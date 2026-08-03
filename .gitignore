@@ -1,7 +1,8 @@
 /target/
+__pycache__/
+*.pyc
 /.env
 *.pem
 *.key
 *.tar.gz
 smart-fec-tunnel-linux-*
-

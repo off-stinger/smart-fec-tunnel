@@ -21,6 +21,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Unit tests
         run: cargo test
+      - name: sing-box merge tests
+        run: python3 -m unittest tests/test_sing_box_merge.py
+      - name: Deployment script syntax
+        run: bash -n deploy/*.sh && python3 -m json.tool configs/sing-box-deployment.example.json >/dev/null
       - name: Static build
         run: cargo build --release --target x86_64-unknown-linux-musl
       - name: Loss recovery integration test
@@ -31,4 +35,3 @@ jobs:
         with:
           name: smart-fec-tunnel-linux-amd64
           path: target/x86_64-unknown-linux-musl/release/smart-fec-tunnel
-

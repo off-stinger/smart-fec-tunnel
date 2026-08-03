@@ -1,76 +1,67 @@
 # 完整部署流程
 
-## 1. 前置条件
+## 前提
 
-- 服务端：Debian/Ubuntu、systemd、sing-box 1.13 或更新版本。
-- 客户端：x86_64 OpenWrt/ImmortalWrt、procd、Passwall。
-- 云防火墙允许服务端 UDP 443；TCP 443 可继续由 Reality/VLESS 使用。
-- TUIC 服务端仅监听 `127.0.0.1:4443`。
-- 三个 WARP mixed worker 仅监听 `127.0.0.1:18101..18103`。
+- 服务端：Linux、systemd、Python 3、sing-box，TCP/443 可由 Reality/VLESS 占用，UDP/443 空闲。
+- 旁路由：OpenWrt/ImmortalWrt、procd、可通过 SSH 管理。
+- 服务端须允许 UDP/443；内部端口 4443、18080、18101-18103 不应暴露公网。
 
-## 2. 安全准备
+## 1. 准备私密配置
 
-生成独立 FEC 密钥：
+复制 `configs/sing-box-deployment.example.json` 到仓库外，替换全部 `REPLACE_*`。三个 WARP endpoint 推荐使用独立账户/私钥/隧道地址；它们仍共享服务器公网 30 Mbps 上限。
 
-```sh
-openssl rand -hex 32
+部署规范只描述本项目托管的 TUIC inbound、WARP workers/endpoints/outbound 和路由。合并器不会重写现有日志、DNS、证书、Reality/VLESS 或其他出站。
+
+`route_position` 默认 `first`，示例使用 `last`，让现有域名/IP 特例先命中，再执行通用 TCP/UDP 分流。`route_final` 仅在规范显式提供时修改。
+
+## 2. 执行一键编排
+
+```powershell
+.\deploy\deploy-all.ps1 `
+  -Server root@服务器IP `
+  -OpenWrt root@旁路由IP `
+  -ServerIdentityFile C:\keys\server.pem `
+  -Binary .\smart-fec-tunnel-linux-amd64 `
+  -ServerEndpoint 服务器IP:443 `
+  -FecKey '<至少32字符随机值>' `
+  -SingBoxSpec C:\secure\sing-box-deployment.json `
+  -RateMbps 30
 ```
 
-不要复用 TUIC、SSH、WARP 或 GitHub 凭据。不要把 `.env`、证书私钥、WARP私钥提交到仓库。
+sing-box 阶段会依次：保存原配置和部署规范、生成候选配置、执行 `sing-box check`、原子替换、重启并检查 active 状态。校验或启动失败时不会继续部署；激活失败会恢复原配置并重启旧服务。
 
-## 3. 服务端 sing-box
+## 3. 验收
 
-以 `configs/sing-box-server.example.json` 为结构参考，将自己的 TUIC TLS 和三个 WARP endpoint 合并到现有配置。先检查后重启：
+服务端：
 
 ```sh
+systemctl is-active sing-box smart-fec-server smart-warp-balance
+ss -lntup | grep -E ':(443|4443|18080|18101|18102|18103)\b'
+journalctl -u sing-box -u smart-fec-server -u smart-warp-balance --since '-10 min' --no-pager
+sing-box check -c /etc/sing-box/config.json
+```
+
+旁路由：
+
+```sh
+/etc/init.d/smart-fec-client status
+logread -e smart-fec
+```
+
+确认无误后，再把 Passwall 的 TUIC 服务端改为本机 FEC 监听地址；脚本不会替你切换主链路。
+
+## 4. 回滚
+
+sing-box 备份目录为 `/root/smart-fec-sing-box-backup-时间戳/`。手工回滚：
+
+```sh
+cp -a /root/smart-fec-sing-box-backup-时间戳/config.json /etc/sing-box/config.json
 sing-box check -c /etc/sing-box/config.json
 systemctl restart sing-box
 ```
 
-确认 4443、18101、18102、18103 都只监听回环地址。
+FEC 组件可运行 `deploy/uninstall.sh` 卸载；卸载不会删除 sing-box 配置或备份。
 
-## 4. 一键安装
+## 复刻到其他链路
 
-在 Windows 管理机执行：
-
-```powershell
-.\deploy\deploy-all.ps1 `
-  -Server root@203.0.113.10 `
-  -OpenWrt root@192.0.2.1 `
-  -ServerIdentityFile C:\keys\server.pem `
-  -Binary .\dist\smart-fec-tunnel-linux-amd64 `
-  -ServerEndpoint 203.0.113.10:443 `
-  -FecKey '<随机密钥>' `
-  -RateMbps 30
-```
-
-脚本会先备份旧文件，再安装两端服务。它不会自动切换 Passwall 主节点，避免部署错误导致断网。
-
-## 5. Passwall 节点
-
-建立 TUIC 节点，地址使用 `127.0.0.1`、端口使用 `3333`；UUID、密码、SNI、ALPN必须与服务端 TUIC 一致。先作为备用节点测试，验收通过后再手工切换 TCP/UDP 主节点。
-
-## 6. 验收
-
-```sh
-systemctl is-active sing-box smart-fec-server smart-warp-balance
-/etc/init.d/smart-fec-client status
-```
-
-建议测试：
-
-1. 连续 DNS 查询。
-2. 100 个短 HTTPS 请求。
-3. 三路不同源站并发下载。
-4. WARP A/B/C 分配计数。
-5. 临时断开一个 worker，确认新连接由其他 worker承接。
-6. 分别重启客户端和服务端，等待 30 秒后复测。
-
-## 7. 跨链路复刻
-
-每条新链路使用独立的 FEC 密钥、TUIC凭据、systemd服务名和回环端口。公网 UDP端口也应独立；若服务器IP不同，可继续使用 UDP 443。不要把同一请求复制到多条 WARP；负载单位是 TCP连接，一条连接始终固定在一个 WARP worker。
-
-## 8. 回滚
-
-安装脚本会输出备份目录。Passwall切换前记录原 TCP/UDP节点。出现失败时先切回原节点，再恢复备份或运行 `deploy/uninstall.sh`。卸载脚本故意保留二进制与密钥，防止误删后无法恢复。
-
+每条链路使用独立的 FEC 密钥、TUIC 凭据和 WARP 私钥；调整公网端口及所有回环端口，确保不冲突。先在备用节点完成部署和验收，再切换 Passwall。不要把一份含真实私钥的规范复用或提交到 Git。
