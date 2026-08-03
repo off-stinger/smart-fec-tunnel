@@ -1,0 +1,60 @@
+{
+  "log": { "level": "info", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "tuic",
+      "tag": "tuic-inner",
+      "listen": "127.0.0.1",
+      "listen_port": 4443,
+      "users": [{ "uuid": "REPLACE_UUID", "password": "REPLACE_TUIC_PASSWORD" }],
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_TLS_NAME",
+        "certificate_path": "/etc/sing-box/cert.pem",
+        "key_path": "/etc/sing-box/key.pem"
+      }
+    },
+    { "type": "mixed", "tag": "warp-worker-a", "listen": "127.0.0.1", "listen_port": 18101 },
+    { "type": "mixed", "tag": "warp-worker-b", "listen": "127.0.0.1", "listen_port": 18102 },
+    { "type": "mixed", "tag": "warp-worker-c", "listen": "127.0.0.1", "listen_port": 18103 }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "socks", "tag": "warp-balance", "server": "127.0.0.1", "server_port": 18080 }
+  ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "warp-a",
+      "address": ["172.16.0.2/32"],
+      "private_key": "REPLACE_WARP_PRIVATE_KEY_A",
+      "peers": [{ "address": "162.159.192.1", "port": 2408, "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "allowed_ips": ["0.0.0.0/0"], "persistent_keepalive_interval": 25 }]
+    },
+    {
+      "type": "wireguard",
+      "tag": "warp-b",
+      "address": ["172.16.0.3/32"],
+      "private_key": "REPLACE_WARP_PRIVATE_KEY_B",
+      "peers": [{ "address": "162.159.192.2", "port": 2408, "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "allowed_ips": ["0.0.0.0/0"], "persistent_keepalive_interval": 25 }]
+    },
+    {
+      "type": "wireguard",
+      "tag": "warp-c",
+      "address": ["172.16.0.4/32"],
+      "private_key": "REPLACE_WARP_PRIVATE_KEY_C",
+      "peers": [{ "address": "162.159.192.3", "port": 2408, "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "allowed_ips": ["0.0.0.0/0"], "persistent_keepalive_interval": 25 }]
+    }
+  ],
+  "route": {
+    "rules": [
+      { "inbound": ["warp-worker-a"], "action": "route", "outbound": "warp-a" },
+      { "inbound": ["warp-worker-b"], "action": "route", "outbound": "warp-b" },
+      { "inbound": ["warp-worker-c"], "action": "route", "outbound": "warp-c" },
+      { "ip_is_private": true, "action": "route", "outbound": "direct" },
+      { "network": "tcp", "action": "route", "outbound": "warp-balance" },
+      { "network": "udp", "action": "route", "outbound": "warp-b" }
+    ],
+    "final": "warp-b"
+  }
+}

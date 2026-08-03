@@ -1,0 +1,7 @@
+/target/
+/.env
+*.pem
+*.key
+*.tar.gz
+smart-fec-tunnel-linux-*
+

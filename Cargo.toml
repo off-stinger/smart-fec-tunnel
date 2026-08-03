@@ -1,0 +1,20 @@
+[package]
+name = "smart-fec-tunnel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.8"
+reed-solomon-erasure = "6"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
