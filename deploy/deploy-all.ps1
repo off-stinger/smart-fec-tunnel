@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory=$true)][string]$ServerEndpoint,
     [Parameter(Mandatory=$true)][string]$FecKey,
     [string]$SingBoxSpec,
+    [switch]$StableGoogleEgress,
     [double]$RateMbps = 30
 )
 
@@ -20,6 +21,8 @@ $serverInstaller = Join-Path $PSScriptRoot 'server-install.sh'
 $routerInstaller = Join-Path $PSScriptRoot 'openwrt-install.sh'
 $singBoxInstaller = Join-Path $PSScriptRoot 'sing-box-install.sh'
 $singBoxMerger = Join-Path $PSScriptRoot 'sing-box-merge.py'
+$googleRoutePatcher = Join-Path $PSScriptRoot 'add-google-stable-route.py'
+$googleRouteInstaller = Join-Path $PSScriptRoot 'install-google-route-updater.sh'
 $remoteBinary = '/tmp/smart-fec-tunnel.new'
 $tempKey = New-TemporaryFile
 
@@ -33,6 +36,11 @@ try {
         scp -i $ServerIdentityFile $singBoxInstaller "${Server}:/tmp/sing-box-install.sh"
         scp -i $ServerIdentityFile $singBoxMerger "${Server}:/tmp/sing-box-merge.py"
         ssh -i $ServerIdentityFile $Server "chmod 700 /tmp/sing-box-install.sh /tmp/sing-box-merge.py; chmod 600 /tmp/sing-box-deployment.json; /tmp/sing-box-install.sh /tmp/sing-box-merge.py /tmp/sing-box-deployment.json; rm -f /tmp/sing-box-deployment.json"
+    }
+    if ($StableGoogleEgress) {
+        scp -i $ServerIdentityFile $googleRoutePatcher "${Server}:/tmp/add-google-stable-route.py"
+        scp -i $ServerIdentityFile $googleRouteInstaller "${Server}:/tmp/install-google-route-updater.sh"
+        ssh -i $ServerIdentityFile $Server "chmod 700 /tmp/add-google-stable-route.py /tmp/install-google-route-updater.sh; /tmp/install-google-route-updater.sh /tmp/add-google-stable-route.py; rm -f /tmp/add-google-stable-route.py /tmp/install-google-route-updater.sh"
     }
     ssh -i $ServerIdentityFile $Server "chmod 600 /tmp/smart-fec.key; chmod 700 /tmp/server-install.sh '$remoteBinary'; SMART_FEC_KEY=`$(cat /tmp/smart-fec.key) /tmp/server-install.sh '$remoteBinary' '$RateMbps'; rm -f /tmp/smart-fec.key"
 

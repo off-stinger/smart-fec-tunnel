@@ -37,12 +37,15 @@ TCP/443 可继续由现有 Reality/VLESS 使用，FEC 服务只占用 UDP/443。
   -ServerEndpoint 203.0.113.10:443 `
   -FecKey '<至少32字符随机密钥>' `
   -SingBoxSpec C:\secure\sing-box-deployment.json `
+  -StableGoogleEgress `
   -RateMbps 30
 ```
 
 执行顺序是：备份并合并服务端 sing-box、校验并重启、安装服务端 FEC/WARP balancer、安装 OpenWrt 客户端。任何 sing-box 激活故障都会恢复备份。脚本不会自动切换 Passwall 节点，避免部署途中切断管理链路。
 
 如果省略 `-SingBoxSpec`，脚本只更新 FEC 组件并明确告警，sing-box 不会被修改。完整说明见 [`docs/DEPLOYMENT.zh-CN.md`](docs/DEPLOYMENT.zh-CN.md)。
+
+`-StableGoogleEgress` 会安装每日自动维护器：从 Google 官方 `goog.json` 中扣除 `cloud.json` 的客户网段，只在服务网段实际变化且候选配置校验成功时更新并重启 sing-box；失败时自动回滚。
 
 ## 构建与测试
 

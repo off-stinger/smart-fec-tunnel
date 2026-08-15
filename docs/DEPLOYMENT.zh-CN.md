@@ -25,6 +25,7 @@
   -ServerEndpoint 服务器IP:443 `
   -FecKey '<至少32字符随机值>' `
   -SingBoxSpec C:\secure\sing-box-deployment.json `
+  -StableGoogleEgress `
   -RateMbps 30
 ```
 
@@ -49,6 +50,13 @@ logread -e smart-fec
 ```
 
 确认无误后，再把 Passwall 的 TUIC 服务端改为本机 FEC 监听地址；脚本不会替你切换主链路。
+
+Google 稳定出口维护器每天读取 Google 官方地址列表，排除 Google Cloud 客户网段。只有规则变化时才备份、校验并重启 sing-box；查看状态：
+
+```sh
+systemctl status smart-fec-google-route.timer
+journalctl -u smart-fec-google-route.service --since '-7 days' --no-pager
+```
 
 ## 4. 回滚
 

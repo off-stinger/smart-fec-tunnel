@@ -7,8 +7,9 @@ case "$(uname -s)" in
 esac
 
 if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now smart-fec-server smart-warp-balance 2>/dev/null || true
+    systemctl disable --now smart-fec-server smart-warp-balance smart-fec-google-route.timer 2>/dev/null || true
     rm -f /etc/systemd/system/smart-fec-server.service /etc/systemd/system/smart-warp-balance.service
+    rm -f /etc/systemd/system/smart-fec-google-route.service /etc/systemd/system/smart-fec-google-route.timer
     systemctl daemon-reload
     echo "Server services removed. Binary and secrets were retained for recovery."
 elif [ -x /etc/init.d/smart-fec-client ]; then
@@ -19,4 +20,3 @@ elif [ -x /etc/init.d/smart-fec-client ]; then
 else
     echo "No installation detected"
 fi
-
