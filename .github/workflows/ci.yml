@@ -22,7 +22,7 @@ jobs:
       - name: Unit tests
         run: cargo test
       - name: sing-box merge tests
-        run: python3 -m unittest tests/test_sing_box_merge.py
+        run: python3 -m unittest tests/test_sing_box_merge.py tests/test_google_stable_route.py
       - name: Deployment script syntax
         run: bash -n deploy/*.sh && python3 -m json.tool configs/sing-box-deployment.example.json >/dev/null
       - name: Static build

@@ -19,6 +19,7 @@ TCP/443 可继续由现有 Reality/VLESS 使用，FEC 服务只占用 UDP/443。
 - 认证报文、FEC 丢包恢复、乱序窗口和内存上限
 - 默认按服务端 30 Mbps 峰值整形，避免 UDP 突发
 - 三路 WARP 是按 TCP 连接负载，不是 urltest 择优，也不复制业务请求
+- Google 搜索可固定走服务器稳定公网，规避共享 WARP IP 被 Google 错标为中国地区
 - sing-box 无损合并：保留 Reality/VLESS、DNS 和非托管路由
 - 部署前配置校验、原子替换、启动失败自动回滚
 - Debian/systemd、OpenWrt/procd 一键安装
