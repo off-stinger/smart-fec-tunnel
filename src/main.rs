@@ -1,7 +1,11 @@
 use anyhow::{bail, Context, Result};
 use blake3::Hasher;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    XChaCha20Poly1305, XNonce,
+};
 use clap::{Parser, Subcommand};
-use rand::Rng;
+use rand::{Rng, RngCore};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -24,11 +28,15 @@ use tracing::{info, warn};
 const MAGIC: u32 = 0x5346_4543; // SFEC
 const VERSION_V1: u8 = 1;
 const VERSION_V2: u8 = 2;
+const VERSION_V3: u8 = 3;
 const KIND_DATA: u8 = 1;
 const KIND_PARITY: u8 = 2;
 const KIND_REPORT: u8 = 3;
 const HEADER: usize = 36;
 const HEADER_V2: usize = 44;
+const V3_SELECTOR: usize = 8;
+const V3_NONCE: usize = 24;
+const V3_INNER_HEADER: usize = 31;
 const TAG: usize = 16;
 const SHARD: usize = 1050;
 const FRAGMENT_HEADER: usize = 14;
@@ -182,6 +190,82 @@ impl Frame {
             parity: buf[offset + 27],
             payload: buf[header..header + payload_len].to_vec(),
         })
+    }
+
+    fn encode_wire(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
+        if self.version != VERSION_V3 {
+            return Ok(self.encode(key));
+        }
+        let mut inner = Vec::with_capacity(V3_INNER_HEADER + self.payload.len());
+        inner.push(self.kind);
+        inner.extend_from_slice(&self.session.to_be_bytes());
+        inner.extend_from_slice(&self.sequence.to_be_bytes());
+        inner.extend_from_slice(&self.group.to_be_bytes());
+        inner.extend_from_slice(&self.index.to_be_bytes());
+        inner.push(self.data);
+        inner.push(self.parity);
+        inner.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+        inner.extend_from_slice(&self.payload);
+
+        let mut nonce = [0u8; V3_NONCE];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let cipher = XChaCha20Poly1305::new(key.into());
+        let ciphertext = cipher
+            .encrypt(XNonce::from_slice(&nonce), inner.as_ref())
+            .map_err(|_| anyhow::anyhow!("v3 encryption failed"))?;
+        let mut out = Vec::with_capacity(V3_SELECTOR + V3_NONCE + ciphertext.len());
+        out.extend_from_slice(&v3_selector(key));
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    fn decode_v3(buf: &[u8], key_id: u64, key: &[u8; 32]) -> Result<Self> {
+        if buf.len() < V3_SELECTOR + V3_NONCE + V3_INNER_HEADER + TAG
+            || buf[..V3_SELECTOR] != v3_selector(key)
+        {
+            bail!("invalid v3 envelope")
+        }
+        let nonce = XNonce::from_slice(&buf[V3_SELECTOR..V3_SELECTOR + V3_NONCE]);
+        let cipher = XChaCha20Poly1305::new(key.into());
+        let inner = cipher
+            .decrypt(nonce, &buf[V3_SELECTOR + V3_NONCE..])
+            .map_err(|_| anyhow::anyhow!("v3 authentication failed"))?;
+        if inner.len() < V3_INNER_HEADER {
+            bail!("short v3 payload")
+        }
+        let payload_len = u16::from_be_bytes(inner[29..31].try_into().unwrap()) as usize;
+        if V3_INNER_HEADER + payload_len != inner.len() {
+            bail!("bad v3 length")
+        }
+        Ok(Self {
+            version: VERSION_V3,
+            key_id,
+            kind: inner[0],
+            session: u64::from_be_bytes(inner[1..9].try_into().unwrap()),
+            sequence: u64::from_be_bytes(inner[9..17].try_into().unwrap()),
+            group: u64::from_be_bytes(inner[17..25].try_into().unwrap()),
+            index: u16::from_be_bytes(inner[25..27].try_into().unwrap()),
+            data: inner[27],
+            parity: inner[28],
+            payload: inner[V3_INNER_HEADER..].to_vec(),
+        })
+    }
+}
+
+fn v3_selector(key: &[u8; 32]) -> [u8; V3_SELECTOR] {
+    let mut hasher = Hasher::new_keyed(key);
+    hasher.update(b"smart-fec-v3-routing-selector");
+    hasher.finalize().as_bytes()[..V3_SELECTOR]
+        .try_into()
+        .unwrap()
+}
+
+fn decode_client_frame(buf: &[u8], key_id: u64, key: &[u8; 32]) -> Result<Frame> {
+    if buf.starts_with(&MAGIC.to_be_bytes()) {
+        Frame::decode(buf, key)
+    } else {
+        Frame::decode_v3(buf, key_id, key)
     }
 }
 
@@ -612,9 +696,18 @@ fn decode_server_frame(
     bytes: &[u8],
     legacy_key: Option<&[u8; 32]>,
     keyring: &HashMap<u64, [u8; 32]>,
+    selectors: &HashMap<[u8; V3_SELECTOR], (u64, [u8; 32])>,
 ) -> Result<(Frame, [u8; 32])> {
-    if bytes.len() < 6 || u32::from_be_bytes(bytes[0..4].try_into().unwrap()) != MAGIC {
-        bail!("bad protocol")
+    if !bytes.starts_with(&MAGIC.to_be_bytes()) {
+        if bytes.len() < V3_SELECTOR {
+            bail!("short v3 envelope")
+        }
+        let selector: [u8; V3_SELECTOR] = bytes[..V3_SELECTOR].try_into().unwrap();
+        let (key_id, selected) = selectors.get(&selector).context("unknown v3 selector")?;
+        return Ok((Frame::decode_v3(bytes, *key_id, selected)?, *selected));
+    }
+    if bytes.len() < 6 {
+        bail!("short legacy frame")
     }
     let selected = match bytes[4] {
         VERSION_V1 => legacy_key.context("legacy protocol disabled")?,
@@ -639,7 +732,13 @@ async fn send_frames(
     pacer: &mut Pacer,
 ) -> Result<()> {
     for frame in frames {
-        let bytes = frame.encode(key);
+        let bytes = match frame.encode_wire(key) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(%error, "frame encryption failed");
+                continue;
+            }
+        };
         pacer.wait(bytes.len()).await;
         let sent = if let Some(peer) = peer {
             socket.send_to(&bytes, peer).await
@@ -710,7 +809,7 @@ async fn client(
     let key = key(&secret);
     let session = rand::thread_rng().gen::<u64>();
     let version = if key_id.is_some() {
-        VERSION_V2
+        VERSION_V3
     } else {
         VERSION_V1
     };
@@ -741,7 +840,7 @@ async fn client(
             }
             r = tunnel.recv(&mut net_buf) => {
                 let n = match r { Ok(n) => n, Err(e) => { warn!(error=%e, "tunnel receive failed"); continue; } };
-                match Frame::decode(&net_buf[..n], &key) {
+                match decode_client_frame(&net_buf[..n], key_id.unwrap_or(0), &key) {
                     Ok(f) if f.version != version || f.key_id != key_id.unwrap_or(0) || f.session != session => {
                         warn!("discard frame for different identity or session");
                     }
@@ -804,7 +903,13 @@ async fn send_session_frames(
     pacer: &Mutex<Pacer>,
 ) {
     for frame in frames {
-        let bytes = frame.encode(key);
+        let bytes = match frame.encode_wire(key) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(%error, "session encryption failed");
+                continue;
+            }
+        };
         let mut limiter = pacer.lock().await;
         limiter.wait(bytes.len()).await;
         drop(limiter);
@@ -898,6 +1003,15 @@ async fn server(
     if legacy_key.is_none() && keyring.is_empty() {
         bail!("server requires --key for V1 migration and/or --keyring for V2")
     }
+    let mut selectors = HashMap::new();
+    for (&key_id, &device_key) in &keyring {
+        if selectors
+            .insert(v3_selector(&device_key), (key_id, device_key))
+            .is_some()
+        {
+            bail!("keyring contains a V3 selector collision")
+        }
+    }
     let public = Arc::new(
         UdpSocket::bind(listen)
             .await
@@ -913,7 +1027,7 @@ async fn server(
         tokio::select! {
             received = public.recv_from(&mut net_buf) => {
                 let (n, peer) = match received { Ok(v) => v, Err(error) => { warn!(%error, "public receive failed"); continue; } };
-                let (frame, device_key) = match decode_server_frame(&net_buf[..n], legacy_key.as_ref(), &keyring) {
+                let (frame, device_key) = match decode_server_frame(&net_buf[..n], legacy_key.as_ref(), &keyring, &selectors) {
                     Ok(value) => value,
                     Err(_) => continue,
                 };
@@ -925,7 +1039,7 @@ async fn server(
                     if frame.version == VERSION_V1 && sessions.keys().filter(|(id, _)| *id == 0).count() >= MAX_V1_MIGRATION_SESSIONS {
                         continue;
                     }
-                    if frame.version == VERSION_V2 && sessions.keys().filter(|(id, _)| *id == frame.key_id).count() >= MAX_V2_SESSIONS_PER_DEVICE {
+                    if matches!(frame.version, VERSION_V2 | VERSION_V3) && sessions.keys().filter(|(id, _)| *id == frame.key_id).count() >= MAX_V2_SESSIONS_PER_DEVICE {
                         continue;
                     }
                     let (sender, receiver) = mpsc::channel(256);
@@ -1231,7 +1345,8 @@ mod tests {
         let frame = enc.report_frame(1234);
         let bytes = frame.encode(&device_key);
         let keys = HashMap::from([(42, device_key)]);
-        let (decoded, selected) = decode_server_frame(&bytes, None, &keys).unwrap();
+        let (decoded, selected) =
+            decode_server_frame(&bytes, None, &keys, &HashMap::new()).unwrap();
         assert_eq!(decoded.version, VERSION_V2);
         assert_eq!(decoded.key_id, 42);
         assert_eq!(decoded.session, 77);
@@ -1241,9 +1356,25 @@ mod tests {
     fn v2_frame_rejects_unknown_or_wrong_device_key() {
         let mut enc = Encoder::with_identity(77, VERSION_V2, 42);
         let bytes = enc.report_frame(0).encode(&key("correct-device-secret"));
-        assert!(decode_server_frame(&bytes, None, &HashMap::new()).is_err());
+        assert!(decode_server_frame(&bytes, None, &HashMap::new(), &HashMap::new()).is_err());
         let wrong = HashMap::from([(42, key("wrong-device-secret"))]);
-        assert!(decode_server_frame(&bytes, None, &wrong).is_err());
+        assert!(decode_server_frame(&bytes, None, &wrong, &HashMap::new()).is_err());
+    }
+    #[test]
+    fn v3_envelope_hides_header_and_authenticates() {
+        let device_key = key("v3-device-secret-at-least-32-bytes");
+        let frame = Encoder::with_identity(91, VERSION_V3, 7).report_frame(9876);
+        let bytes = frame.encode_wire(&device_key).unwrap();
+        assert!(!bytes.starts_with(&MAGIC.to_be_bytes()));
+        assert!(!bytes.windows(4).any(|window| window == MAGIC.to_be_bytes()));
+        let selectors = HashMap::from([(v3_selector(&device_key), (7, device_key))]);
+        let (decoded, _) = decode_server_frame(&bytes, None, &HashMap::new(), &selectors).unwrap();
+        assert_eq!(decoded.version, VERSION_V3);
+        assert_eq!(decoded.key_id, 7);
+        assert_eq!(decoded.session, 91);
+        let mut tampered = bytes;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(decode_server_frame(&tampered, None, &HashMap::new(), &selectors).is_err());
     }
     #[test]
     fn keyring_rejects_reserved_duplicate_and_short_entries() {

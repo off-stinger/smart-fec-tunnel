@@ -1,6 +1,6 @@
 # Smart FEC Tunnel
 
-面向 OpenWrt 旁路由与 Linux 服务端的 TUIC 外层 FEC、限速整形和多 WARP 分流方案。`0.2.0-alpha.1` 增加 FEC V2 每设备密钥和多会话隔离，并保留 V1 迁移入口。项目不修改 sing-box/TUIC 源码：UDP 会话经过带认证的 Reed-Solomon FEC 隧道；服务端 TCP 新连接轮询分配到三个 WARP，UDP 固定到一个稳定 WARP。
+面向 OpenWrt 旁路由与 Linux 服务端的 TUIC 外层 FEC、限速整形和多 WARP 分流方案。`0.2.0-alpha.2` 增加 FEC V3 加密信封：公网不再暴露固定魔数、版本、设备 ID、会话、序列与 FEC 参数，同时保留 V1/V2 迁移接收。项目不修改 sing-box/TUIC 源码。
 
 ## 数据路径
 
@@ -18,6 +18,7 @@ TCP/443 可继续由现有 Reality/VLESS 使用，FEC 服务只占用 UDP/443。
 
 - 认证报文、FEC 丢包恢复、乱序窗口和内存上限
 - FEC V2 每设备 `key_id`、独立密钥、独立会话与上游 socket；服务端会话总量及单设备数量有界
+- FEC V3 使用 XChaCha20-Poly1305 加密全部内部元数据，外层只保留不透明密钥选择器和随机 nonce
 - 默认按服务端 30 Mbps 峰值整形，避免 UDP 突发
 - 三路 WARP 是按 TCP 连接负载，不是 urltest 择优，也不复制业务请求
 - Google 搜索可固定走服务器稳定公网，规避共享 WARP IP 被 Google 错标为中国地区

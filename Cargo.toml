@@ -1,11 +1,12 @@
 [package]
 name = "smart-fec-tunnel"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 edition = "2021"
 
 [dependencies]
 anyhow = "1"
 blake3 = "1"
+chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.8"
 reed-solomon-erasure = "6"
