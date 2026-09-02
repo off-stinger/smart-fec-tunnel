@@ -97,6 +97,7 @@ EOF
 systemd-analyze verify /etc/systemd/system/smart-fec-server.service /etc/systemd/system/smart-warp-balance.service
 systemctl daemon-reload
 systemctl enable --now smart-fec-server smart-warp-balance
+systemctl restart smart-fec-server smart-warp-balance
 sleep 2
 systemctl is-active --quiet smart-fec-server
 systemctl is-active --quiet smart-warp-balance
