@@ -6,6 +6,7 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -15,17 +16,19 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::Mutex,
+    sync::{mpsc, Mutex},
     time,
 };
 use tracing::{info, warn};
 
 const MAGIC: u32 = 0x5346_4543; // SFEC
-const VERSION: u8 = 1;
+const VERSION_V1: u8 = 1;
+const VERSION_V2: u8 = 2;
 const KIND_DATA: u8 = 1;
 const KIND_PARITY: u8 = 2;
 const KIND_REPORT: u8 = 3;
 const HEADER: usize = 36;
+const HEADER_V2: usize = 44;
 const TAG: usize = 16;
 const SHARD: usize = 1050;
 const FRAGMENT_HEADER: usize = 14;
@@ -37,6 +40,9 @@ const REORDER_WINDOW: u64 = 64;
 const MAX_GROUPS: usize = 2048;
 const MAX_REASSEMBLIES: usize = 4096;
 const MAX_PARITY: usize = 3;
+const MAX_V2_SESSIONS_PER_DEVICE: usize = 16;
+const MAX_V1_MIGRATION_SESSIONS: usize = 64;
+const MAX_DEVICE_KEYS: usize = 65_536;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Adaptive authenticated FEC tunnel for TUIC/UDP")]
@@ -54,6 +60,9 @@ enum Command {
         server: SocketAddr,
         #[arg(long, env = "SMART_FEC_KEY")]
         key: String,
+        /// Non-zero device key identifier. Omit to use the legacy V1 wire format.
+        #[arg(long, env = "SMART_FEC_KEY_ID")]
+        key_id: Option<u64>,
         #[arg(long, default_value_t = 10.0)]
         rate_mbps: f64,
     },
@@ -62,8 +71,16 @@ enum Command {
         listen: SocketAddr,
         #[arg(long, default_value = "127.0.0.1:443")]
         upstream: SocketAddr,
+        /// Optional legacy V1 shared key during migration.
         #[arg(long, env = "SMART_FEC_KEY")]
-        key: String,
+        key: Option<String>,
+        /// V2 keyring: one `key_id secret` entry per line (root-readable only).
+        #[arg(long, env = "SMART_FEC_KEYRING")]
+        keyring: Option<PathBuf>,
+        #[arg(long, default_value_t = 1024)]
+        max_sessions: usize,
+        #[arg(long, default_value_t = 120)]
+        session_idle_secs: u64,
         #[arg(long, default_value_t = 10.0)]
         rate_mbps: f64,
     },
@@ -77,6 +94,8 @@ enum Command {
 
 #[derive(Clone, Debug)]
 struct Frame {
+    version: u8,
+    key_id: u64,
     kind: u8,
     session: u64,
     sequence: u64,
@@ -89,10 +108,18 @@ struct Frame {
 
 impl Frame {
     fn encode(&self, key: &[u8; 32]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER + self.payload.len() + TAG);
+        let header = if self.version == VERSION_V2 {
+            HEADER_V2
+        } else {
+            HEADER
+        };
+        let mut out = Vec::with_capacity(header + self.payload.len() + TAG);
         out.extend_from_slice(&MAGIC.to_be_bytes());
-        out.push(VERSION);
+        out.push(self.version);
         out.push(self.kind);
+        if self.version == VERSION_V2 {
+            out.extend_from_slice(&self.key_id.to_be_bytes());
+        }
         out.extend_from_slice(&self.session.to_be_bytes());
         out.extend_from_slice(&self.sequence.to_be_bytes());
         out.extend_from_slice(&self.group.to_be_bytes());
@@ -108,7 +135,25 @@ impl Frame {
     }
 
     fn decode(buf: &[u8], key: &[u8; 32]) -> Result<Self> {
-        if buf.len() < HEADER + TAG {
+        if buf.len() < 6 + TAG {
+            bail!("short frame")
+        }
+        let version = buf[4];
+        let (header, key_id, offset) = match version {
+            VERSION_V1 => (HEADER, 0, 6),
+            VERSION_V2 => {
+                if buf.len() < HEADER_V2 + TAG {
+                    bail!("short v2 frame")
+                }
+                (
+                    HEADER_V2,
+                    u64::from_be_bytes(buf[6..14].try_into().unwrap()),
+                    14,
+                )
+            }
+            _ => bail!("bad protocol version"),
+        };
+        if buf.len() < header + TAG {
             bail!("short frame")
         }
         let body_len = buf.len() - TAG;
@@ -117,22 +162,25 @@ impl Frame {
         if h.finalize().as_bytes()[..TAG] != buf[body_len..] {
             bail!("bad auth")
         }
-        if u32::from_be_bytes(buf[0..4].try_into().unwrap()) != MAGIC || buf[4] != VERSION {
+        if u32::from_be_bytes(buf[0..4].try_into().unwrap()) != MAGIC {
             bail!("bad protocol")
         }
-        let payload_len = u16::from_be_bytes(buf[34..36].try_into().unwrap()) as usize;
-        if HEADER + payload_len + TAG != buf.len() {
+        let payload_len =
+            u16::from_be_bytes(buf[offset + 28..offset + 30].try_into().unwrap()) as usize;
+        if header + payload_len + TAG != buf.len() {
             bail!("bad length")
         }
         Ok(Self {
+            version,
+            key_id,
             kind: buf[5],
-            session: u64::from_be_bytes(buf[6..14].try_into().unwrap()),
-            sequence: u64::from_be_bytes(buf[14..22].try_into().unwrap()),
-            group: u64::from_be_bytes(buf[22..30].try_into().unwrap()),
-            index: u16::from_be_bytes(buf[30..32].try_into().unwrap()),
-            data: buf[32],
-            parity: buf[33],
-            payload: buf[HEADER..HEADER + payload_len].to_vec(),
+            session: u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap()),
+            sequence: u64::from_be_bytes(buf[offset + 8..offset + 16].try_into().unwrap()),
+            group: u64::from_be_bytes(buf[offset + 16..offset + 24].try_into().unwrap()),
+            index: u16::from_be_bytes(buf[offset + 24..offset + 26].try_into().unwrap()),
+            data: buf[offset + 26],
+            parity: buf[offset + 27],
+            payload: buf[header..header + payload_len].to_vec(),
         })
     }
 }
@@ -194,6 +242,8 @@ impl Adaptive {
 
 #[derive(Debug)]
 struct Encoder {
+    version: u8,
+    key_id: u64,
     session: u64,
     sequence: u64,
     packet: u64,
@@ -203,8 +253,14 @@ struct Encoder {
 }
 
 impl Encoder {
+    #[cfg(test)]
     fn new(session: u64) -> Self {
+        Self::with_identity(session, VERSION_V1, 0)
+    }
+    fn with_identity(session: u64, version: u8, key_id: u64) -> Self {
         Self {
+            version,
+            key_id,
             session,
             sequence: 1,
             packet: 1,
@@ -215,6 +271,8 @@ impl Encoder {
     }
     fn report_frame(&mut self, loss_ppm: u32) -> Frame {
         let f = Frame {
+            version: self.version,
+            key_id: self.key_id,
             kind: KIND_REPORT,
             session: self.session,
             sequence: self.sequence,
@@ -270,6 +328,8 @@ impl Encoder {
         let mut frames = Vec::with_capacity(data + parity);
         for (index, shard) in self.shards.iter().enumerate() {
             frames.push(Frame {
+                version: self.version,
+                key_id: self.key_id,
                 kind: KIND_DATA,
                 session: self.session,
                 sequence: self.sequence,
@@ -288,6 +348,8 @@ impl Encoder {
             rs.encode(&mut all)?;
             for p in 0..parity {
                 frames.push(Frame {
+                    version: self.version,
+                    key_id: self.key_id,
                     kind: KIND_PARITY,
                     session: self.session,
                     sequence: self.sequence,
@@ -342,10 +404,7 @@ impl Decoder {
             packets: HashMap::new(),
         }
     }
-    fn reset(&mut self, session: u64) {
-        *self = Self::new(session);
-    }
-    fn observe_seq(&mut self, seq: u64) {
+    fn observe_seq(&mut self, seq: u64) -> bool {
         if self.highest_sequence == 0
             && self.finalized_sequence == 0
             && self.seen_sequences.is_empty()
@@ -353,10 +412,10 @@ impl Decoder {
             self.finalized_sequence = seq.saturating_sub(1);
         }
         if seq <= self.finalized_sequence {
-            return;
+            return false;
         }
         self.highest_sequence = self.highest_sequence.max(seq);
-        self.seen_sequences.insert(seq);
+        self.seen_sequences.insert(seq)
     }
     fn loss_report(&mut self) -> u32 {
         let cutoff = self.highest_sequence.saturating_sub(REORDER_WINDOW);
@@ -405,9 +464,11 @@ impl Decoder {
     }
     fn frame(&mut self, frame: Frame) -> Result<Vec<Vec<u8>>> {
         if self.session != frame.session {
-            self.reset(frame.session);
+            bail!("session mismatch")
         }
-        self.observe_seq(frame.sequence);
+        if !self.observe_seq(frame.sequence) {
+            return Ok(vec![]);
+        }
         if frame.kind == KIND_REPORT {
             return Ok(vec![]);
         }
@@ -504,6 +565,72 @@ fn key(raw: &str) -> [u8; 32] {
     *blake3::hash(raw.as_bytes()).as_bytes()
 }
 
+fn load_keyring(path: &PathBuf) -> Result<HashMap<u64, [u8; 32]>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            bail!("keyring must not be accessible by group or other users")
+        }
+    }
+    let text = std::fs::read_to_string(path).context("read keyring")?;
+    parse_keyring(&text)
+}
+
+fn parse_keyring(text: &str) -> Result<HashMap<u64, [u8; 32]>> {
+    let mut result = HashMap::new();
+    for (line_no, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let id: u64 = fields
+            .next()
+            .context("missing key id")?
+            .parse()
+            .with_context(|| format!("invalid key id at line {}", line_no + 1))?;
+        let secret = fields.next().context("missing key secret")?;
+        if id == 0 || secret.len() < 32 || fields.next().is_some() {
+            bail!("invalid keyring entry at line {}", line_no + 1)
+        }
+        if result.insert(id, key(secret)).is_some() {
+            bail!("duplicate key id at line {}", line_no + 1)
+        }
+        if result.len() > MAX_DEVICE_KEYS {
+            bail!("keyring exceeds maximum device count")
+        }
+    }
+    if result.is_empty() {
+        bail!("keyring contains no device keys")
+    }
+    Ok(result)
+}
+
+fn decode_server_frame(
+    bytes: &[u8],
+    legacy_key: Option<&[u8; 32]>,
+    keyring: &HashMap<u64, [u8; 32]>,
+) -> Result<(Frame, [u8; 32])> {
+    if bytes.len() < 6 || u32::from_be_bytes(bytes[0..4].try_into().unwrap()) != MAGIC {
+        bail!("bad protocol")
+    }
+    let selected = match bytes[4] {
+        VERSION_V1 => legacy_key.context("legacy protocol disabled")?,
+        VERSION_V2 => {
+            if bytes.len() < HEADER_V2 + TAG {
+                bail!("short v2 frame")
+            }
+            let id = u64::from_be_bytes(bytes[6..14].try_into().unwrap());
+            keyring.get(&id).context("unknown key id")?
+        }
+        _ => bail!("unsupported protocol version"),
+    };
+    let frame = Frame::decode(bytes, selected)?;
+    Ok((frame, *selected))
+}
+
 async fn send_frames(
     socket: &UdpSocket,
     peer: Option<SocketAddr>,
@@ -574,16 +701,29 @@ async fn client(
     listen: SocketAddr,
     server: SocketAddr,
     secret: String,
+    key_id: Option<u64>,
     rate_mbps: f64,
 ) -> Result<()> {
+    if key_id == Some(0) {
+        bail!("key-id 0 is reserved for legacy V1")
+    }
     let key = key(&secret);
     let session = rand::thread_rng().gen::<u64>();
+    let version = if key_id.is_some() {
+        VERSION_V2
+    } else {
+        VERSION_V1
+    };
     let local = UdpSocket::bind(listen)
         .await
         .context("bind client listen")?;
     let tunnel = UdpSocket::bind("0.0.0.0:0").await?;
     tunnel.connect(server).await?;
-    let encoder = Arc::new(Mutex::new(Encoder::new(session)));
+    let encoder = Arc::new(Mutex::new(Encoder::with_identity(
+        session,
+        version,
+        key_id.unwrap_or(0),
+    )));
     let mut decoder = Decoder::new(session);
     let mut app_peer = None;
     let mut local_buf = vec![0u8; 65535];
@@ -602,10 +742,14 @@ async fn client(
             r = tunnel.recv(&mut net_buf) => {
                 let n = match r { Ok(n) => n, Err(e) => { warn!(error=%e, "tunnel receive failed"); continue; } };
                 match Frame::decode(&net_buf[..n], &key) {
+                    Ok(f) if f.version != version || f.key_id != key_id.unwrap_or(0) || f.session != session => {
+                        warn!("discard frame for different identity or session");
+                    }
                     Ok(f) if f.kind == KIND_REPORT && f.payload.len() == 4 => {
-                        decoder.observe_seq(f.sequence);
-                        let loss = u32::from_be_bytes(f.payload[..4].try_into().unwrap());
-                        encoder.lock().await.adaptive.report(loss);
+                        if decoder.observe_seq(f.sequence) {
+                            let loss = u32::from_be_bytes(f.payload[..4].try_into().unwrap());
+                            encoder.lock().await.adaptive.report(loss);
+                        }
                     }
                     Ok(f) => match decoder.frame(f) {
                         Ok(datagrams) => for d in datagrams { if let Some(peer) = app_peer { if let Err(e) = local.send_to(&d, peer).await { warn!(error=%e, "local send failed"); } } },
@@ -630,65 +774,202 @@ async fn client(
     }
 }
 
-async fn server(
-    listen: SocketAddr,
+struct SessionPacket {
+    frame: Frame,
+    peer: SocketAddr,
+}
+
+struct SessionEntry {
+    sender: mpsc::Sender<SessionPacket>,
+    last_seen: Arc<std::sync::Mutex<Instant>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct SessionRuntime {
+    public: Arc<UdpSocket>,
     upstream: SocketAddr,
-    secret: String,
-    rate_mbps: f64,
+    key: [u8; 32],
+    version: u8,
+    key_id: u64,
+    session: u64,
+    pacer: Arc<Mutex<Pacer>>,
+    last_seen: Arc<std::sync::Mutex<Instant>>,
+}
+
+async fn send_session_frames(
+    public: &UdpSocket,
+    peer: SocketAddr,
+    frames: Vec<Frame>,
+    key: &[u8; 32],
+    pacer: &Mutex<Pacer>,
+) {
+    for frame in frames {
+        let bytes = frame.encode(key);
+        let mut limiter = pacer.lock().await;
+        limiter.wait(bytes.len()).await;
+        drop(limiter);
+        if let Err(error) = public.send_to(&bytes, peer).await {
+            warn!(%error, "session send failed");
+        }
+    }
+}
+
+async fn run_server_session(
+    runtime: SessionRuntime,
+    mut input: mpsc::Receiver<SessionPacket>,
 ) -> Result<()> {
-    let key = key(&secret);
-    let public = UdpSocket::bind(listen)
-        .await
-        .context("bind server listen")?;
     let upstream_socket = UdpSocket::bind("127.0.0.1:0").await?;
-    upstream_socket.connect(upstream).await?;
-    let mut client_peer = None;
-    let mut session = 0u64;
-    let encoder = Arc::new(Mutex::new(Encoder::new(session)));
-    let mut decoder = Decoder::new(session);
-    let mut net_buf = vec![0u8; 2048];
+    upstream_socket.connect(runtime.upstream).await?;
+    let mut decoder = Decoder::new(runtime.session);
+    let mut encoder = Encoder::with_identity(runtime.session, runtime.version, runtime.key_id);
+    let mut peer = None;
     let mut upstream_buf = vec![0u8; 65535];
     let mut report = time::interval(Duration::from_secs(2));
     let mut flush = time::interval(Duration::from_millis(5));
-    let mut pacer = Pacer::new(rate_mbps)?;
-    info!(%listen, %upstream, "server started");
     loop {
         tokio::select! {
-            r = public.recv_from(&mut net_buf) => {
-                let (n, peer) = match r { Ok(v) => v, Err(e) => { warn!(error=%e, "public receive failed"); continue; } };
-                match Frame::decode(&net_buf[..n], &key) {
-                    Ok(f) => {
-                        if session != f.session {
-                            session = f.session; client_peer = Some(peer); decoder.reset(session);
-                            *encoder.lock().await = Encoder::new(session);
-                            info!(session, %peer, "active session");
-                        } else { client_peer = Some(peer); }
-                        if f.kind == KIND_REPORT && f.payload.len() == 4 {
-                            decoder.observe_seq(f.sequence);
-                            let loss = u32::from_be_bytes(f.payload[..4].try_into().unwrap());
-                            encoder.lock().await.adaptive.report(loss);
-                        } else { match decoder.frame(f) {
-                            Ok(datagrams) => for d in datagrams { if let Err(e) = upstream_socket.send(&d).await { warn!(error=%e, "upstream send failed"); } },
-                            Err(e) => warn!(error=%e, "discard invalid fec frame"),
-                        } }
+            packet = input.recv() => {
+                let Some(packet) = packet else { return Ok(()) };
+                peer = Some(packet.peer);
+                let frame = packet.frame;
+                if frame.session != runtime.session || frame.version != runtime.version || frame.key_id != runtime.key_id {
+                    continue;
+                }
+                if frame.kind == KIND_REPORT && frame.payload.len() == 4 {
+                    if decoder.observe_seq(frame.sequence) {
+                        encoder.adaptive.report(u32::from_be_bytes(frame.payload[..4].try_into().unwrap()));
                     }
-                    Err(e) => warn!(error=%e, %peer, "discard frame"),
+                } else {
+                    match decoder.frame(frame) {
+                        Ok(datagrams) => for datagram in datagrams {
+                            if let Err(error) = upstream_socket.send(&datagram).await {
+                                warn!(%error, "session upstream send failed");
+                            }
+                        },
+                        Err(error) => warn!(%error, "discard invalid session frame"),
+                    }
                 }
             }
-            r = upstream_socket.recv(&mut upstream_buf), if client_peer.is_some() => {
-                let n = match r { Ok(n) => n, Err(e) => { warn!(error=%e, "upstream receive failed"); continue; } };
-                let frames = encoder.lock().await.encode_datagram(&upstream_buf[..n])?;
-                send_frames(&public, client_peer, frames, &key, &mut pacer).await?;
+            received = upstream_socket.recv(&mut upstream_buf), if peer.is_some() => {
+                let n = match received { Ok(n) => n, Err(error) => { warn!(%error, "session upstream receive failed"); continue; } };
+                if let Ok(mut last_seen) = runtime.last_seen.lock() {
+                    *last_seen = Instant::now();
+                }
+                match encoder.encode_datagram(&upstream_buf[..n]) {
+                    Ok(frames) => send_session_frames(&runtime.public, peer.unwrap(), frames, &runtime.key, &runtime.pacer).await,
+                    Err(error) => warn!(%error, "session encode failed"),
+                }
             }
-            _ = report.tick(), if client_peer.is_some() => {
-                let loss = decoder.loss_report(); let mut enc = encoder.lock().await;
-                let parity = enc.adaptive.parity; let f = enc.report_frame(loss); drop(enc);
-                send_frames(&public, client_peer, vec![f], &key, &mut pacer).await?;
-                info!(loss_ppm=loss, tx_parity=parity, "link report");
+            _ = report.tick(), if peer.is_some() => {
+                let loss = decoder.loss_report();
+                let frame = encoder.report_frame(loss);
+                send_session_frames(&runtime.public, peer.unwrap(), vec![frame], &runtime.key, &runtime.pacer).await;
             }
-            _ = flush.tick(), if client_peer.is_some() => {
-                let frames = encoder.lock().await.flush()?;
-                send_frames(&public, client_peer, frames, &key, &mut pacer).await?;
+            _ = flush.tick(), if peer.is_some() => {
+                match encoder.flush() {
+                    Ok(frames) => send_session_frames(&runtime.public, peer.unwrap(), frames, &runtime.key, &runtime.pacer).await,
+                    Err(error) => warn!(%error, "session flush failed"),
+                }
+            }
+        }
+    }
+}
+
+async fn server(
+    listen: SocketAddr,
+    upstream: SocketAddr,
+    legacy_secret: Option<String>,
+    keyring_path: Option<PathBuf>,
+    max_sessions: usize,
+    session_idle_secs: u64,
+    rate_mbps: f64,
+) -> Result<()> {
+    if max_sessions == 0 || max_sessions > 65_536 {
+        bail!("max-sessions must be between 1 and 65536")
+    }
+    if !(10..=86_400).contains(&session_idle_secs) {
+        bail!("session-idle-secs must be between 10 and 86400")
+    }
+    let legacy_key = legacy_secret.as_deref().map(key);
+    let keyring = match keyring_path {
+        Some(path) => load_keyring(&path)?,
+        None => HashMap::new(),
+    };
+    if legacy_key.is_none() && keyring.is_empty() {
+        bail!("server requires --key for V1 migration and/or --keyring for V2")
+    }
+    let public = Arc::new(
+        UdpSocket::bind(listen)
+            .await
+            .context("bind server listen")?,
+    );
+    let pacer = Arc::new(Mutex::new(Pacer::new(rate_mbps)?));
+    let mut sessions: HashMap<(u64, u64), SessionEntry> = HashMap::new();
+    let mut net_buf = vec![0u8; 2048];
+    let mut cleanup = time::interval(Duration::from_secs(5));
+    let idle = Duration::from_secs(session_idle_secs);
+    info!(%listen, %upstream, v2_keys=keyring.len(), legacy=legacy_key.is_some(), max_sessions, "multi-user server started");
+    loop {
+        tokio::select! {
+            received = public.recv_from(&mut net_buf) => {
+                let (n, peer) = match received { Ok(v) => v, Err(error) => { warn!(%error, "public receive failed"); continue; } };
+                let (frame, device_key) = match decode_server_frame(&net_buf[..n], legacy_key.as_ref(), &keyring) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let session_key = (frame.key_id, frame.session);
+                if !sessions.contains_key(&session_key) {
+                    if sessions.len() >= max_sessions {
+                        continue;
+                    }
+                    if frame.version == VERSION_V1 && sessions.keys().filter(|(id, _)| *id == 0).count() >= MAX_V1_MIGRATION_SESSIONS {
+                        continue;
+                    }
+                    if frame.version == VERSION_V2 && sessions.keys().filter(|(id, _)| *id == frame.key_id).count() >= MAX_V2_SESSIONS_PER_DEVICE {
+                        continue;
+                    }
+                    let (sender, receiver) = mpsc::channel(256);
+                    let version = frame.version;
+                    let key_id = frame.key_id;
+                    let session = frame.session;
+                    let last_seen = Arc::new(std::sync::Mutex::new(Instant::now()));
+                    let runtime = SessionRuntime {
+                        public: public.clone(),
+                        upstream,
+                        key: device_key,
+                        version,
+                        key_id,
+                        session,
+                        pacer: pacer.clone(),
+                        last_seen: last_seen.clone(),
+                    };
+                    let task = tokio::spawn(async move {
+                        if let Err(error) = run_server_session(runtime, receiver).await {
+                            warn!(%error, "session worker stopped");
+                        }
+                    });
+                    sessions.insert(session_key, SessionEntry { sender, last_seen, task });
+                    info!(key_id=frame.key_id, session=frame.session, "authenticated session started");
+                }
+                if let Some(entry) = sessions.get_mut(&session_key) {
+                    if let Ok(mut last_seen) = entry.last_seen.lock() {
+                        *last_seen = Instant::now();
+                    }
+                    // A bounded queue intentionally sheds excess authenticated traffic.
+                    let _ = entry.sender.try_send(SessionPacket { frame, peer });
+                }
+            }
+            _ = cleanup.tick() => {
+                let now = Instant::now();
+                let expired: Vec<_> = sessions.iter()
+                    .filter(|(_, entry)| entry.task.is_finished() || entry.last_seen.lock().map_or(true, |last_seen| now.duration_since(*last_seen) >= idle))
+                    .map(|(id, _)| *id).collect();
+                for id in expired {
+                    if let Some(entry) = sessions.remove(&id) {
+                        entry.task.abort();
+                        info!(key_id=id.0, session=id.1, "session expired");
+                    }
+                }
             }
         }
     }
@@ -874,14 +1155,29 @@ async fn main() -> Result<()> {
             listen,
             server,
             key,
+            key_id,
             rate_mbps,
-        } => client(listen, server, key, rate_mbps).await,
+        } => client(listen, server, key, key_id, rate_mbps).await,
         Command::Server {
             listen,
             upstream,
             key,
+            keyring,
+            max_sessions,
+            session_idle_secs,
             rate_mbps,
-        } => server(listen, upstream, key, rate_mbps).await,
+        } => {
+            server(
+                listen,
+                upstream,
+                key,
+                keyring,
+                max_sessions,
+                session_idle_secs,
+                rate_mbps,
+            )
+            .await
+        }
         Command::Balance { listen, upstream } => balance(listen, upstream).await,
     }
 }
@@ -893,6 +1189,8 @@ mod tests {
     fn frame_auth_roundtrip() {
         let k = key("test");
         let f = Frame {
+            version: VERSION_V1,
+            key_id: 0,
             kind: KIND_DATA,
             session: 1,
             sequence: 2,
@@ -911,6 +1209,8 @@ mod tests {
     fn frame_rejects_tamper() {
         let k = key("test");
         let f = Frame {
+            version: VERSION_V1,
+            key_id: 0,
             kind: KIND_REPORT,
             session: 1,
             sequence: 1,
@@ -923,6 +1223,69 @@ mod tests {
         let mut b = f.encode(&k);
         b[20] ^= 1;
         assert!(Frame::decode(&b, &k).is_err());
+    }
+    #[test]
+    fn v2_frame_selects_device_key_and_authenticates() {
+        let device_key = key("device-secret-long-enough");
+        let mut enc = Encoder::with_identity(77, VERSION_V2, 42);
+        let frame = enc.report_frame(1234);
+        let bytes = frame.encode(&device_key);
+        let keys = HashMap::from([(42, device_key)]);
+        let (decoded, selected) = decode_server_frame(&bytes, None, &keys).unwrap();
+        assert_eq!(decoded.version, VERSION_V2);
+        assert_eq!(decoded.key_id, 42);
+        assert_eq!(decoded.session, 77);
+        assert_eq!(selected, device_key);
+    }
+    #[test]
+    fn v2_frame_rejects_unknown_or_wrong_device_key() {
+        let mut enc = Encoder::with_identity(77, VERSION_V2, 42);
+        let bytes = enc.report_frame(0).encode(&key("correct-device-secret"));
+        assert!(decode_server_frame(&bytes, None, &HashMap::new()).is_err());
+        let wrong = HashMap::from([(42, key("wrong-device-secret"))]);
+        assert!(decode_server_frame(&bytes, None, &wrong).is_err());
+    }
+    #[test]
+    fn keyring_rejects_reserved_duplicate_and_short_entries() {
+        assert!(parse_keyring("0 a-very-long-secret").is_err());
+        assert!(parse_keyring("1 too-short").is_err());
+        assert!(parse_keyring("1 first-secret-long\n1 second-secret-long").is_err());
+        let parsed = parse_keyring(
+            "# device keys\n1 first-device-secret-at-least-32-bytes\n2 second-device-secret-at-least-32-bytes",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+    }
+    #[test]
+    fn duplicate_authenticated_frame_is_not_delivered_twice() {
+        let mut enc = Encoder::with_identity(7, VERSION_V2, 3);
+        enc.adaptive.parity = 0;
+        enc.encode_datagram(b"payload").unwrap();
+        let frame = enc.flush().unwrap().remove(0);
+        let mut decoder = Decoder::new(7);
+        assert_eq!(
+            decoder.frame(frame.clone()).unwrap(),
+            vec![b"payload".to_vec()]
+        );
+        assert!(decoder.frame(frame).unwrap().is_empty());
+    }
+    #[test]
+    fn sessions_keep_independent_decoder_state() {
+        let mut first_encoder = Encoder::with_identity(10, VERSION_V2, 1);
+        let mut second_encoder = Encoder::with_identity(20, VERSION_V2, 2);
+        first_encoder.adaptive.parity = 0;
+        second_encoder.adaptive.parity = 0;
+        first_encoder.encode_datagram(b"first").unwrap();
+        second_encoder.encode_datagram(b"second").unwrap();
+        let first = first_encoder.flush().unwrap().remove(0);
+        let second = second_encoder.flush().unwrap().remove(0);
+        let mut first_decoder = Decoder::new(10);
+        let mut second_decoder = Decoder::new(20);
+        assert_eq!(first_decoder.frame(first).unwrap(), vec![b"first".to_vec()]);
+        assert_eq!(
+            second_decoder.frame(second).unwrap(),
+            vec![b"second".to_vec()]
+        );
     }
     #[test]
     fn adaptive_has_hysteresis() {

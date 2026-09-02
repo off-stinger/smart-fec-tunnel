@@ -9,6 +9,11 @@ usage() {
 [ "$(id -u)" = 0 ] || { echo "Run as root" >&2; exit 1; }
 [ "$#" -ge 2 ] || usage
 [ -n "${SMART_FEC_KEY:-}" ] || { echo "SMART_FEC_KEY is required" >&2; exit 1; }
+case "$SMART_FEC_KEY" in *[[:space:]]*) echo "SMART_FEC_KEY must not contain whitespace" >&2; exit 1;; esac
+[ "${SMART_FEC_KEY_ID:-}" = 0 ] && SMART_FEC_KEY_ID=
+if [ -n "${SMART_FEC_KEY_ID:-}" ]; then
+    case "$SMART_FEC_KEY_ID" in 0|*[!0-9]*) echo "SMART_FEC_KEY_ID must be a non-zero integer" >&2; exit 1;; esac
+fi
 
 binary=$1
 server=$2
@@ -27,6 +32,7 @@ chmod 0755 /usr/bin/smart-fec-tunnel
 umask 077
 {
     printf 'SMART_FEC_KEY=%s\n' "$SMART_FEC_KEY"
+    printf 'SMART_FEC_KEY_ID=%s\n' "${SMART_FEC_KEY_ID:-}"
     printf 'SMART_FEC_SERVER=%s\n' "$server"
     printf 'SMART_FEC_RATE_MBPS=%s\n' "$rate"
 } > /etc/smart-fec.env
@@ -40,10 +46,12 @@ STOP=10
 start_service() {
     . /etc/smart-fec.env
     procd_open_instance
-    procd_set_param command /usr/bin/smart-fec-tunnel client \
+    set -- /usr/bin/smart-fec-tunnel client \
         --listen 127.0.0.1:3333 \
         --server "$SMART_FEC_SERVER" \
         --rate-mbps "$SMART_FEC_RATE_MBPS"
+    [ -z "${SMART_FEC_KEY_ID:-}" ] || set -- "$@" --key-id "$SMART_FEC_KEY_ID"
+    procd_set_param command "$@"
     procd_set_param env SMART_FEC_KEY="$SMART_FEC_KEY" RUST_LOG=info
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
@@ -58,4 +66,3 @@ chmod 0755 /etc/init.d/smart-fec-client
 sleep 2
 /etc/init.d/smart-fec-client status | grep -q running
 echo "Installed successfully. Backup: $backup"
-

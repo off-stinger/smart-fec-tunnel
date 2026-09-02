@@ -9,6 +9,11 @@ usage() {
 [ "$(id -u)" = 0 ] || { echo "Run as root" >&2; exit 1; }
 [ "$#" -ge 1 ] || usage
 [ -n "${SMART_FEC_KEY:-}" ] || { echo "SMART_FEC_KEY is required" >&2; exit 1; }
+case "$SMART_FEC_KEY" in *[[:space:]]*) echo "SMART_FEC_KEY must not contain whitespace" >&2; exit 1;; esac
+[ "${SMART_FEC_KEY_ID:-}" = 0 ] && SMART_FEC_KEY_ID=
+if [ -n "${SMART_FEC_KEY_ID:-}" ]; then
+    case "$SMART_FEC_KEY_ID" in 0|*[!0-9]*) echo "SMART_FEC_KEY_ID must be a non-zero integer" >&2; exit 1;; esac
+fi
 
 binary=$1
 rate=${2:-30}
@@ -23,13 +28,30 @@ backup=/root/smart-fec-backup-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$backup"
 [ ! -e /usr/local/bin/smart-fec-tunnel ] || cp -a /usr/local/bin/smart-fec-tunnel "$backup/"
 [ ! -e /etc/smart-fec/server.env ] || cp -a /etc/smart-fec/server.env "$backup/"
+[ ! -e /etc/smart-fec/server.keys ] || cp -a /etc/smart-fec/server.keys "$backup/"
 [ ! -e /etc/systemd/system/smart-fec-server.service ] || cp -a /etc/systemd/system/smart-fec-server.service "$backup/"
 [ ! -e /etc/systemd/system/smart-warp-balance.service ] || cp -a /etc/systemd/system/smart-warp-balance.service "$backup/"
 
 install -m 0755 "$binary" /usr/local/bin/smart-fec-tunnel
 mkdir -p /etc/smart-fec
 umask 077
-printf 'SMART_FEC_KEY=%s\n' "$SMART_FEC_KEY" > /etc/smart-fec/server.env
+if [ -n "${SMART_FEC_KEY_ID:-}" ]; then
+    keyring_tmp=/etc/smart-fec/server.keys.new
+    if [ -f /etc/smart-fec/server.keys ]; then
+        awk -v id="$SMART_FEC_KEY_ID" '$1 != id' /etc/smart-fec/server.keys > "$keyring_tmp"
+    else
+        : > "$keyring_tmp"
+    fi
+    printf '%s %s\n' "$SMART_FEC_KEY_ID" "$SMART_FEC_KEY" >> "$keyring_tmp"
+    chmod 0600 "$keyring_tmp"
+    mv "$keyring_tmp" /etc/smart-fec/server.keys
+    [ -f /etc/smart-fec/server.env ] || : > /etc/smart-fec/server.env
+else
+    printf 'SMART_FEC_KEY=%s\n' "$SMART_FEC_KEY" > /etc/smart-fec/server.env
+fi
+
+server_auth_args=
+[ ! -s /etc/smart-fec/server.keys ] || server_auth_args='--keyring /etc/smart-fec/server.keys'
 
 cat > /etc/systemd/system/smart-fec-server.service <<EOF
 [Unit]
@@ -40,7 +62,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/smart-fec/server.env
-ExecStart=/usr/local/bin/smart-fec-tunnel server --listen 0.0.0.0:443 --upstream $upstream --rate-mbps $rate
+ExecStart=/usr/local/bin/smart-fec-tunnel server --listen 0.0.0.0:443 --upstream $upstream --rate-mbps $rate $server_auth_args
 Restart=always
 RestartSec=2
 NoNewPrivileges=true
@@ -79,4 +101,3 @@ sleep 2
 systemctl is-active --quiet smart-fec-server
 systemctl is-active --quiet smart-warp-balance
 echo "Installed successfully. Backup: $backup"
-

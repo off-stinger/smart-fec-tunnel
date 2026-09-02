@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Binary,
     [Parameter(Mandatory=$true)][string]$ServerEndpoint,
     [Parameter(Mandatory=$true)][string]$FecKey,
+    [UInt64]$FecKeyId = 0,
     [string]$SingBoxSpec,
     [switch]$StableGoogleEgress,
     [double]$RateMbps = 30
@@ -14,6 +15,7 @@ $ErrorActionPreference = 'Stop'
 if (!(Test-Path -LiteralPath $Binary)) { throw "Binary not found: $Binary" }
 if (!(Test-Path -LiteralPath $ServerIdentityFile)) { throw "Identity file not found: $ServerIdentityFile" }
 if ($FecKey.Length -lt 32) { throw 'FecKey must be at least 32 characters' }
+if ($FecKey -match '\s') { throw 'FecKey must not contain whitespace' }
 if ($RateMbps -lt 1 -or $RateMbps -gt 1000) { throw 'RateMbps must be between 1 and 1000' }
 if ($SingBoxSpec -and !(Test-Path -LiteralPath $SingBoxSpec)) { throw "sing-box spec not found: $SingBoxSpec" }
 
@@ -42,13 +44,13 @@ try {
         scp -i $ServerIdentityFile $googleRouteInstaller "${Server}:/tmp/install-google-route-updater.sh"
         ssh -i $ServerIdentityFile $Server "chmod 700 /tmp/add-google-stable-route.py /tmp/install-google-route-updater.sh; /tmp/install-google-route-updater.sh /tmp/add-google-stable-route.py; rm -f /tmp/add-google-stable-route.py /tmp/install-google-route-updater.sh"
     }
-    ssh -i $ServerIdentityFile $Server "chmod 600 /tmp/smart-fec.key; chmod 700 /tmp/server-install.sh '$remoteBinary'; SMART_FEC_KEY=`$(cat /tmp/smart-fec.key) /tmp/server-install.sh '$remoteBinary' '$RateMbps'; rm -f /tmp/smart-fec.key"
+    ssh -i $ServerIdentityFile $Server "chmod 600 /tmp/smart-fec.key; chmod 700 /tmp/server-install.sh '$remoteBinary'; SMART_FEC_KEY=`$(cat /tmp/smart-fec.key) SMART_FEC_KEY_ID='$FecKeyId' /tmp/server-install.sh '$remoteBinary' '$RateMbps'; rm -f /tmp/smart-fec.key"
 
     # Force legacy SCP because many OpenWrt Dropbear builds do not provide SFTP.
     scp -O $Binary "${OpenWrt}:$remoteBinary"
     scp -O $routerInstaller "${OpenWrt}:/tmp/openwrt-install.sh"
     scp -O $tempKey.FullName "${OpenWrt}:/tmp/smart-fec.key"
-    ssh $OpenWrt "chmod 600 /tmp/smart-fec.key; chmod 700 /tmp/openwrt-install.sh '$remoteBinary'; SMART_FEC_KEY=`$(cat /tmp/smart-fec.key) /tmp/openwrt-install.sh '$remoteBinary' '$ServerEndpoint' '$RateMbps'; rm -f /tmp/smart-fec.key"
+    ssh $OpenWrt "chmod 600 /tmp/smart-fec.key; chmod 700 /tmp/openwrt-install.sh '$remoteBinary'; SMART_FEC_KEY=`$(cat /tmp/smart-fec.key) SMART_FEC_KEY_ID='$FecKeyId' /tmp/openwrt-install.sh '$remoteBinary' '$ServerEndpoint' '$RateMbps'; rm -f /tmp/smart-fec.key"
 }
 finally {
     Remove-Item -LiteralPath $tempKey.FullName -Force -ErrorAction SilentlyContinue

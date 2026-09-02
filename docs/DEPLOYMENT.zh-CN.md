@@ -24,12 +24,15 @@
   -Binary .\smart-fec-tunnel-linux-amd64 `
   -ServerEndpoint 服务器IP:443 `
   -FecKey '<至少32字符随机值>' `
+  -FecKeyId 1 `
   -SingBoxSpec C:\secure\sing-box-deployment.json `
   -StableGoogleEgress `
   -RateMbps 30
 ```
 
 sing-box 阶段会依次：保存原配置和部署规范、生成候选配置、执行 `sing-box check`、原子替换、重启并检查 active 状态。校验或启动失败时不会继续部署；激活失败会恢复原配置并重启旧服务。
+
+`-FecKeyId` 使用非零整数标识设备。相同设备重复部署会原子更新服务端 keyring 中对应条目，不影响其他设备；每台设备必须使用不同 ID 和随机密钥。省略或传入 `0` 仅用于旧版 V1 迁移，不建议新部署使用。keyring 权限为 `0600`，修改后需重启服务加载。
 
 ## 3. 验收
 
