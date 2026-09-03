@@ -55,6 +55,10 @@ const MAX_PARITY: usize = 3;
 // Adding more parity only consumes the already constrained UDP budget and
 // makes TUIC congestion recovery worse, so the controller bypasses FEC.
 const FEC_BYPASS_LOSS_PPM: u32 = 150_000;
+// Loss reports also act as tunnel keepalives.  This reserved value preserves
+// that traffic without teaching the adaptive controller that an undersized
+// observation window is a real zero-loss sample.
+const LOSS_SAMPLE_UNAVAILABLE: u32 = u32::MAX;
 const MAX_V2_SESSIONS_PER_DEVICE: usize = 16;
 const MAX_V1_MIGRATION_SESSIONS: usize = 64;
 const MAX_DEVICE_KEYS: usize = 65_536;
@@ -297,6 +301,9 @@ impl Adaptive {
         }
     }
     fn report(&mut self, loss: u32) {
+        if loss == LOSS_SAMPLE_UNAVAILABLE {
+            return;
+        }
         self.last_loss_ppm = loss;
         if loss >= FEC_BYPASS_LOSS_PPM {
             self.parity = 0;
@@ -522,17 +529,17 @@ impl Decoder {
         self.highest_sequence = self.highest_sequence.max(seq);
         self.seen_sequences.insert(seq)
     }
-    fn loss_report(&mut self) -> u32 {
+    fn loss_report(&mut self) -> Option<u32> {
         let cutoff = self.highest_sequence.saturating_sub(REORDER_WINDOW);
         if cutoff <= self.finalized_sequence {
-            return 0;
+            return None;
         }
         let expected = cutoff - self.finalized_sequence;
         // A single missing report in an idle connection must not be represented
         // as 100% loss or drive the adaptive redundancy controller. Accumulate a
         // statistically useful window before finalizing a result.
         if expected < 32 {
-            return 0;
+            return None;
         }
         let received = self
             .seen_sequences
@@ -542,7 +549,7 @@ impl Decoder {
         let ppm = ((missing as u128 * 1_000_000) / expected as u128) as u32;
         self.seen_sequences = self.seen_sequences.split_off(&(cutoff + 1));
         self.finalized_sequence = cutoff;
-        ppm.min(1_000_000)
+        Some(ppm.min(1_000_000))
     }
     fn fragment(&mut self, shard: &[u8]) -> Vec<Vec<u8>> {
         if shard.len() < FRAGMENT_HEADER || shard.len() > SHARD {
@@ -894,9 +901,9 @@ async fn client(
                 let loss = decoder.loss_report();
                 let mut enc = encoder.lock().await;
                 let parity = enc.adaptive.parity;
-                let f = enc.report_frame(loss);
+                let f = enc.report_frame(loss.unwrap_or(LOSS_SAMPLE_UNAVAILABLE));
                 drop(enc); send_frames(&tunnel, None, vec![f], &key, &mut pacer).await?;
-                info!(loss_ppm=loss, tx_parity=parity, "link report");
+                info!(loss_ppm=?loss, tx_parity=parity, "link report");
             }
             _ = flush.tick() => {
                 let frames = encoder.lock().await.flush()?;
@@ -1000,7 +1007,7 @@ async fn run_server_session(
             }
             _ = report.tick(), if peer.is_some() => {
                 let loss = decoder.loss_report();
-                let frame = encoder.report_frame(loss);
+                let frame = encoder.report_frame(loss.unwrap_or(LOSS_SAMPLE_UNAVAILABLE));
                 send_session_frames(&runtime.public, peer.unwrap(), vec![frame], &runtime.key, &runtime.pacer).await;
             }
             _ = flush.tick(), if peer.is_some() => {
@@ -1489,6 +1496,22 @@ mod tests {
         assert_eq!(a.parity, 0);
     }
     #[test]
+    fn adaptive_ignores_unavailable_loss_samples() {
+        let mut a = Adaptive {
+            parity: 2,
+            bad: 1,
+            good: 7,
+            last_loss_ppm: 80_000,
+            smoothed_loss_ppm: 70_000,
+        };
+        a.report(LOSS_SAMPLE_UNAVAILABLE);
+        assert_eq!(a.parity, 2);
+        assert_eq!(a.bad, 1);
+        assert_eq!(a.good, 7);
+        assert_eq!(a.last_loss_ppm, 80_000);
+        assert_eq!(a.smoothed_loss_ppm, 70_000);
+    }
+    #[test]
     fn fec_recovers_missing_shard() {
         let mut enc = Encoder::new(9);
         enc.adaptive.parity = 2;
@@ -1517,7 +1540,7 @@ mod tests {
                 d.observe_seq(seq);
             }
         }
-        assert_eq!(d.loss_report(), 0);
+        assert_eq!(d.loss_report(), Some(0));
     }
     #[test]
     fn finalized_window_reports_real_loss_once() {
@@ -1528,8 +1551,8 @@ mod tests {
             }
         }
         let loss = d.loss_report();
-        assert_eq!(loss, 2_000_000u32 / 136);
-        assert_eq!(d.loss_report(), 0);
+        assert_eq!(loss, Some(2_000_000u32 / 136));
+        assert_eq!(d.loss_report(), None);
     }
     #[test]
     fn first_high_sequence_establishes_baseline() {
@@ -1537,7 +1560,7 @@ mod tests {
         for seq in 10_000..=10_200 {
             d.observe_seq(seq);
         }
-        assert_eq!(d.loss_report(), 0);
+        assert_eq!(d.loss_report(), Some(0));
     }
     #[test]
     fn empty_datagram_roundtrip() {
