@@ -284,7 +284,11 @@ struct Adaptive {
 impl Default for Adaptive {
     fn default() -> Self {
         Self {
-            parity: 2,
+            // Start without speculative redundancy.  On a rate-limited link,
+            // starting at 2 parity shards can triple one-shard QUIC traffic,
+            // overflow the UDP receive queue, and create a self-sustaining
+            // congestion/loss loop before feedback has any useful sample.
+            parity: 0,
             bad: 0,
             good: 0,
             last_loss_ppm: 0,
@@ -407,7 +411,10 @@ impl Encoder {
         let parity = if self.adaptive.parity == 0 {
             0
         } else if data < DATA_SHARDS {
-            self.adaptive.parity.min(data + 1)
+            // Never emit more repair shards than source shards for a partial
+            // group.  In particular, a single QUIC datagram needs at most one
+            // duplicate to recover one loss.
+            self.adaptive.parity.min(data)
         } else {
             (data * self.adaptive.parity).div_ceil(DATA_SHARDS)
         }
