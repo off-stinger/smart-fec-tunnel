@@ -38,10 +38,10 @@ const V3_SELECTOR: usize = 8;
 const V3_NONCE: usize = 24;
 const V3_INNER_HEADER: usize = 31;
 const TAG: usize = 16;
-// V3 adds 79 bytes around a shard. 1380 therefore produces a 1459-byte UDP
-// payload, below the IPv4/Ethernet 1472-byte no-fragment ceiling while allowing
-// a typical 1200-1350-byte QUIC datagram to remain in one FEC shard.
-const SHARD: usize = 1380;
+// V3 adds 79 bytes around a shard. 1340 therefore produces a 1419-byte UDP
+// payload (1447 bytes with IPv4/UDP), leaving headroom for Internet paths whose
+// effective MTU is below Ethernet's nominal 1500 bytes.
+const SHARD: usize = 1340;
 const FRAGMENT_HEADER: usize = 14;
 const CHUNK: usize = SHARD - FRAGMENT_HEADER;
 const DATA_SHARDS: usize = 10;
@@ -411,8 +411,13 @@ impl Encoder {
             .map(Vec::len)
             .max()
             .unwrap_or(FRAGMENT_HEADER);
-        for shard in &mut self.shards {
-            shard.resize(shard_len, 0);
+        // Equal-sized source shards are required only when Reed-Solomon parity
+        // is actually generated. Keeping variable lengths at parity=0 avoids
+        // turning a tiny tail fragment into another full-sized wire packet.
+        if parity > 0 {
+            for shard in &mut self.shards {
+                shard.resize(shard_len, 0);
+            }
         }
         let mut frames = Vec::with_capacity(data + parity);
         for (index, shard) in self.shards.iter().enumerate() {
