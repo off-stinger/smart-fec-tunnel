@@ -440,7 +440,7 @@ impl Encoder {
         if parity > 0 {
             let rs = ReedSolomon::new(data, parity)?;
             let mut all = self.shards.clone();
-            all.extend((0..parity).map(|_| vec![0u8; SHARD]));
+            all.extend((0..parity).map(|_| vec![0u8; shard_len]));
             rs.encode(&mut all)?;
             for p in 0..parity {
                 frames.push(Frame {
