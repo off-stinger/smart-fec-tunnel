@@ -272,29 +272,15 @@ fn decode_client_frame(buf: &[u8], key_id: u64, key: &[u8; 32]) -> Result<Frame>
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Adaptive {
+    // Zero is intentional: speculative startup redundancy can create a
+    // congestion/loss loop on a rate-limited path before feedback is useful.
     parity: usize,
     bad: u8,
     good: u16,
     last_loss_ppm: u32,
     smoothed_loss_ppm: u32,
-}
-
-impl Default for Adaptive {
-    fn default() -> Self {
-        Self {
-            // Start without speculative redundancy.  On a rate-limited link,
-            // starting at 2 parity shards can triple one-shard QUIC traffic,
-            // overflow the UDP receive queue, and create a self-sustaining
-            // congestion/loss loop before feedback has any useful sample.
-            parity: 0,
-            bad: 0,
-            good: 0,
-            last_loss_ppm: 0,
-            smoothed_loss_ppm: 0,
-        }
-    }
 }
 
 impl Adaptive {
