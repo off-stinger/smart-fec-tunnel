@@ -51,6 +51,10 @@ const REORDER_WINDOW: u64 = 64;
 const MAX_GROUPS: usize = 2048;
 const MAX_REASSEMBLIES: usize = 4096;
 const MAX_PARITY: usize = 3;
+// Above this loss level a 10+3 code cannot repair the path economically.
+// Adding more parity only consumes the already constrained UDP budget and
+// makes TUIC congestion recovery worse, so the controller bypasses FEC.
+const FEC_BYPASS_LOSS_PPM: u32 = 150_000;
 const MAX_V2_SESSIONS_PER_DEVICE: usize = 16;
 const MAX_V1_MIGRATION_SESSIONS: usize = 64;
 const MAX_DEVICE_KEYS: usize = 65_536;
@@ -294,6 +298,13 @@ impl Adaptive {
     }
     fn report(&mut self, loss: u32) {
         self.last_loss_ppm = loss;
+        if loss >= FEC_BYPASS_LOSS_PPM {
+            self.parity = 0;
+            self.bad = 0;
+            self.good = 0;
+            self.smoothed_loss_ppm = loss;
+            return;
+        }
         self.smoothed_loss_ppm = ((self.smoothed_loss_ppm as u64 * 3 + loss as u64) / 4) as u32;
         let target = Self::target(self.smoothed_loss_ppm);
         if target > self.parity {
@@ -1444,17 +1455,17 @@ mod tests {
     fn adaptive_has_hysteresis() {
         let mut a = Adaptive::default();
         for _ in 0..8 {
-            a.report(200_000);
+            a.report(90_000);
         }
-        assert_eq!(a.parity, 3);
+        assert!(a.parity >= 1);
         for _ in 0..24 {
             a.report(0);
         }
-        assert!(a.parity < 3);
+        assert_eq!(a.parity, 0);
         for _ in 0..20 {
             a.report(1_000_000);
         }
-        assert_eq!(a.parity, MAX_PARITY);
+        assert_eq!(a.parity, 0);
     }
     #[test]
     fn adaptive_reacts_to_bursty_loss() {
@@ -1462,11 +1473,20 @@ mod tests {
             parity: 0,
             ..Adaptive::default()
         };
-        for loss in [0, 250_000, 0, 180_000, 0, 220_000, 0, 150_000] {
+        for loss in [0, 75_000, 0, 80_000, 0, 90_000, 0, 70_000] {
             a.report(loss);
         }
         assert!(a.parity >= 1);
         assert!(a.parity <= MAX_PARITY);
+    }
+    #[test]
+    fn adaptive_bypasses_fec_when_loss_exceeds_repair_budget() {
+        let mut a = Adaptive {
+            parity: MAX_PARITY,
+            ..Adaptive::default()
+        };
+        a.report(FEC_BYPASS_LOSS_PPM);
+        assert_eq!(a.parity, 0);
     }
     #[test]
     fn fec_recovers_missing_shard() {
