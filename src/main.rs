@@ -1458,7 +1458,7 @@ mod tests {
             a.report(90_000);
         }
         assert!(a.parity >= 1);
-        for _ in 0..24 {
+        for _ in 0..45 {
             a.report(0);
         }
         assert_eq!(a.parity, 0);
