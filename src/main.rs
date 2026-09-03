@@ -38,7 +38,10 @@ const V3_SELECTOR: usize = 8;
 const V3_NONCE: usize = 24;
 const V3_INNER_HEADER: usize = 31;
 const TAG: usize = 16;
-const SHARD: usize = 1050;
+// V3 adds 79 bytes around a shard. 1380 therefore produces a 1459-byte UDP
+// payload, below the IPv4/Ethernet 1472-byte no-fragment ceiling while allowing
+// a typical 1200-1350-byte QUIC datagram to remain in one FEC shard.
+const SHARD: usize = 1380;
 const FRAGMENT_HEADER: usize = 14;
 const CHUNK: usize = SHARD - FRAGMENT_HEADER;
 const DATA_SHARDS: usize = 10;
@@ -383,7 +386,7 @@ impl Encoder {
             payload.chunks(CHUNK).collect()
         };
         for (idx, chunk) in chunks.into_iter().enumerate() {
-            let mut shard = vec![0u8; SHARD];
+            let mut shard = vec![0u8; FRAGMENT_HEADER + chunk.len()];
             shard[0..8].copy_from_slice(&packet_id.to_be_bytes());
             shard[8..10].copy_from_slice(&(idx as u16).to_be_bytes());
             shard[10..12].copy_from_slice(&(count as u16).to_be_bytes());
@@ -409,6 +412,15 @@ impl Encoder {
             (data * self.adaptive.parity).div_ceil(DATA_SHARDS)
         }
         .min(MAX_PARITY);
+        let shard_len = self
+            .shards
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(FRAGMENT_HEADER);
+        for shard in &mut self.shards {
+            shard.resize(shard_len, 0);
+        }
         let mut frames = Vec::with_capacity(data + parity);
         for (index, shard) in self.shards.iter().enumerate() {
             frames.push(Frame {
@@ -507,6 +519,12 @@ impl Decoder {
             return 0;
         }
         let expected = cutoff - self.finalized_sequence;
+        // A single missing report in an idle connection must not be represented
+        // as 100% loss or drive the adaptive redundancy controller. Accumulate a
+        // statistically useful window before finalizing a result.
+        if expected < 32 {
+            return 0;
+        }
         let received = self
             .seen_sequences
             .range((self.finalized_sequence + 1)..=cutoff)
@@ -518,14 +536,19 @@ impl Decoder {
         ppm.min(1_000_000)
     }
     fn fragment(&mut self, shard: &[u8]) -> Vec<Vec<u8>> {
-        if shard.len() != SHARD {
+        if shard.len() < FRAGMENT_HEADER || shard.len() > SHARD {
             return vec![];
         }
         let packet = u64::from_be_bytes(shard[0..8].try_into().unwrap());
         let idx = u16::from_be_bytes(shard[8..10].try_into().unwrap()) as usize;
         let count = u16::from_be_bytes(shard[10..12].try_into().unwrap()) as usize;
         let len = u16::from_be_bytes(shard[12..14].try_into().unwrap()) as usize;
-        if count == 0 || count > 64 || idx >= count || len > CHUNK {
+        if count == 0
+            || count > 64
+            || idx >= count
+            || len > CHUNK
+            || FRAGMENT_HEADER + len > shard.len()
+        {
             return vec![];
         }
         let entry = self.packets.entry(packet).or_insert_with(|| Reassembly {
@@ -565,7 +588,8 @@ impl Decoder {
             || data > 32
             || parity > 16
             || frame.index as usize >= data + parity
-            || frame.payload.len() != SHARD
+            || frame.payload.len() < FRAGMENT_HEADER
+            || frame.payload.len() > SHARD
         {
             bail!("invalid fec frame")
         }

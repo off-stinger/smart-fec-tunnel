@@ -1,6 +1,6 @@
 # Smart FEC Tunnel
 
-面向 OpenWrt 旁路由与 Linux 服务端的 TUIC 外层 FEC、限速整形和多 WARP 分流方案。`0.2.0-alpha.2` 增加 FEC V3 加密信封：公网不再暴露固定魔数、版本、设备 ID、会话、序列与 FEC 参数，同时保留 V1/V2 迁移接收。项目不修改 sing-box/TUIC 源码。
+面向 OpenWrt 旁路由与 Linux 服务端的 TUIC 外层 FEC、限速整形和多 WARP 分流方案。`0.2.0-alpha.3` 使用 FEC V3 加密信封和 MTU 安全的动态 shard：公网不再暴露固定魔数及 FEC 元数据，典型 QUIC 数据报无需二次分片，小包也不再固定填充至统一长度。项目不修改 sing-box/TUIC 源码。
 
 ## 数据路径
 
