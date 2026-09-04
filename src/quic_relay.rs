@@ -11,6 +11,7 @@ use crate::quic_auth::{
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use quinn::{
+    congestion::{Controller, ControllerFactory},
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     rustls::{self, pki_types::CertificateDer, pki_types::PrivateKeyDer},
     ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig,
@@ -39,6 +40,55 @@ const CARRIER_PING: &[u8] = b"SFT-Q-PING-1";
 const CARRIER_PONG: &[u8] = b"SFT-Q-PONG-1";
 const CARRIER_HEARTBEAT: Duration = Duration::from_secs(2);
 const CARRIER_DEAD_TIMEOUT: Duration = Duration::from_secs(6);
+const CARRIER_WINDOW: u64 = 4 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+struct CarrierController {
+    window: u64,
+}
+
+impl Controller for CarrierController {
+    fn on_congestion_event(
+        &mut self,
+        _now: std::time::Instant,
+        _sent: std::time::Instant,
+        _is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+        // The encapsulated TUIC connection and SFT pacer already respond to
+        // congestion. Reducing this outer carrier window would punish the same
+        // loss twice and collapse throughput.
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        self.window
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+#[derive(Debug)]
+struct CarrierControllerFactory;
+
+impl ControllerFactory for CarrierControllerFactory {
+    fn build(self: Arc<Self>, _now: std::time::Instant, _current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(CarrierController {
+            window: CARRIER_WINDOW,
+        })
+    }
+}
 
 #[derive(Debug)]
 struct CarrierGroup {
@@ -136,6 +186,7 @@ fn transport_config() -> Arc<TransportConfig> {
     // PMTU discovery and black-hole detection remain enabled and can lower it;
     // the carrier fragmentation layer handles the resulting smaller DATAGRAM.
     transport.initial_mtu(1472);
+    transport.congestion_controller_factory(Arc::new(CarrierControllerFactory));
     transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
     transport.datagram_send_buffer_size(4 * 1024 * 1024);
     Arc::new(transport)
