@@ -1,12 +1,13 @@
 # Smart FEC Tunnel
 
-面向 OpenWrt 旁路由与 Linux 服务端的 TUIC 外层 FEC、限速整形和多 WARP 分流方案。`0.2.0-alpha.8` 使用 FEC V3 加密信封和保守路径 MTU：公网不再暴露固定魔数及 FEC 元数据，外层 IPv4 包不超过约 1447 字节；冷启动从零冗余开始，无冗余时尾分片不补齐，高丢包超过纠错预算时自动旁路 FEC，无有效样本的心跳不再被误判为零丢包，空闲 30 秒后会逐级退出历史冗余，避免 FEC 状态冻结。项目不修改 sing-box/TUIC 源码。
+面向 OpenWrt 旁路由与 Linux 服务端的 TUIC 外层 FEC、限速整形和多 WARP 分流方案。`0.2.0-alpha.9` 增加可并行部署的 QUIC/TLS 1.3 承载：设备证明绑定 TLS Exporter，使用进程级有界重放缓存；现有 FEC V3 数据报按 QUIC 实际协商上限动态分片，避免依赖放大公网 MTU，并用双向心跳发现失效连接。原有 UDP/FEC 模式保留作为无损回退，项目不修改 sing-box/TUIC 源码。
 
 ## 数据路径
 
 ```text
 Passwall -> TUIC -> smart-fec client (OpenWrt)
-          -> UDP/443 FEC -> smart-fec server (Linux)
+          -> QUIC relay -> UDP/443 QUIC/TLS + FEC
+          -> QUIC relay server -> loopback smart-fec server (Linux)
           -> 127.0.0.1:4443 sing-box TUIC inbound
           -> TCP: WARP A/B/C 按连接负载
           -> UDP: 默认稳定 WARP B
@@ -19,6 +20,8 @@ TCP/443 可继续由现有 Reality/VLESS 使用，FEC 服务只占用 UDP/443。
 - 认证报文、FEC 丢包恢复、乱序窗口和内存上限
 - FEC V2 每设备 `key_id`、独立密钥、独立会话与上游 socket；服务端会话总量及单设备数量有界
 - FEC V3 使用 XChaCha20-Poly1305 加密全部内部元数据，外层只保留不透明密钥选择器和随机 nonce
+- QUIC/TLS 1.3 可选承载、证书固定、TLS Exporter 通道绑定设备认证和跨连接重放防护
+- QUIC 外层动态分片、有界重组、2 秒心跳与 6 秒失效检测；旧 UDP 模式可并行回退
 - 默认按服务端 30 Mbps 峰值整形，避免 UDP 突发
 - 三路 WARP 是按 TCP 连接负载，不是 urltest 择优，也不复制业务请求
 - Google 搜索可固定走服务器稳定公网，规避共享 WARP IP 被 Google 错标为中国地区
@@ -62,6 +65,7 @@ python3 -m unittest tests/test_sing_box_merge.py
 cargo build --release --target x86_64-unknown-linux-musl
 SMART_FEC_BIN=./target/x86_64-unknown-linux-musl/release/smart-fec-tunnel python3 tests/integration_loopback.py
 SMART_FEC_BIN=./target/x86_64-unknown-linux-musl/release/smart-fec-tunnel python3 tests/integration_multiuser.py
+BIN=./target/x86_64-unknown-linux-musl/release/smart-fec-tunnel tests/integration_quic_relay.sh
 ```
 
 ## 安全
