@@ -1525,8 +1525,10 @@ mod tests {
         };
         a.report(LOSS_SAMPLE_UNAVAILABLE);
         assert_eq!(a.parity, 2);
-        assert_eq!(a.bad, 1);
-        assert_eq!(a.good, 7);
+        // An idle gap breaks both consecutive-sample streaks, but must not
+        // immediately change the active parity or measured loss history.
+        assert_eq!(a.bad, 0);
+        assert_eq!(a.good, 0);
         assert_eq!(a.last_loss_ppm, 80_000);
         assert_eq!(a.smoothed_loss_ppm, 70_000);
     }
