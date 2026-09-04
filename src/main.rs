@@ -289,6 +289,7 @@ struct Adaptive {
     good: u16,
     last_loss_ppm: u32,
     smoothed_loss_ppm: u32,
+    unavailable_reports: u8,
 }
 
 impl Adaptive {
@@ -302,14 +303,31 @@ impl Adaptive {
     }
     fn report(&mut self, loss: u32) {
         if loss == LOSS_SAMPLE_UNAVAILABLE {
+            self.bad = 0;
+            self.good = 0;
+            self.unavailable_reports = self.unavailable_reports.saturating_add(1);
+            // Reports arrive every two seconds.  If traffic has been too idle
+            // to produce a real sample for 30 seconds, retire one stale parity
+            // level.  This keeps the NAT heartbeat without freezing expensive
+            // redundancy indefinitely after a previous burst.
+            if self.unavailable_reports >= 15 {
+                self.parity = self.parity.saturating_sub(1);
+                self.unavailable_reports = 0;
+                if self.parity == 0 {
+                    self.smoothed_loss_ppm = 0;
+                    self.last_loss_ppm = 0;
+                }
+            }
             return;
         }
+        self.unavailable_reports = 0;
         self.last_loss_ppm = loss;
         if loss >= FEC_BYPASS_LOSS_PPM {
             self.parity = 0;
             self.bad = 0;
             self.good = 0;
             self.smoothed_loss_ppm = loss;
+            self.unavailable_reports = 0;
             return;
         }
         self.smoothed_loss_ppm = ((self.smoothed_loss_ppm as u64 * 3 + loss as u64) / 4) as u32;
@@ -1503,6 +1521,7 @@ mod tests {
             good: 7,
             last_loss_ppm: 80_000,
             smoothed_loss_ppm: 70_000,
+            unavailable_reports: 0,
         };
         a.report(LOSS_SAMPLE_UNAVAILABLE);
         assert_eq!(a.parity, 2);
@@ -1510,6 +1529,23 @@ mod tests {
         assert_eq!(a.good, 7);
         assert_eq!(a.last_loss_ppm, 80_000);
         assert_eq!(a.smoothed_loss_ppm, 70_000);
+    }
+    #[test]
+    fn adaptive_retires_stale_parity_after_idle_timeout() {
+        let mut a = Adaptive {
+            parity: 2,
+            ..Adaptive::default()
+        };
+        for _ in 0..14 {
+            a.report(LOSS_SAMPLE_UNAVAILABLE);
+        }
+        assert_eq!(a.parity, 2);
+        a.report(LOSS_SAMPLE_UNAVAILABLE);
+        assert_eq!(a.parity, 1);
+        for _ in 0..15 {
+            a.report(LOSS_SAMPLE_UNAVAILABLE);
+        }
+        assert_eq!(a.parity, 0);
     }
     #[test]
     fn fec_recovers_missing_shard() {
