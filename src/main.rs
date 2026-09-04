@@ -7,6 +7,7 @@ use chacha20poly1305::{
 use clap::{Parser, Subcommand};
 use rand::{Rng, RngCore};
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use smart_fec_tunnel::quic_relay;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::SocketAddr,
@@ -108,6 +109,34 @@ enum Command {
         listen: SocketAddr,
         #[arg(long, required = true, num_args = 1..)]
         upstream: Vec<SocketAddr>,
+    },
+    /// Carry the existing SFT/FEC UDP wire protocol inside authenticated QUIC DATAGRAMs.
+    QuicClient {
+        #[arg(long, default_value = "127.0.0.1:8444")]
+        listen: SocketAddr,
+        #[arg(long)]
+        server: SocketAddr,
+        #[arg(long)]
+        server_name: String,
+        #[arg(long)]
+        ca_cert: PathBuf,
+        #[arg(long, env = "SMART_FEC_KEY_ID")]
+        key_id: u64,
+        #[arg(long, env = "SMART_FEC_KEY")]
+        key: String,
+    },
+    /// Accept authenticated QUIC on UDP/443 and relay SFT frames to a loopback server.
+    QuicServer {
+        #[arg(long, default_value = "0.0.0.0:443")]
+        listen: SocketAddr,
+        #[arg(long, default_value = "127.0.0.1:8443")]
+        upstream: SocketAddr,
+        #[arg(long)]
+        cert: PathBuf,
+        #[arg(long)]
+        private_key: PathBuf,
+        #[arg(long, env = "SMART_FEC_KEYRING")]
+        keyring: PathBuf,
     },
 }
 
@@ -1351,6 +1380,21 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Balance { listen, upstream } => balance(listen, upstream).await,
+        Command::QuicClient {
+            listen,
+            server,
+            server_name,
+            ca_cert,
+            key_id,
+            key,
+        } => quic_relay::run_client(listen, server, &server_name, &ca_cert, key_id, &key).await,
+        Command::QuicServer {
+            listen,
+            upstream,
+            cert,
+            private_key,
+            keyring,
+        } => quic_relay::run_server(listen, upstream, &cert, &private_key, &keyring).await,
     }
 }
 

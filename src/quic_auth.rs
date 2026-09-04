@@ -99,6 +99,17 @@ pub fn make_envelope(
     out
 }
 
+pub fn envelope_device_id(envelope: &[u8]) -> Result<u64> {
+    if envelope.len() != ENVELOPE_LEN || &envelope[..4] != MAGIC || envelope[4] != VERSION {
+        bail!("invalid authentication envelope")
+    }
+    let device_id = u64::from_be_bytes(envelope[5..13].try_into().unwrap());
+    if device_id == 0 {
+        bail!("device id must be non-zero")
+    }
+    Ok(device_id)
+}
+
 pub fn verify_envelope(
     envelope: &[u8],
     secret: &str,
@@ -110,10 +121,7 @@ pub fn verify_envelope(
     if envelope.len() != ENVELOPE_LEN || &envelope[..4] != MAGIC || envelope[4] != VERSION {
         bail!("invalid authentication envelope")
     }
-    let device_id = u64::from_be_bytes(envelope[5..13].try_into().unwrap());
-    if device_id == 0 {
-        bail!("device id must be non-zero")
-    }
+    let device_id = envelope_device_id(envelope)?;
     let timestamp = u64::from_be_bytes(envelope[13..21].try_into().unwrap());
     if now.abs_diff(timestamp) > window_secs {
         bail!("expired authentication envelope")

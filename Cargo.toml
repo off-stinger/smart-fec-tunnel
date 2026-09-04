@@ -6,10 +6,13 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 blake3 = "1"
+bytes = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
+quinn = "0.11.11"
 rand = "0.8"
 reed-solomon-erasure = "6"
+rustls-pemfile = "2"
 subtle = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

@@ -3,3 +3,4 @@
 pub mod controller;
 pub mod product_config;
 pub mod quic_auth;
+pub mod quic_relay;
