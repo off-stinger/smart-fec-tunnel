@@ -40,9 +40,9 @@ const CARRIER_PING: &[u8] = b"SFT-Q-PING-1";
 const CARRIER_PONG: &[u8] = b"SFT-Q-PONG-1";
 const CARRIER_HEARTBEAT: Duration = Duration::from_secs(2);
 // QUIC DATAGRAM is intentionally unreliable. A missing PONG alone is not proof
-// that the path is dead, so allow several heartbeat opportunities and count any
-// authenticated server datagram as evidence that the carrier is alive.
-const CARRIER_DEAD_TIMEOUT: Duration = Duration::from_secs(12);
+// that the path is dead, so count any authenticated server datagram as evidence
+// that the carrier is alive while retaining fast failure detection.
+const CARRIER_DEAD_TIMEOUT: Duration = Duration::from_secs(6);
 const CARRIER_WINDOW: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
