@@ -132,6 +132,10 @@ fn transport_config() -> Arc<TransportConfig> {
     transport.max_concurrent_bidi_streams(1_u8.into());
     transport.max_idle_timeout(Some(Duration::from_secs(8).try_into().unwrap()));
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
+    // 1472 bytes plus the IPv4 header is a standard 1500-byte packet. Quinn's
+    // PMTU discovery and black-hole detection remain enabled and can lower it;
+    // the carrier fragmentation layer handles the resulting smaller DATAGRAM.
+    transport.initial_mtu(1472);
     transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
     transport.datagram_send_buffer_size(4 * 1024 * 1024);
     Arc::new(transport)
@@ -372,7 +376,7 @@ pub async fn run_client(
         let result = async {
             let connection = endpoint.connect(server, server_name)?.await?;
             authenticate_client(&connection, device_id, secret).await?;
-            info!(%server, "QUIC relay connected and authenticated");
+            info!(%server, max_datagram = ?connection.max_datagram_size(), "QUIC relay connected and authenticated");
             delay = Duration::from_secs(1);
             relay_client_session(&socket, &connection).await
         }
