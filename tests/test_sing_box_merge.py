@@ -46,6 +46,13 @@ class MergeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MODULE.merge(self.base, self.spec)
 
+    def test_rejects_duplicate_wireguard_identities(self):
+        self.spec["endpoints"].append(
+            {"type": "wireguard", "tag": "warp-b", "private_key": "secret"}
+        )
+        with self.assertRaisesRegex(ValueError, "independent private keys"):
+            MODULE.merge(self.base, self.spec)
+
 
 if __name__ == "__main__":
     unittest.main()

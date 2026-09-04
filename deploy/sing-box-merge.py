@@ -29,6 +29,19 @@ def upsert(existing, additions, managed_tags):
     return kept + copy.deepcopy(additions)
 
 
+def validate_wireguard_identities(endpoints):
+    identities = []
+    for endpoint in endpoints:
+        if endpoint.get("type") != "wireguard":
+            continue
+        private_key = endpoint.get("private_key")
+        if not isinstance(private_key, str) or not private_key.strip():
+            fail(f"wireguard endpoint {endpoint['tag']} requires a private_key")
+        identities.append(private_key)
+    if len(identities) != len(set(identities)):
+        fail("wireguard endpoints must use independent private keys")
+
+
 def merge(base, spec):
     if not isinstance(base, dict) or not isinstance(spec, dict):
         fail("base and deployment spec must be JSON objects")
@@ -39,6 +52,7 @@ def merge(base, spec):
     inbound_tags = tagged(inbounds, "inbounds")
     outbound_tags = tagged(outbounds, "outbounds")
     endpoint_tags = tagged(endpoints, "endpoints")
+    validate_wireguard_identities(endpoints)
     all_tags = inbound_tags + outbound_tags + endpoint_tags
     if len(all_tags) != len(set(all_tags)):
         fail("managed tags must be unique across inbounds, outbounds and endpoints")
