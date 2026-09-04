@@ -40,7 +40,7 @@ const CARRIER_PING: &[u8] = b"SFT-Q-PING-1";
 const CARRIER_PONG: &[u8] = b"SFT-Q-PONG-1";
 const CARRIER_HEARTBEAT: Duration = Duration::from_secs(2);
 const CARRIER_DEAD_TIMEOUT: Duration = Duration::from_secs(6);
-const CARRIER_WINDOW: u64 = 4 * 1024 * 1024;
+const CARRIER_WINDOW: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct CarrierController {
