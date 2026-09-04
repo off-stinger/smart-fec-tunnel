@@ -39,7 +39,10 @@ const CARRIER_TTL: Duration = Duration::from_secs(3);
 const CARRIER_PING: &[u8] = b"SFT-Q-PING-1";
 const CARRIER_PONG: &[u8] = b"SFT-Q-PONG-1";
 const CARRIER_HEARTBEAT: Duration = Duration::from_secs(2);
-const CARRIER_DEAD_TIMEOUT: Duration = Duration::from_secs(6);
+// QUIC DATAGRAM is intentionally unreliable. A missing PONG alone is not proof
+// that the path is dead, so allow several heartbeat opportunities and count any
+// authenticated server datagram as evidence that the carrier is alive.
+const CARRIER_DEAD_TIMEOUT: Duration = Duration::from_secs(12);
 const CARRIER_WINDOW: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -180,7 +183,7 @@ async fn send_carrier(connection: &Connection, payload: &[u8], message: &mut u64
 fn transport_config() -> Arc<TransportConfig> {
     let mut transport = TransportConfig::default();
     transport.max_concurrent_bidi_streams(1_u8.into());
-    transport.max_idle_timeout(Some(Duration::from_secs(8).try_into().unwrap()));
+    transport.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
     // 1472 bytes plus the IPv4 header is a standard 1500-byte packet. Quinn's
     // PMTU discovery and black-hole detection remain enabled and can lower it;
@@ -383,11 +386,11 @@ async fn relay_client_session(socket: &UdpSocket, connection: &Connection) -> Re
     let mut message = 0u64;
     let mut heartbeat = time::interval(CARRIER_HEARTBEAT);
     heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-    let mut last_pong = Instant::now();
+    let mut last_server_activity = Instant::now();
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if last_pong.elapsed() > CARRIER_DEAD_TIMEOUT {
+                if last_server_activity.elapsed() > CARRIER_DEAD_TIMEOUT {
                     bail!("QUIC carrier heartbeat timeout")
                 }
                 connection.send_datagram_wait(Bytes::from_static(CARRIER_PING)).await?;
@@ -399,10 +402,13 @@ async fn relay_client_session(socket: &UdpSocket, connection: &Connection) -> Re
             }
             incoming = connection.read_datagram() => {
                 let incoming = incoming?;
-                if incoming.as_ref() == CARRIER_PONG {
-                    last_pong = Instant::now();
-                } else if let (Some(peer), Some(payload)) = (local_peer, received.push(&incoming)?) {
-                    socket.send_to(&payload, peer).await?;
+                // Both PONG and ordinary relay traffic prove that the
+                // authenticated peer and return path are still usable.
+                last_server_activity = Instant::now();
+                if incoming.as_ref() != CARRIER_PONG {
+                    if let (Some(peer), Some(payload)) = (local_peer, received.push(&incoming)?) {
+                        socket.send_to(&payload, peer).await?;
+                    }
                 }
             }
         }
