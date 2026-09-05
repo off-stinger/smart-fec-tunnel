@@ -332,29 +332,21 @@ async fn relay_connection(connection: Connection, upstream: SocketAddr) -> Resul
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     let mut received = CarrierReassembly::default();
     let mut message = 0u64;
-    let receive = async {
-        loop {
-            let incoming = connection.read_datagram().await?;
-            if incoming.as_ref() == CARRIER_PING {
-                connection.send_datagram(Bytes::from_static(CARRIER_PONG))?;
-            } else if let Some(payload) = received.push(&incoming)? {
-                socket.send(&payload).await?;
+    loop {
+        tokio::select! {
+            incoming = connection.read_datagram() => {
+                let incoming = incoming?;
+                if incoming.as_ref() == CARRIER_PING {
+                    connection.send_datagram_wait(Bytes::from_static(CARRIER_PONG)).await?;
+                } else if let Some(payload) = received.push(&incoming)? {
+                    socket.send(&payload).await?;
+                }
+            }
+            incoming = socket.recv(&mut buffer) => {
+                let size = incoming?;
+                send_carrier(&connection, &buffer[..size], &mut message).await?;
             }
         }
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    };
-    let send = async {
-        loop {
-            let size = socket.recv(&mut buffer).await?;
-            send_carrier(&connection, &buffer[..size], &mut message).await?;
-        }
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    };
-    tokio::select! {
-        result = receive => result,
-        result = send => result,
     }
 }
 
