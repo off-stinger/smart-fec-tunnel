@@ -332,21 +332,29 @@ async fn relay_connection(connection: Connection, upstream: SocketAddr) -> Resul
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     let mut received = CarrierReassembly::default();
     let mut message = 0u64;
-    loop {
-        tokio::select! {
-            incoming = connection.read_datagram() => {
-                let incoming = incoming?;
-                if incoming.as_ref() == CARRIER_PING {
-                    connection.send_datagram_wait(Bytes::from_static(CARRIER_PONG)).await?;
-                } else if let Some(payload) = received.push(&incoming)? {
-                    socket.send(&payload).await?;
-                }
-            }
-            incoming = socket.recv(&mut buffer) => {
-                let size = incoming?;
-                send_carrier(&connection, &buffer[..size], &mut message).await?;
+    let receive = async {
+        loop {
+            let incoming = connection.read_datagram().await?;
+            if incoming.as_ref() == CARRIER_PING {
+                connection.send_datagram(Bytes::from_static(CARRIER_PONG))?;
+            } else if let Some(payload) = received.push(&incoming)? {
+                socket.send(&payload).await?;
             }
         }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    let send = async {
+        loop {
+            let size = socket.recv(&mut buffer).await?;
+            send_carrier(&connection, &buffer[..size], &mut message).await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::select! {
+        result = receive => result,
+        result = send => result,
     }
 }
 
@@ -380,38 +388,53 @@ pub async fn run_server(
 }
 
 async fn relay_client_session(socket: &UdpSocket, connection: &Connection) -> Result<()> {
-    let mut local_peer = None;
+    let (peer_tx, peer_rx) = tokio::sync::watch::channel(None);
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     let mut received = CarrierReassembly::default();
     let mut message = 0u64;
     let mut heartbeat = time::interval(CARRIER_HEARTBEAT);
     heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     let mut last_server_activity = Instant::now();
-    loop {
-        tokio::select! {
-            _ = heartbeat.tick() => {
-                if last_server_activity.elapsed() > CARRIER_DEAD_TIMEOUT {
-                    bail!("QUIC carrier heartbeat timeout")
+    // Poll both directions independently: QUIC send backpressure must never
+    // stop draining return traffic or prevent the liveness timer from running.
+    let send = async {
+        loop {
+            let (size, peer) = socket.recv_from(&mut buffer).await?;
+            peer_tx.send_replace(Some(peer));
+            send_carrier(connection, &buffer[..size], &mut message).await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    let receive = async {
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    if last_server_activity.elapsed() > CARRIER_DEAD_TIMEOUT {
+                        bail!("QUIC carrier heartbeat timeout")
+                    }
+                    connection.send_datagram(Bytes::from_static(CARRIER_PING))?;
                 }
-                connection.send_datagram_wait(Bytes::from_static(CARRIER_PING)).await?;
-            }
-            incoming = socket.recv_from(&mut buffer) => {
-                let (size, peer) = incoming?;
-                local_peer = Some(peer);
-                send_carrier(connection, &buffer[..size], &mut message).await?;
-            }
-            incoming = connection.read_datagram() => {
-                let incoming = incoming?;
-                // Both PONG and ordinary relay traffic prove that the
-                // authenticated peer and return path are still usable.
-                last_server_activity = Instant::now();
-                if incoming.as_ref() != CARRIER_PONG {
-                    if let (Some(peer), Some(payload)) = (local_peer, received.push(&incoming)?) {
-                        socket.send_to(&payload, peer).await?;
+                incoming = connection.read_datagram() => {
+                    let incoming = incoming?;
+                    // Both PONG and ordinary relay traffic prove that the
+                    // authenticated peer and return path are still usable.
+                    last_server_activity = Instant::now();
+                    if incoming.as_ref() != CARRIER_PONG {
+                        let local_peer = *peer_rx.borrow();
+                        if let (Some(peer), Some(payload)) = (local_peer, received.push(&incoming)?) {
+                            socket.send_to(&payload, peer).await?;
+                        }
                     }
                 }
             }
         }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::select! {
+        result = receive => result,
+        result = send => result,
     }
 }
 
