@@ -43,7 +43,8 @@ Smart Gateway 的目标是把弱网恢复、加密代理、多出口调度和多
 | Rust Controller/事务 Revision | Alpha 骨架 | 已有类型化 Profile、只读端口规划、候选验证与 Revision 回滚原语；部署适配仍在脚本中 |
 | Passwall 自动创建节点 | 第一版目标 | 当前需手工把 TUIC 指向本地 FEC 入口 |
 | Windows Agent/v2rayN 导入 | 第一版目标 | 当前未实现 |
-| 自适应 FEC、PMTU | 第一版目标 | 当前参数不是闭环自适应 |
+| QUIC 可靠有序载体 | Alpha 已实现 | `SMART_QUIC_STREAM_LANES=1`；直接承载 TUIC 时旁路 FEC，避免双重恢复 |
+| 自适应 FEC、PMTU | 第一版目标 | 仅用于不可靠 DATAGRAM 模式；当前参数不是完整闭环自适应 |
 | 内核能力检测与自动调优 | 第一版目标 | 当前未实现 |
 | MASQUE | 后续实验 | 当前未实现，默认关闭 |
 | DoQ | 后续实验 | 当前未实现，不能替代现有 DoH 默认链路 |
@@ -64,6 +65,18 @@ Passwall / 本地代理
 ```
 
 TCP/443 可以继续提供现有 Reality/VLESS；Smart FEC 默认使用 UDP/443。内部端口应只监听回环，不应开放到公网。
+
+实测发现，将 TUIC 依次嵌套在 FEC 与不可靠 QUIC DATAGRAM 中会放大重传和错误序号缺口。生产候选因此增加可靠有序载体模式：OpenWrt QUIC 客户端直接监听 `127.0.0.1:3333`，服务端 QUIC 直接转发到 sing-box TUIC 入站 `127.0.0.1:4443`，中间 FEC 进程保持停用。该模式配置如下：
+
+```text
+OpenWrt: SMART_QUIC_LOCAL_PORT=3333
+两端:    SMART_QUIC_STREAM_LANES=1
+服务端:  SMART_QUIC_UPSTREAM=127.0.0.1:4443
+```
+
+多条可靠流的轮询实验会造成 TUIC 报文深度乱序，当前版本明确拒绝大于 `1` 的通道数。DATAGRAM+FEC 作为兼容/实验路径保留，但不再是本环境的推荐默认路径。
+
+监测中必须区分 QUIC 协议栈确认的 `wire_loss_ppm` 与 FEC 层的 `sequence_gap_ppm`。后者还可能包含乱序、迟到和会话切换，不能称为公网物理丢包率。少于 100 个已发送 QUIC 包的窗口不计算丢包百分比，只保留原始包数。
 
 ## 4. 第一版产品架构
 

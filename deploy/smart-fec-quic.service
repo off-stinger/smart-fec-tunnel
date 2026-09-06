@@ -6,7 +6,10 @@ Requires=smart-fec-server.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/smart-fec-tunnel-alpha9 quic-server --listen 0.0.0.0:443 --upstream 127.0.0.1:8443 --cert /etc/smart-fec/quic-cert.pem --private-key /etc/smart-fec/quic-key.pem --keyring /etc/smart-fec/server.keys
+Environment=SMART_QUIC_UPSTREAM=127.0.0.1:8443
+Environment=SMART_QUIC_STREAM_LANES=0
+EnvironmentFile=-/etc/smart-fec/quic.env
+ExecStart=/usr/local/bin/smart-fec-tunnel-alpha9 quic-server --listen 0.0.0.0:443 --upstream ${SMART_QUIC_UPSTREAM} --cert /etc/smart-fec/quic-cert.pem --private-key /etc/smart-fec/quic-key.pem --keyring /etc/smart-fec/server.keys
 Restart=always
 RestartSec=2
 TimeoutStopSec=5

@@ -7,14 +7,17 @@ start_service() {
     . /etc/smart-fec.env
     . /etc/smart-fec-quic.env
     [ -n "${SMART_FEC_KEY_ID:-}" ] || return 1
+    local_port="${SMART_QUIC_LOCAL_PORT:-8444}"
+    stream_lanes="${SMART_QUIC_STREAM_LANES:-0}"
     procd_open_instance
     procd_set_param command /usr/bin/smart-fec-tunnel-alpha9 quic-client \
-        --listen 127.0.0.1:8444 \
+        --listen "127.0.0.1:$local_port" \
         --server "$SMART_QUIC_SERVER" \
         --server-name "$SMART_QUIC_SERVER_NAME" \
         --ca-cert /etc/smart-fec-quic-cert.pem \
         --key-id "$SMART_FEC_KEY_ID"
-    procd_set_param env SMART_FEC_KEY="$SMART_FEC_KEY" RUST_LOG=info
+    procd_set_param env SMART_FEC_KEY="$SMART_FEC_KEY" \
+        SMART_QUIC_STREAM_LANES="$stream_lanes" RUST_LOG=info
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
     procd_set_param stderr 1

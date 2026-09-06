@@ -14,7 +14,7 @@ use quinn::{
     congestion::{Controller, ControllerFactory},
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     rustls::{self, pki_types::CertificateDer, pki_types::PrivateKeyDer},
-    ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig,
+    ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
 };
 use rand::RngCore;
 use std::{
@@ -26,7 +26,12 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, sync::Mutex, time};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, Mutex},
+    task::JoinSet,
+    time,
+};
 use tracing::{info, warn};
 
 const ALPN: &[u8] = b"sft-quic/1";
@@ -39,11 +44,81 @@ const CARRIER_TTL: Duration = Duration::from_secs(3);
 const CARRIER_PING: &[u8] = b"SFT-Q-PING-1";
 const CARRIER_PONG: &[u8] = b"SFT-Q-PONG-1";
 const CARRIER_HEARTBEAT: Duration = Duration::from_secs(2);
+const CARRIER_STATS_INTERVAL: Duration = Duration::from_secs(5);
+// Multiple independently retransmitted lanes reorder TUIC datagrams deeply
+// enough to cause severe stalls. Keep the product mode strictly ordered until
+// flow-aware lane assignment is implemented and validated.
+const MAX_STREAM_LANES: usize = 1;
+const MIN_WIRE_LOSS_SAMPLE_PACKETS: u64 = 100;
+const STREAM_LANE_PREFACE: u8 = 0x53;
 // QUIC DATAGRAM is intentionally unreliable. A missing PONG alone is not proof
 // that the path is dead, so count any authenticated server datagram as evidence
 // that the carrier is alive while retaining fast failure detection.
 const CARRIER_DEAD_TIMEOUT: Duration = Duration::from_secs(6);
 const CARRIER_WINDOW: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CarrierStatsSnapshot {
+    sent_packets: u64,
+    lost_packets: u64,
+    lost_bytes: u64,
+    congestion_events: u64,
+    udp_tx_bytes: u64,
+    udp_rx_bytes: u64,
+}
+
+fn log_carrier_stats(
+    connection: &Connection,
+    previous: &mut CarrierStatsSnapshot,
+    role: &'static str,
+) {
+    let stats = connection.stats();
+    let current = CarrierStatsSnapshot {
+        sent_packets: stats.path.sent_packets,
+        lost_packets: stats.path.lost_packets,
+        lost_bytes: stats.path.lost_bytes,
+        congestion_events: stats.path.congestion_events,
+        udp_tx_bytes: stats.udp_tx.bytes,
+        udp_rx_bytes: stats.udp_rx.bytes,
+    };
+    let sent_packets = current.sent_packets.saturating_sub(previous.sent_packets);
+    let lost_packets = current.lost_packets.saturating_sub(previous.lost_packets);
+    let wire_loss_ppm = (sent_packets >= MIN_WIRE_LOSS_SAMPLE_PACKETS)
+        .then(|| ((lost_packets as u128 * 1_000_000) / sent_packets as u128).min(1_000_000) as u32);
+    info!(
+        role,
+        wire_loss_ppm=?wire_loss_ppm,
+        sent_packets,
+        lost_packets,
+        lost_bytes=current.lost_bytes.saturating_sub(previous.lost_bytes),
+        congestion_events=current.congestion_events.saturating_sub(previous.congestion_events),
+        tx_bytes=current.udp_tx_bytes.saturating_sub(previous.udp_tx_bytes),
+        rx_bytes=current.udp_rx_bytes.saturating_sub(previous.udp_rx_bytes),
+        rtt_ms=stats.path.rtt.as_millis(),
+        cwnd_bytes=stats.path.cwnd,
+        mtu=stats.path.current_mtu,
+        "QUIC carrier stats"
+    );
+    *previous = current;
+}
+
+fn configured_stream_lanes() -> Result<usize> {
+    let value = std::env::var("SMART_QUIC_STREAM_LANES").ok();
+    parse_stream_lanes(value.as_deref())
+}
+
+fn parse_stream_lanes(value: Option<&str>) -> Result<usize> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let lanes: usize = value
+        .parse()
+        .context("SMART_QUIC_STREAM_LANES must be an integer")?;
+    if lanes != MAX_STREAM_LANES {
+        bail!("SMART_QUIC_STREAM_LANES currently supports only 1")
+    }
+    Ok(lanes)
+}
 
 #[derive(Clone, Debug)]
 struct CarrierController {
@@ -180,9 +255,51 @@ async fn send_carrier(connection: &Connection, payload: &[u8], message: &mut u64
     Ok(())
 }
 
+async fn write_stream_datagram(send: &mut SendStream, payload: &[u8]) -> Result<()> {
+    if payload.len() > MAX_DATAGRAM {
+        bail!("stream carrier datagram is too large")
+    }
+    send.write_all(&(payload.len() as u32).to_be_bytes())
+        .await?;
+    send.write_all(payload).await?;
+    Ok(())
+}
+
+async fn read_stream_datagram(receive: &mut RecvStream) -> Result<Vec<u8>> {
+    let mut header = [0u8; 4];
+    receive.read_exact(&mut header).await?;
+    let size = u32::from_be_bytes(header) as usize;
+    if size > MAX_DATAGRAM {
+        bail!("stream carrier datagram is too large")
+    }
+    let mut payload = vec![0u8; size];
+    receive.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+fn spawn_lane_readers(receives: Vec<RecvStream>) -> (mpsc::Receiver<Vec<u8>>, JoinSet<Result<()>>) {
+    let (tx, rx) = mpsc::channel(1024);
+    let mut tasks = JoinSet::new();
+    for mut receive in receives {
+        let tx = tx.clone();
+        tasks.spawn(async move {
+            loop {
+                let payload = read_stream_datagram(&mut receive).await?;
+                tx.send(payload)
+                    .await
+                    .context("stream lane receiver closed")?;
+            }
+        });
+    }
+    drop(tx);
+    (rx, tasks)
+}
+
 fn transport_config() -> Arc<TransportConfig> {
     let mut transport = TransportConfig::default();
-    transport.max_concurrent_bidi_streams(1_u8.into());
+    // One bidirectional stream authenticates the device; optional reliable
+    // carrier lanes use the remaining streams.
+    transport.max_concurrent_bidi_streams(((MAX_STREAM_LANES + 1) as u32).into());
     transport.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
     // 1472 bytes plus the IPv4 header is a standard 1500-byte packet. Quinn's
@@ -332,6 +449,8 @@ async fn relay_connection(connection: Connection, upstream: SocketAddr) -> Resul
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     let mut received = CarrierReassembly::default();
     let mut message = 0u64;
+    let mut stats_tick = time::interval(CARRIER_STATS_INTERVAL);
+    let mut previous_stats = CarrierStatsSnapshot::default();
     loop {
         tokio::select! {
             incoming = connection.read_datagram() => {
@@ -345,6 +464,60 @@ async fn relay_connection(connection: Connection, upstream: SocketAddr) -> Resul
             incoming = socket.recv(&mut buffer) => {
                 let size = incoming?;
                 send_carrier(&connection, &buffer[..size], &mut message).await?;
+            }
+            _ = stats_tick.tick() => {
+                log_carrier_stats(&connection, &mut previous_stats, "server");
+            }
+        }
+    }
+}
+
+async fn relay_laned_connection(
+    connection: Connection,
+    upstream: SocketAddr,
+    lanes: usize,
+) -> Result<()> {
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?;
+    socket.connect(upstream).await?;
+    let mut sends = Vec::with_capacity(lanes);
+    let mut receives = Vec::with_capacity(lanes);
+    for _ in 0..lanes {
+        let (mut send, mut receive) = time::timeout(Duration::from_secs(5), connection.accept_bi())
+            .await
+            .context("carrier lane timeout")??;
+        let mut preface = [0u8; 1];
+        receive.read_exact(&mut preface).await?;
+        if preface[0] != STREAM_LANE_PREFACE {
+            bail!("invalid carrier lane preface")
+        }
+        send.write_all(&[STREAM_LANE_PREFACE]).await?;
+        sends.push(send);
+        receives.push(receive);
+    }
+    let (mut incoming_lanes, mut readers) = spawn_lane_readers(receives);
+    let mut buffer = vec![0u8; MAX_DATAGRAM];
+    let mut next_lane = 0usize;
+    let mut stats_tick = time::interval(CARRIER_STATS_INTERVAL);
+    let mut previous_stats = CarrierStatsSnapshot::default();
+    loop {
+        tokio::select! {
+            incoming = socket.recv(&mut buffer) => {
+                let size = incoming?;
+                write_stream_datagram(&mut sends[next_lane], &buffer[..size]).await?;
+                next_lane = (next_lane + 1) % lanes;
+            }
+            incoming = incoming_lanes.recv() => {
+                let payload = incoming.context("all carrier lane readers closed")?;
+                socket.send(&payload).await?;
+            }
+            reader = readers.join_next() => {
+                reader
+                    .context("all carrier lane readers closed")?
+                    .context("carrier lane reader panicked")??;
+                bail!("carrier lane reader exited unexpectedly")
+            }
+            _ = stats_tick.tick() => {
+                log_carrier_stats(&connection, &mut previous_stats, "server-lanes");
             }
         }
     }
@@ -369,7 +542,12 @@ pub async fn run_server(
                 let connection = connecting.await?;
                 let device_id = authenticate_server(&connection, &keys, &replays).await?;
                 info!(device_id, remote = %connection.remote_address(), "QUIC device authenticated");
-                relay_connection(connection, upstream).await
+                let lanes = configured_stream_lanes()?;
+                if lanes == 0 {
+                    relay_connection(connection, upstream).await
+                } else {
+                    relay_laned_connection(connection, upstream, lanes).await
+                }
             }.await;
             if let Err(error) = result {
                 warn!(%error, "QUIC connection closed");
@@ -385,8 +563,10 @@ async fn relay_client_session(socket: &UdpSocket, connection: &Connection) -> Re
     let mut received = CarrierReassembly::default();
     let mut message = 0u64;
     let mut heartbeat = time::interval(CARRIER_HEARTBEAT);
+    let mut stats_tick = time::interval(CARRIER_STATS_INTERVAL);
     heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     let mut last_server_activity = Instant::now();
+    let mut previous_stats = CarrierStatsSnapshot::default();
     // Poll both directions independently: QUIC send backpressure must never
     // stop draining return traffic or prevent the liveness timer from running.
     let send = async {
@@ -419,6 +599,9 @@ async fn relay_client_session(socket: &UdpSocket, connection: &Connection) -> Re
                         }
                     }
                 }
+                _ = stats_tick.tick() => {
+                    log_carrier_stats(connection, &mut previous_stats, "client");
+                }
             }
         }
         #[allow(unreachable_code)]
@@ -427,6 +610,57 @@ async fn relay_client_session(socket: &UdpSocket, connection: &Connection) -> Re
     tokio::select! {
         result = receive => result,
         result = send => result,
+    }
+}
+
+async fn relay_laned_client_session(
+    socket: &UdpSocket,
+    connection: &Connection,
+    lanes: usize,
+) -> Result<()> {
+    let mut sends = Vec::with_capacity(lanes);
+    let mut receives = Vec::with_capacity(lanes);
+    for _ in 0..lanes {
+        let (mut send, mut receive) = connection.open_bi().await?;
+        send.write_all(&[STREAM_LANE_PREFACE]).await?;
+        let mut preface = [0u8; 1];
+        receive.read_exact(&mut preface).await?;
+        if preface[0] != STREAM_LANE_PREFACE {
+            bail!("invalid carrier lane preface")
+        }
+        sends.push(send);
+        receives.push(receive);
+    }
+    let (mut incoming_lanes, mut readers) = spawn_lane_readers(receives);
+    let mut buffer = vec![0u8; MAX_DATAGRAM];
+    let mut next_lane = 0usize;
+    let mut peer = None;
+    let mut stats_tick = time::interval(CARRIER_STATS_INTERVAL);
+    let mut previous_stats = CarrierStatsSnapshot::default();
+    loop {
+        tokio::select! {
+            incoming = socket.recv_from(&mut buffer) => {
+                let (size, source) = incoming?;
+                peer = Some(source);
+                write_stream_datagram(&mut sends[next_lane], &buffer[..size]).await?;
+                next_lane = (next_lane + 1) % lanes;
+            }
+            incoming = incoming_lanes.recv() => {
+                let payload = incoming.context("all carrier lane readers closed")?;
+                if let Some(destination) = peer {
+                    socket.send_to(&payload, destination).await?;
+                }
+            }
+            reader = readers.join_next() => {
+                reader
+                    .context("all carrier lane readers closed")?
+                    .context("carrier lane reader panicked")??;
+                bail!("carrier lane reader exited unexpectedly")
+            }
+            _ = stats_tick.tick() => {
+                log_carrier_stats(connection, &mut previous_stats, "client-lanes");
+            }
+        }
     }
 }
 
@@ -448,9 +682,14 @@ pub async fn run_client(
         let result = async {
             let connection = endpoint.connect(server, server_name)?.await?;
             authenticate_client(&connection, device_id, secret).await?;
-            info!(%server, max_datagram = ?connection.max_datagram_size(), "QUIC relay connected and authenticated");
+            let lanes = configured_stream_lanes()?;
+            info!(%server, lanes, max_datagram = ?connection.max_datagram_size(), "QUIC relay connected and authenticated");
             delay = Duration::from_secs(1);
-            relay_client_session(&socket, &connection).await
+            if lanes == 0 {
+                relay_client_session(&socket, &connection).await
+            } else {
+                relay_laned_client_session(&socket, &connection, lanes).await
+            }
         }
         .await;
         warn!(error = %result.as_ref().unwrap_err(), "QUIC relay reconnecting");
@@ -463,6 +702,15 @@ pub async fn run_client(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn stream_lane_mode_is_explicit_and_rejects_unvalidated_parallel_lanes() {
+        assert_eq!(parse_stream_lanes(None).unwrap(), 0);
+        assert_eq!(parse_stream_lanes(Some("1")).unwrap(), 1);
+        for invalid in ["0", "2", "16", "invalid"] {
+            assert!(parse_stream_lanes(Some(invalid)).is_err());
+        }
+    }
 
     #[test]
     fn keyring_rejects_weak_duplicate_and_reserved_entries() {

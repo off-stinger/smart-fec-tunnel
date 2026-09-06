@@ -63,6 +63,7 @@ const LOSS_SAMPLE_UNAVAILABLE: u32 = u32::MAX;
 const MAX_V2_SESSIONS_PER_DEVICE: usize = 16;
 const MAX_V1_MIGRATION_SESSIONS: usize = 64;
 const MAX_DEVICE_KEYS: usize = 65_536;
+const SESSION_TAKEOVER_MAX_SEQUENCE: u64 = 32;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Adaptive authenticated FEC tunnel for TUIC/UDP")]
@@ -542,12 +543,24 @@ struct Reassembly {
     parts: Vec<Option<Vec<u8>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SequenceReport {
+    expected: u64,
+    received: u64,
+    missing: u64,
+    sequence_gap_ppm: u32,
+    late: u64,
+    duplicates: u64,
+}
+
 #[derive(Debug)]
 struct Decoder {
     session: u64,
     highest_sequence: u64,
     finalized_sequence: u64,
     seen_sequences: BTreeSet<u64>,
+    late_sequences: u64,
+    duplicate_sequences: u64,
     groups: BTreeMap<u64, Group>,
     packets: HashMap<u64, Reassembly>,
 }
@@ -559,6 +572,8 @@ impl Decoder {
             highest_sequence: 0,
             finalized_sequence: 0,
             seen_sequences: BTreeSet::new(),
+            late_sequences: 0,
+            duplicate_sequences: 0,
             groups: BTreeMap::new(),
             packets: HashMap::new(),
         }
@@ -571,12 +586,17 @@ impl Decoder {
             self.finalized_sequence = seq.saturating_sub(1);
         }
         if seq <= self.finalized_sequence {
+            self.late_sequences = self.late_sequences.saturating_add(1);
             return false;
         }
         self.highest_sequence = self.highest_sequence.max(seq);
-        self.seen_sequences.insert(seq)
+        if !self.seen_sequences.insert(seq) {
+            self.duplicate_sequences = self.duplicate_sequences.saturating_add(1);
+            return false;
+        }
+        true
     }
-    fn loss_report(&mut self) -> Option<u32> {
+    fn sequence_report(&mut self) -> Option<SequenceReport> {
         let cutoff = self.highest_sequence.saturating_sub(REORDER_WINDOW);
         if cutoff <= self.finalized_sequence {
             return None;
@@ -593,10 +613,18 @@ impl Decoder {
             .range((self.finalized_sequence + 1)..=cutoff)
             .count() as u64;
         let missing = expected.saturating_sub(received);
-        let ppm = ((missing as u128 * 1_000_000) / expected as u128) as u32;
+        let gap_ppm = ((missing as u128 * 1_000_000) / expected as u128) as u32;
         self.seen_sequences = self.seen_sequences.split_off(&(cutoff + 1));
         self.finalized_sequence = cutoff;
-        Some(ppm.min(1_000_000))
+        let report = SequenceReport {
+            expected,
+            received,
+            missing,
+            sequence_gap_ppm: gap_ppm.min(1_000_000),
+            late: std::mem::take(&mut self.late_sequences),
+            duplicates: std::mem::take(&mut self.duplicate_sequences),
+        };
+        Some(report)
     }
     fn fragment(&mut self, shard: &[u8]) -> Vec<Vec<u8>> {
         if shard.len() < FRAGMENT_HEADER || shard.len() > SHARD {
@@ -874,6 +902,9 @@ impl Pacer {
         self.updated = now;
         let needed = bytes as f64;
         if self.tokens < needed {
+            // Refill in scheduler-sized batches. OpenWrt cannot reliably wake
+            // for the sub-millisecond per-frame deficit at 30+ Mbit/s; doing so
+            // collapses throughput because each nominal 0.3 ms wait rounds up.
             let delay = (self.capacity - self.tokens) / self.bytes_per_second;
             time::sleep(Duration::from_secs_f64(delay)).await;
             self.updated = Instant::now();
@@ -945,12 +976,25 @@ async fn client(
                 }
             }
             _ = report.tick() => {
-                let loss = decoder.loss_report();
+                let report = decoder.sequence_report();
                 let mut enc = encoder.lock().await;
                 let parity = enc.adaptive.parity;
-                let f = enc.report_frame(loss.unwrap_or(LOSS_SAMPLE_UNAVAILABLE));
+                let f = enc.report_frame(report.map_or(LOSS_SAMPLE_UNAVAILABLE, |sample| sample.sequence_gap_ppm));
                 drop(enc); send_frames(&tunnel, None, vec![f], &key, &mut pacer).await?;
-                info!(loss_ppm=?loss, tx_parity=parity, "link report");
+                if let Some(sample) = report {
+                    info!(
+                        sequence_gap_ppm=sample.sequence_gap_ppm,
+                        expected=sample.expected,
+                        received=sample.received,
+                        missing=sample.missing,
+                        late=sample.late,
+                        duplicates=sample.duplicates,
+                        tx_parity=parity,
+                        "sequence report"
+                    );
+                } else {
+                    info!(tx_parity=parity, "sequence report unavailable");
+                }
             }
             _ = flush.tick() => {
                 let frames = encoder.lock().await.flush()?;
@@ -980,6 +1024,26 @@ struct SessionRuntime {
     session: u64,
     pacer: Arc<Mutex<Pacer>>,
     last_seen: Arc<std::sync::Mutex<Instant>>,
+}
+
+fn superseded_sessions<T>(
+    sessions: &HashMap<(u64, u64), T>,
+    key_id: u64,
+    session: u64,
+    sequence: u64,
+) -> Option<Vec<(u64, u64)>> {
+    let existing: Vec<_> = sessions
+        .keys()
+        .filter(|(id, current)| *id == key_id && *current != session)
+        .copied()
+        .collect();
+    if existing.is_empty() {
+        return Some(existing);
+    }
+    // A freshly started authenticated client begins near sequence one.  Once
+    // it takes over, delayed high-sequence reports from an old session must be
+    // ignored or they can continuously replace the live session again.
+    (sequence <= SESSION_TAKEOVER_MAX_SEQUENCE).then_some(existing)
 }
 
 async fn send_session_frames(
@@ -1053,8 +1117,8 @@ async fn run_server_session(
                 }
             }
             _ = report.tick(), if peer.is_some() => {
-                let loss = decoder.loss_report();
-                let frame = encoder.report_frame(loss.unwrap_or(LOSS_SAMPLE_UNAVAILABLE));
+                let report = decoder.sequence_report();
+                let frame = encoder.report_frame(report.map_or(LOSS_SAMPLE_UNAVAILABLE, |sample| sample.sequence_gap_ppm));
                 send_session_frames(&runtime.public, peer.unwrap(), vec![frame], &runtime.key, &runtime.pacer).await;
             }
             _ = flush.tick(), if peer.is_some() => {
@@ -1120,6 +1184,22 @@ async fn server(
                 };
                 let session_key = (frame.key_id, frame.session);
                 if !sessions.contains_key(&session_key) {
+                    if matches!(frame.version, VERSION_V2 | VERSION_V3) {
+                        let Some(superseded) = superseded_sessions(
+                            &sessions,
+                            frame.key_id,
+                            frame.session,
+                            frame.sequence,
+                        ) else {
+                            continue;
+                        };
+                        for id in superseded {
+                            if let Some(entry) = sessions.remove(&id) {
+                                entry.task.abort();
+                                info!(key_id=id.0, session=id.1, "session superseded");
+                            }
+                        }
+                    }
                     if sessions.len() >= max_sessions {
                         continue;
                     }
@@ -1521,6 +1601,19 @@ mod tests {
         );
     }
     #[test]
+    fn new_device_session_replaces_old_but_late_old_frames_cannot_take_over() {
+        let sessions = HashMap::from([((7, 100), ())]);
+        assert_eq!(
+            superseded_sessions(&sessions, 7, 200, 1),
+            Some(vec![(7, 100)])
+        );
+        assert_eq!(
+            superseded_sessions(&sessions, 7, 200, SESSION_TAKEOVER_MAX_SEQUENCE + 1),
+            None
+        );
+        assert_eq!(superseded_sessions(&sessions, 8, 300, 500), Some(vec![]));
+    }
+    #[test]
     fn adaptive_has_hysteresis() {
         let mut a = Adaptive::default();
         for _ in 0..8 {
@@ -1622,7 +1715,7 @@ mod tests {
                 d.observe_seq(seq);
             }
         }
-        assert_eq!(d.loss_report(), Some(0));
+        assert_eq!(d.sequence_report().unwrap().sequence_gap_ppm, 0);
     }
     #[test]
     fn finalized_window_reports_real_loss_once() {
@@ -1632,9 +1725,33 @@ mod tests {
                 d.observe_seq(seq);
             }
         }
-        let loss = d.loss_report();
-        assert_eq!(loss, Some(2_000_000u32 / 136));
-        assert_eq!(d.loss_report(), None);
+        let report = d.sequence_report().unwrap();
+        assert_eq!(report.sequence_gap_ppm, 2_000_000u32 / 136);
+        assert_eq!(report.expected, 136);
+        assert_eq!(report.received, 134);
+        assert_eq!(report.missing, 2);
+        assert_eq!(d.sequence_report(), None);
+    }
+    #[test]
+    fn sequence_report_separates_late_and_duplicate_frames_from_gaps() {
+        let mut d = Decoder::new(1);
+        for seq in 1..=200 {
+            d.observe_seq(seq);
+        }
+        assert!(!d.observe_seq(100));
+        let first = d.sequence_report().unwrap();
+        assert_eq!(first.sequence_gap_ppm, 0);
+        assert_eq!(first.duplicates, 1);
+        assert_eq!(first.late, 0);
+
+        assert!(!d.observe_seq(10));
+        for seq in 201..=336 {
+            d.observe_seq(seq);
+        }
+        let second = d.sequence_report().unwrap();
+        assert_eq!(second.sequence_gap_ppm, 0);
+        assert_eq!(second.duplicates, 0);
+        assert_eq!(second.late, 1);
     }
     #[test]
     fn first_high_sequence_establishes_baseline() {
@@ -1642,7 +1759,7 @@ mod tests {
         for seq in 10_000..=10_200 {
             d.observe_seq(seq);
         }
-        assert_eq!(d.loss_report(), Some(0));
+        assert_eq!(d.sequence_report().unwrap().sequence_gap_ppm, 0);
     }
     #[test]
     fn empty_datagram_roundtrip() {

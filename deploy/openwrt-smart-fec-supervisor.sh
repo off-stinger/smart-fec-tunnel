@@ -6,6 +6,7 @@ PASSWALL_RUNTIME="${SMART_FEC_PASSWALL_RUNTIME:-/tmp/etc/passwall/acl/default/TC
 FAILURE_LIMIT="${SMART_FEC_FAILURE_LIMIT:-3}"
 PROBE_INTERVAL="${SMART_FEC_PROBE_INTERVAL:-10}"
 RECOVERY_COOLDOWN="${SMART_FEC_RECOVERY_COOLDOWN:-30}"
+QUIC_ENV="${SMART_FEC_QUIC_ENV:-/etc/smart-fec-quic.env}"
 
 probe() {
     curl --socks5-hostname "$SOCKS_ADDRESS" --silent --show-error \
@@ -21,6 +22,17 @@ smart_path_active() {
 }
 
 recover() {
+    local direct_carrier=0
+    if [ -r "$QUIC_ENV" ]; then
+        . "$QUIC_ENV"
+        [ "${SMART_QUIC_LOCAL_PORT:-8444}" = 3333 ] && direct_carrier=1
+    fi
+    if [ "$direct_carrier" -eq 1 ]; then
+        logger -t smart-fec-supervisor -p daemon.warning \
+            "end-to-end probe failed ${FAILURE_LIMIT} times; rebuilding direct QUIC carrier"
+        /etc/init.d/smart-fec-quic restart
+        return
+    fi
     logger -t smart-fec-supervisor -p daemon.warning \
         "end-to-end probe failed ${FAILURE_LIMIT} times; rebuilding QUIC and FEC sessions"
     /etc/init.d/smart-fec-quic restart
