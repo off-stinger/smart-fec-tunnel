@@ -1,7 +1,8 @@
 #!/bin/sh
 set -u
 
-SOCKS_ADDRESS="${SMART_FEC_HEALTH_SOCKS:-127.0.0.1:1071}"
+SOCKS_ADDRESS="${SMART_FEC_HEALTH_SOCKS:-127.0.0.1:1070}"
+PASSWALL_RUNTIME="${SMART_FEC_PASSWALL_RUNTIME:-/tmp/etc/passwall/acl/default/TCP_UDP_SOCKS_DNS.json}"
 FAILURE_LIMIT="${SMART_FEC_FAILURE_LIMIT:-3}"
 PROBE_INTERVAL="${SMART_FEC_PROBE_INTERVAL:-10}"
 RECOVERY_COOLDOWN="${SMART_FEC_RECOVERY_COOLDOWN:-30}"
@@ -11,6 +12,12 @@ probe() {
         --output /dev/null --connect-timeout 4 --max-time 8 \
         --write-out '%{http_code}' https://www.google.com/generate_204 2>/dev/null |
         grep -qx '204'
+}
+
+smart_path_active() {
+    [ -r "$PASSWALL_RUNTIME" ] &&
+        grep -q '"server"[[:space:]]*:[[:space:]]*"127\.0\.0\.1"' "$PASSWALL_RUNTIME" &&
+        grep -q '"server_port"[[:space:]]*:[[:space:]]*3333' "$PASSWALL_RUNTIME"
 }
 
 recover() {
@@ -23,6 +30,16 @@ recover() {
 
 failures=0
 while true; do
+    # The FEC client currently has one application peer.  Never attach a
+    # second probe-side TUIC client to port 3333 because it could steal replies
+    # from Passwall.  Probe Passwall's own SOCKS listener only while SMART-FEC
+    # is the runtime-selected path.
+    if ! smart_path_active; then
+        failures=0
+        sleep "$PROBE_INTERVAL"
+        continue
+    fi
+
     if probe; then
         if [ "$failures" -gt 0 ]; then
             logger -t smart-fec-supervisor -p daemon.notice \
