@@ -31,7 +31,7 @@ def lossy_relay(stop):
         if target is None:
             continue
         # Wire header: magic[4], version[1], kind[1], session[8], seq[8], group[8], index[2].
-        if len(data) >= 32 and data[:4] == b"SFT1" and data[5] == 1:
+        if len(data) >= 32 and data[:4] == b"SFEC" and data[5] == 1:
             group = int.from_bytes(data[22:30], "big")
             index = int.from_bytes(data[30:32], "big")
             marker = (from_server, group)

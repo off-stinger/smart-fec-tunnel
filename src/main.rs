@@ -35,7 +35,8 @@ const KIND_PARITY: u8 = 2;
 const KIND_REPORT: u8 = 3;
 const HEADER: usize = 36;
 const HEADER_V2: usize = 44;
-const V3_SELECTOR: usize = 8;
+const V3_SELECTOR: usize = 8; // selector 总长度 = 4 字节 key_id 哈希前缀 + 4 字节随机后缀
+const V3_SELECTOR_PREFIX: usize = 4; // 前 4 字节：key_id 的稳定哈希（仅定位密钥，非密钥指纹）
 const V3_NONCE: usize = 24;
 const V3_INNER_HEADER: usize = 31;
 const TAG: usize = 16;
@@ -51,11 +52,11 @@ const REASSEMBLY_TTL: Duration = Duration::from_secs(3);
 const REORDER_WINDOW: u64 = 64;
 const MAX_GROUPS: usize = 2048;
 const MAX_REASSEMBLIES: usize = 4096;
-const MAX_PARITY: usize = 3;
+const MAX_PARITY: usize = 4;
 // Above this loss level a 10+3 code cannot repair the path economically.
 // Adding more parity only consumes the already constrained UDP budget and
 // makes TUIC congestion recovery worse, so the controller bypasses FEC.
-const FEC_BYPASS_LOSS_PPM: u32 = 150_000;
+const FEC_BYPASS_LOSS_PPM: u32 = 300_000;
 // Loss reports also act as tunnel keepalives.  This reserved value preserves
 // that traffic without teaching the adaptive controller that an undersized
 // observation window is a real zero-loss sample.
@@ -255,7 +256,10 @@ impl Frame {
             .encrypt(XNonce::from_slice(&nonce), inner.as_ref())
             .map_err(|_| anyhow::anyhow!("v3 encryption failed"))?;
         let mut out = Vec::with_capacity(V3_SELECTOR + V3_NONCE + ciphertext.len());
-        out.extend_from_slice(&v3_selector(key));
+        out.extend_from_slice(&v3_selector_prefix(self.key_id));
+        let mut random_suffix = [0u8; V3_SELECTOR_PREFIX];
+        rand::thread_rng().fill_bytes(&mut random_suffix);
+        out.extend_from_slice(&random_suffix);
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
         Ok(out)
@@ -263,7 +267,7 @@ impl Frame {
 
     fn decode_v3(buf: &[u8], key_id: u64, key: &[u8; 32]) -> Result<Self> {
         if buf.len() < V3_SELECTOR + V3_NONCE + V3_INNER_HEADER + TAG
-            || buf[..V3_SELECTOR] != v3_selector(key)
+            || buf[..V3_SELECTOR_PREFIX] != v3_selector_prefix(key_id)
         {
             bail!("invalid v3 envelope")
         }
@@ -294,10 +298,11 @@ impl Frame {
     }
 }
 
-fn v3_selector(key: &[u8; 32]) -> [u8; V3_SELECTOR] {
-    let mut hasher = Hasher::new_keyed(key);
-    hasher.update(b"smart-fec-v3-routing-selector");
-    hasher.finalize().as_bytes()[..V3_SELECTOR]
+fn v3_selector_prefix(key_id: u64) -> [u8; V3_SELECTOR_PREFIX] {
+    let mut hasher = Hasher::new();
+    hasher.update(b"smart-fec-v3-selector");
+    hasher.update(&key_id.to_be_bytes());
+    hasher.finalize().as_bytes()[..V3_SELECTOR_PREFIX]
         .try_into()
         .unwrap()
 }
@@ -320,21 +325,27 @@ struct Adaptive {
     last_loss_ppm: u32,
     smoothed_loss_ppm: u32,
     unavailable_reports: u8,
+    /// 连续超过 FEC_BYPASS_LOSS_PPM 的次数，用于给 bypass 加滞回。
+    bypass_streak: u8,
+    /// 刚因持续高丢包 bypass，恢复时直接跳到目标冗余档，避免逐级爬升太慢。
+    bypassed: bool,
 }
 
 impl Adaptive {
     fn target(loss: u32) -> usize {
         match loss {
-            0..=9_999 => 0,
-            10_000..=49_999 => 1,
-            50_000..=99_999 => 2,
-            _ => 3,
+            0..=9_999 => 0,           // <1%
+            10_000..=49_999 => 1,     // 1-5%
+            50_000..=99_999 => 2,     // 5-10%
+            100_000..=199_999 => 3,   // 10-20%
+            _ => 4,                   // >=20%
         }
     }
     fn report(&mut self, loss: u32) {
         if loss == LOSS_SAMPLE_UNAVAILABLE {
-            self.bad = 0;
-            self.good = 0;
+            // 空闲/无样本：只累计空闲时长用于长时间降级，绝不打断连续丢包样本的
+            // 上升/下降计数。否则真实 TUIC 流量的间歇性空闲会反复清零 bad，导致
+            // parity 永远升不上去，FEC 形同虚设。
             self.unavailable_reports = self.unavailable_reports.saturating_add(1);
             // Reports arrive every two seconds.  If traffic has been too idle
             // to produce a real sample for 30 seconds, retire one stale parity
@@ -352,16 +363,31 @@ impl Adaptive {
         }
         self.unavailable_reports = 0;
         self.last_loss_ppm = loss;
+        self.smoothed_loss_ppm = ((self.smoothed_loss_ppm as u64 * 3 + loss as u64) / 4) as u32;
         if loss >= FEC_BYPASS_LOSS_PPM {
-            self.parity = 0;
-            self.bad = 0;
+            // 连续超阈值才 bypass：真实丢包是突发性的，单次尖峰立即清零会让
+            // parity 在 0↔1↔2 之间高频震荡。累积 3 次（约 6 秒）再 bypass。
+            self.bypass_streak = self.bypass_streak.saturating_add(1);
             self.good = 0;
-            self.smoothed_loss_ppm = loss;
-            self.unavailable_reports = 0;
+            if self.bypass_streak >= 3 {
+                self.parity = 0;
+                self.bad = 0;
+                self.good = 0;
+                self.unavailable_reports = 0;
+                self.bypassed = true;
+            }
             return;
         }
-        self.smoothed_loss_ppm = ((self.smoothed_loss_ppm as u64 * 3 + loss as u64) / 4) as u32;
+        self.bypass_streak = 0;
         let target = Self::target(self.smoothed_loss_ppm);
+        if self.bypassed {
+            // bypass 后恢复：直接跳到目标档，避免从 0 逐级爬（16 秒）期间丢包穿透。
+            self.parity = target.min(MAX_PARITY);
+            self.bad = 0;
+            self.good = 0;
+            self.bypassed = false;
+            return;
+        }
         if target > self.parity {
             self.bad += 1;
             self.good = 0;
@@ -393,6 +419,8 @@ struct Encoder {
     group: u64,
     shards: Vec<Vec<u8>>,
     adaptive: Adaptive,
+    /// 测试用：固定 parity，绕过自适应，用于量化 Reed-Solomon 的真实恢复能力。
+    force_parity: Option<usize>,
 }
 
 impl Encoder {
@@ -401,6 +429,15 @@ impl Encoder {
         Self::with_identity(session, VERSION_V1, 0)
     }
     fn with_identity(session: u64, version: u8, key_id: u64) -> Self {
+        // 测试钩子仅在 debug 构建生效；release 生产恒为 None，避免误设环境变量
+        // 绕过自适应 FEC（固定 parity）。
+        #[cfg(debug_assertions)]
+        let force_parity = std::env::var("SMART_FEC_FORCE_PARITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|p| p.min(MAX_PARITY));
+        #[cfg(not(debug_assertions))]
+        let force_parity = None;
         Self {
             version,
             key_id,
@@ -410,6 +447,7 @@ impl Encoder {
             group: 1,
             shards: Vec::new(),
             adaptive: Adaptive::default(),
+            force_parity,
         }
     }
     fn report_frame(&mut self, loss_ppm: u32) -> Frame {
@@ -460,7 +498,9 @@ impl Encoder {
             return Ok(Vec::new());
         }
         let data = self.shards.len();
-        let parity = if self.adaptive.parity == 0 {
+        let parity = if let Some(p) = self.force_parity {
+            p.min(data)
+        } else if self.adaptive.parity == 0 {
             0
         } else if data < DATA_SHARDS {
             // Never emit more repair shards than source shards for a partial
@@ -809,34 +849,20 @@ fn parse_keyring(text: &str) -> Result<HashMap<u64, [u8; 32]>> {
 
 fn decode_server_frame(
     bytes: &[u8],
-    legacy_key: Option<&[u8; 32]>,
-    keyring: &HashMap<u64, [u8; 32]>,
-    selectors: &HashMap<[u8; V3_SELECTOR], (u64, [u8; 32])>,
+    _legacy_key: Option<&[u8; 32]>,
+    _keyring: &HashMap<u64, [u8; 32]>,
+    selectors: &HashMap<[u8; V3_SELECTOR_PREFIX], (u64, [u8; 32])>,
 ) -> Result<(Frame, [u8; 32])> {
     if !bytes.starts_with(&MAGIC.to_be_bytes()) {
         if bytes.len() < V3_SELECTOR {
             bail!("short v3 envelope")
         }
-        let selector: [u8; V3_SELECTOR] = bytes[..V3_SELECTOR].try_into().unwrap();
-        let (key_id, selected) = selectors.get(&selector).context("unknown v3 selector")?;
+        let prefix: [u8; V3_SELECTOR_PREFIX] = bytes[..V3_SELECTOR_PREFIX].try_into().unwrap();
+        let (key_id, selected) = selectors.get(&prefix).context("unknown v3 selector")?;
         return Ok((Frame::decode_v3(bytes, *key_id, selected)?, *selected));
     }
-    if bytes.len() < 6 {
-        bail!("short legacy frame")
-    }
-    let selected = match bytes[4] {
-        VERSION_V1 => legacy_key.context("legacy protocol disabled")?,
-        VERSION_V2 => {
-            if bytes.len() < HEADER_V2 + TAG {
-                bail!("short v2 frame")
-            }
-            let id = u64::from_be_bytes(bytes[6..14].try_into().unwrap());
-            keyring.get(&id).context("unknown key id")?
-        }
-        _ => bail!("unsupported protocol version"),
-    };
-    let frame = Frame::decode(bytes, selected)?;
-    Ok((frame, *selected))
+    // MAGIC 开头 = legacy V1/V2 明文协议，已下线，统一拒绝。
+    bail!("legacy V1/V2 protocol removed");
 }
 
 async fn send_frames(
@@ -922,15 +948,13 @@ async fn client(
     rate_mbps: f64,
 ) -> Result<()> {
     if key_id == Some(0) {
-        bail!("key-id 0 is reserved for legacy V1")
+        bail!("key-id 0 is reserved")
     }
+    // V1/V2 明文 legacy 协议已下线，强制使用 V3 加密。
+    let key_id = key_id.context("key-id required: legacy V1/V2 removed")?;
     let key = key(&secret);
     let session = rand::thread_rng().gen::<u64>();
-    let version = if key_id.is_some() {
-        VERSION_V3
-    } else {
-        VERSION_V1
-    };
+    let version = VERSION_V3;
     let local = UdpSocket::bind(listen)
         .await
         .context("bind client listen")?;
@@ -939,7 +963,7 @@ async fn client(
     let encoder = Arc::new(Mutex::new(Encoder::with_identity(
         session,
         version,
-        key_id.unwrap_or(0),
+        key_id,
     )));
     let mut decoder = Decoder::new(session);
     let mut app_peer = None;
@@ -958,8 +982,8 @@ async fn client(
             }
             r = tunnel.recv(&mut net_buf) => {
                 let n = match r { Ok(n) => n, Err(e) => { warn!(error=%e, "tunnel receive failed"); continue; } };
-                match decode_client_frame(&net_buf[..n], key_id.unwrap_or(0), &key) {
-                    Ok(f) if f.version != version || f.key_id != key_id.unwrap_or(0) || f.session != session => {
+                match decode_client_frame(&net_buf[..n], key_id, &key) {
+                    Ok(f) if f.version != version || f.key_id != key_id || f.session != session => {
                         warn!("discard frame for different identity or session");
                     }
                     Ok(f) if f.kind == KIND_REPORT && f.payload.len() == 4 => {
@@ -1082,6 +1106,7 @@ async fn run_server_session(
     let mut upstream_buf = vec![0u8; 65535];
     let mut report = time::interval(Duration::from_secs(2));
     let mut flush = time::interval(Duration::from_millis(5));
+    let mut last_logged_parity = 0usize;
     loop {
         tokio::select! {
             packet = input.recv() => {
@@ -1118,6 +1143,12 @@ async fn run_server_session(
             }
             _ = report.tick(), if peer.is_some() => {
                 let report = decoder.sequence_report();
+                let parity = encoder.adaptive.parity;
+                if parity != last_logged_parity {
+                    // 只在 parity 变化时记录，避免每 2 秒一条刷屏（控制日志量）。
+                    info!(tx_parity = parity, "server FEC parity changed");
+                    last_logged_parity = parity;
+                }
                 let frame = encoder.report_frame(report.map_or(LOSS_SAMPLE_UNAVAILABLE, |sample| sample.sequence_gap_ppm));
                 send_session_frames(&runtime.public, peer.unwrap(), vec![frame], &runtime.key, &runtime.pacer).await;
             }
@@ -1157,7 +1188,7 @@ async fn server(
     let mut selectors = HashMap::new();
     for (&key_id, &device_key) in &keyring {
         if selectors
-            .insert(v3_selector(&device_key), (key_id, device_key))
+            .insert(v3_selector_prefix(key_id), (key_id, device_key))
             .is_some()
         {
             bail!("keyring contains a V3 selector collision")
@@ -1521,18 +1552,14 @@ mod tests {
         assert!(Frame::decode(&b, &k).is_err());
     }
     #[test]
-    fn v2_frame_selects_device_key_and_authenticates() {
+    fn v2_frame_is_rejected_after_removal() {
         let device_key = key("device-secret-long-enough");
         let mut enc = Encoder::with_identity(77, VERSION_V2, 42);
         let frame = enc.report_frame(1234);
         let bytes = frame.encode(&device_key);
         let keys = HashMap::from([(42, device_key)]);
-        let (decoded, selected) =
-            decode_server_frame(&bytes, None, &keys, &HashMap::new()).unwrap();
-        assert_eq!(decoded.version, VERSION_V2);
-        assert_eq!(decoded.key_id, 42);
-        assert_eq!(decoded.session, 77);
-        assert_eq!(selected, device_key);
+        // V1/V2 明文协议已下线，服务端统一拒绝 legacy 帧。
+        assert!(decode_server_frame(&bytes, None, &keys, &HashMap::new()).is_err());
     }
     #[test]
     fn v2_frame_rejects_unknown_or_wrong_device_key() {
@@ -1549,7 +1576,7 @@ mod tests {
         let bytes = frame.encode_wire(&device_key).unwrap();
         assert!(!bytes.starts_with(&MAGIC.to_be_bytes()));
         assert!(!bytes.windows(4).any(|window| window == MAGIC.to_be_bytes()));
-        let selectors = HashMap::from([(v3_selector(&device_key), (7, device_key))]);
+        let selectors = HashMap::from([(v3_selector_prefix(7), (7, device_key))]);
         let (decoded, _) = decode_server_frame(&bytes, None, &HashMap::new(), &selectors).unwrap();
         assert_eq!(decoded.version, VERSION_V3);
         assert_eq!(decoded.key_id, 7);
@@ -1642,13 +1669,45 @@ mod tests {
         assert!(a.parity <= MAX_PARITY);
     }
     #[test]
-    fn adaptive_bypasses_fec_when_loss_exceeds_repair_budget() {
+    fn adaptive_bypasses_fec_after_sustained_high_loss() {
         let mut a = Adaptive {
             parity: MAX_PARITY,
             ..Adaptive::default()
         };
+        // 单次尖峰不应立即 bypass（滞回，避免 parity 震荡）
+        a.report(FEC_BYPASS_LOSS_PPM);
+        assert_eq!(a.parity, MAX_PARITY);
+        a.report(FEC_BYPASS_LOSS_PPM);
+        assert_eq!(a.parity, MAX_PARITY);
+        // 连续 3 次超阈值才 bypass
         a.report(FEC_BYPASS_LOSS_PPM);
         assert_eq!(a.parity, 0);
+    }
+    #[test]
+    fn adaptive_single_loss_spike_does_not_reset_parity() {
+        // 单次 27% 尖峰后回落，parity 应保持（不因 bypass_streak 残留而误降）
+        let mut a = Adaptive {
+            parity: 2,
+            ..Adaptive::default()
+        };
+        a.report(FEC_BYPASS_LOSS_PPM + 100_000);
+        a.report(0);
+        assert_eq!(a.parity, 2);
+    }
+    #[test]
+    fn adaptive_recovers_quickly_after_bypass() {
+        let mut a = Adaptive {
+            parity: MAX_PARITY,
+            ..Adaptive::default()
+        };
+        // 触发 bypass（连续 3 次超阈值）
+        for _ in 0..3 {
+            a.report(FEC_BYPASS_LOSS_PPM);
+        }
+        assert_eq!(a.parity, 0);
+        // 恢复：29% 丢包（smoothed 升到 20%+，target=4），应直接跳到最高档而非逐级爬
+        a.report(290_000);
+        assert_eq!(a.parity, MAX_PARITY);
     }
     #[test]
     fn adaptive_ignores_unavailable_loss_samples() {
@@ -1659,15 +1718,26 @@ mod tests {
             last_loss_ppm: 80_000,
             smoothed_loss_ppm: 70_000,
             unavailable_reports: 0,
+            bypass_streak: 0,
+            bypassed: false,
         };
         a.report(LOSS_SAMPLE_UNAVAILABLE);
         assert_eq!(a.parity, 2);
-        // An idle gap breaks both consecutive-sample streaks, but must not
-        // immediately change the active parity or measured loss history.
-        assert_eq!(a.bad, 0);
-        assert_eq!(a.good, 0);
+        // 空闲样本不打断连续丢包/正常样本的计数，也不改变当前 parity 或已测损失历史。
+        assert_eq!(a.bad, 1);
+        assert_eq!(a.good, 7);
         assert_eq!(a.last_loss_ppm, 80_000);
         assert_eq!(a.smoothed_loss_ppm, 70_000);
+    }
+    #[test]
+    fn adaptive_rises_through_interleaved_idle_gaps() {
+        // 真实 TUIC 流量是间歇性的：高丢包样本之间穿插空闲样本。空闲不得清零
+        // bad，否则 parity 永远升不上去（FEC 失效）。
+        let mut a = Adaptive::default();
+        for loss in [90_000, u32::MAX, 90_000, u32::MAX, 90_000] {
+            a.report(loss);
+        }
+        assert_eq!(a.parity, 1);
     }
     #[test]
     fn adaptive_retires_stale_parity_after_idle_timeout() {

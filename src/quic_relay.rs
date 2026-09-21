@@ -34,7 +34,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-const ALPN: &[u8] = b"sft-quic/1";
+const ALPN: &[u8] = b"h3";
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-SFT-AUTH-v1";
 const MAX_DATAGRAM: usize = 65_535;
 const CARRIER_HEADER: usize = 12;
@@ -369,6 +369,18 @@ fn client_endpoint(bind: SocketAddr, ca_cert: &Path) -> Result<Endpoint> {
 }
 
 fn parse_keyring(path: &Path) -> Result<HashMap<u64, String>> {
+    // 与 main.rs 的 load_keyring 保持一致：密钥文件不得对组/其他用户可读。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("stat keyring {}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            bail!("keyring must not be accessible by group or other users");
+        }
+    }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read keyring {}", path.display()))?;
     let mut keys = HashMap::new();
@@ -384,7 +396,7 @@ fn parse_keyring(path: &Path) -> Result<HashMap<u64, String>> {
             .parse()
             .with_context(|| format!("invalid device id on line {}", line_index + 1))?;
         let secret = fields.next().context("missing device secret")?;
-        if id == 0 || secret.len() < 16 || fields.next().is_some() || keys.contains_key(&id) {
+        if id == 0 || secret.len() < 32 || fields.next().is_some() || keys.contains_key(&id) {
             bail!("invalid keyring entry on line {}", line_index + 1)
         }
         keys.insert(id, secret.to_owned());
@@ -715,22 +727,24 @@ mod tests {
     #[test]
     fn keyring_rejects_weak_duplicate_and_reserved_entries() {
         let path = std::env::temp_dir().join(format!("sft-quic-keyring-{}", std::process::id()));
+        let write = |content: &[u8]| {
+            File::create(&path).unwrap().write_all(content).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        };
         for invalid in [
             "",
             "0 abcdefghijklmnop",
             "1 short",
             "1 abcdefghijklmnop\n1 different-secret-value",
         ] {
-            File::create(&path)
-                .unwrap()
-                .write_all(invalid.as_bytes())
-                .unwrap();
+            write(invalid.as_bytes());
             assert!(parse_keyring(&path).is_err());
         }
-        File::create(&path)
-            .unwrap()
-            .write_all(b"7 abcdefghijklmnop\n8 different-secret-value\n")
-            .unwrap();
+        write(b"7 a-very-long-device-secret-at-least-32\n8 another-very-long-device-secret-32\n");
         assert_eq!(parse_keyring(&path).unwrap().len(), 2);
         std::fs::remove_file(path).unwrap();
     }
