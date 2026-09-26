@@ -1356,6 +1356,91 @@ match classify_inner_peer(app_peer, app_peer_seen.elapsed(), peer) {
 （线格式变更，需要两端同时升级）。这属于新的工作项，本轮不做。**在此之前，"多连接"不是
 可用的吞吐解法**，把它当作解法会得到"第二条连接完全不通"的结果。
 
+### 10.19 T2 收口：载体 ARQ 模式的 A/B（结论：无实质差异，维持 DATAGRAM 默认）
+
+T2 要求"内层 ARQ 可关闭开关并做 A/B"。本项目里这个开关早已存在，只是从未被正式 A/B 过：
+`SMART_QUIC_STREAM_LANES=1` 让载体用**一条有序的可靠 QUIC 流**（即带 ARQ/重传）承载 FEC 帧，
+不设则用 **QUIC DATAGRAM**（RFC 9221，不重传，丢包交给 FEC）。另有一个设计约束写死在代码里：
+
+```rust
+// Multiple independently retransmitted lanes reorder TUIC datagrams deeply
+// enough to cause severe stalls. Keep the product mode strictly ordered until
+// flow-aware lane assignment is implemented and validated.
+const MAX_STREAM_LANES: usize = 1;
+```
+
+即**并行 lane 是被主动拒绝的**（`parse_stream_lanes` 只接受 1），所以 A/B 只在
+"单流 ARQ" 与 "DATAGRAM" 之间。
+
+#### 测量台（本轮顺带修好的两个仪器问题）
+
+1. **`speed.cloudflare.com` 会限流**：持续测试后先返回 **403 + 1 字节**、后返回 **429**
+   （**直连也一样**）。旧脚本只看 `speed_download`，会把 403/429 读成"0 B/s"——§10.18 的
+   错误归因正源于此。**现在脚本强制校验 `http_code == 200`**，非 200 立即判无效。
+2. **10 MB 太小、测的是 ramp**：同一目标下 10 MB 给 1.79 MB/s，100 MB 给 1.10–1.20 MB/s，
+   **高估约 50%**。本轮改用 **OVH 100 MB 稳态传输**（无限流，3/3 有效）。
+
+#### 结果（OVH 100 MB 稳态，http 全程 200，两轮交错各 2–3 次）
+
+| 轮次 | LANES（单流 ARQ） | DATAGRAM |
+| --- | --- | --- |
+| 第一轮 | **1.20 MB/s**（n=3） | 1.10 MB/s（n=3） |
+| 第二轮 | **1.18 MB/s**（n=2） | 1.14 MB/s（n=2） |
+| 合并 | **1.25 MB/s 均值**（n=5） | 1.17 MB/s 均值（n=5） |
+
+LANES 在两轮里都略高（+9.2% / +3.3%），但**合并后区间重叠**
+（LANES 1.157–1.322，DATAGRAM 1.112–1.202，单位 MB/s），**不构成实质差异**。
+
+**决定：维持 DATAGRAM 默认。** 理由：(a) 差异未被确立；(b) 在 FEC 之上再加一层 ARQ，
+正是 RFC 9265 §5.5 提醒的"有序可靠传输置于 FEC 之上可能引起伪重传"；(c) 并行 lane 已被
+证明会严重停顿，而单流不带来可测收益。
+
+#### 同一批测量给出的**上界**：隧道只交出底层那条腿的约 1/3
+
+用同一目标在服务器本机做对照（这是避免把"目标太慢"当成"隧道慢"的必要控制）：
+
+| 路径 | OVH 100 MB |
+| --- | --- |
+| 服务器**直连** | **10.91 MB/s** |
+| 服务器经 **WARP** | **3.58 MB/s** |
+| 服务器经 socks 18080（生产 WARP 出口那条腿） | **3.55 MB/s** |
+| **经整条隧道到路由器** | **1.10–1.20 MB/s** |
+
+底层那条腿有 3.55 MB/s，隧道只交出 1.10–1.20 MB/s —— **约 1/3**。所以"目标太慢"不是解释。
+
+#### 把天花板量化：内层 TUIC 的有效连接窗口约 380–650 KB，且**没有自动调优**
+
+联网核验 quic-go 官方 Flow Control 文档
+（<https://quic-go.net/docs/quic/flowcontrol/>）：
+
+> "If the receiver's flow control window is smaller than the BDP, **the sender won't be able
+> to send any more data before receiving additional flow control credit, making it impossible
+> to fully utilize the available bandwidth.**"
+>
+> **Auto-Tuning**: "When a stream – or the connection in total – **consumes the entire flow
+> control (or close to that value) over any RTT**, this is a sign that the flow control window
+> might [be] too small… the auto-tuning logic **doubles** the receive window… until either the
+> peer doesn't utilize the entire window within one RTT, or until the configured maximum value
+> is reached. This means that **a suitable stream window size is usually reached within just a
+> few network roundtrips.**"
+
+用实测反推有效窗口（`窗口 ≈ 吞吐 × RTT`，载体 `rtt_ms=343`）：
+
+| 实测吞吐 | 反推有效窗口 |
+| --- | --- |
+| 1.10 MB/s（OVH） | ~377 KB |
+| 1.20 MB/s（OVH） | ~412 KB |
+| 1.90 MB/s（Cloudflare，10 MB ramp 偏高） | ~652 KB |
+
+即**有效窗口停留在 512 KB 初值附近、几乎没有按文档描述成倍增长**。而要在 343 ms RTT 上交付
+20 Mbps：`窗口 ≥ 2.5 MB/s × 0.343 s = **858 KB**`。
+
+**结论（对目标的影响）**：交付 20 Mbps 需要把内层 TUIC 的连接窗口从 ~380–650 KB 提到
+≥858 KB。窗口是 **sing-box 内嵌的 quic-go fork（`sagernet/quic-go`）** 的取值，sing-box 的
+TUIC 配置**没有任何窗口字段**（已核对 v1.9 inbound/outbound schema），本项目也无法触及。
+**因此 T5 的"交付 20 Mbps"在本仓库范围内不可达**——它需要改 sing-box（打补丁放开
+`InitialConnectionReceiveWindow` / 让自动调优生效）或换内层协议，而不是继续调 FEC 或载体。
+
 ## 11. 内核感知优化阶段
 
 内核优化按能力和验证结果分级，不以固定 `sysctl` 大全作为产品功能。
