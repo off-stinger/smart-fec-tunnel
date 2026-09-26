@@ -1234,7 +1234,139 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     PrivateKeyDer::from_pem_file(path).context("parse private key PEM")
 }
 
+/// Reads one DER TLV element: returns `(tag, content, total_len)`.
+///
+/// Deliberately minimal -- only what [`certificate_is_self_signed`] needs. It
+/// handles short and long form lengths and rejects indefinite length (which DER
+/// forbids anyway). No dependency is added for this: the dependency tree has no
+/// x509 parser, and pulling one in for a single boolean is not worth the supply
+/// chain and offline-build risk.
+fn der_element(input: &[u8]) -> Option<(u8, &[u8], usize)> {
+    let tag = *input.first()?;
+    let first_len = *input.get(1)?;
+    let (content_len, header_len) = if first_len & 0x80 == 0 {
+        (first_len as usize, 2usize)
+    } else {
+        let count = (first_len & 0x7f) as usize;
+        // 0x80 would be indefinite length, which DER forbids.
+        if count == 0 || count > 4 {
+            return None;
+        }
+        let mut value = 0usize;
+        for index in 0..count {
+            value = (value << 8) | (*input.get(2 + index)? as usize);
+        }
+        (value, 2 + count)
+    };
+    let end = header_len.checked_add(content_len)?;
+    let content = input.get(header_len..end)?;
+    Some((tag, content, end))
+}
+
+/// Iterates the direct children of a constructed DER value.
+fn der_children(mut content: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    let mut out = Vec::new();
+    while !content.is_empty() {
+        let (tag, inner, used) = der_element(content)?;
+        out.push((tag, inner));
+        content = &content[used..];
+    }
+    Some(out)
+}
+
+/// `Some(true)` when the certificate is self-signed, `Some(false)` when it is
+/// not, `None` when the DER could not be parsed.
+///
+/// **This needs no trust store, and that is the point.** A publicly trusted TLS
+/// server certificate is never self-signed, so `Some(true)` means any
+/// standards-compliant client -- including an active prober doing exactly what
+/// this function does -- will reject the chain. That makes it a decisive test of
+/// the fingerprint this server presents, without shipping a root bundle or
+/// adding a certificate-parsing dependency.
+///
+/// Self-signed is defined here the way RFC 5280 defines it: `subject` and
+/// `issuer` are the same distinguished name. Comparing the raw DER of the two
+/// Name structures is the same comparison a validator makes, and avoids having
+/// to decode X.501 at all.
+fn certificate_is_self_signed(der: &[u8]) -> Option<bool> {
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    let (_, certificate, _) = der_element(der)?;
+    let children = der_children(certificate)?;
+    let (_, tbs) = *children.first()?;
+    // TBSCertificate ::= SEQUENCE {
+    //   version [0] EXPLICIT OPTIONAL, serialNumber INTEGER, signature,
+    //   issuer Name, validity, subject Name, ... }
+    let fields = der_children(tbs)?;
+    let mut index = 0usize;
+    // The optional explicit version is context tag [0] (0xa0).
+    if matches!(fields.first().map(|(tag, _)| *tag), Some(0xa0)) {
+        index += 1;
+    }
+    // serialNumber, signature, then issuer.
+    let issuer = fields.get(index + 2)?.1;
+    // validity, then subject.
+    let subject = fields.get(index + 4)?.1;
+    Some(issuer == subject)
+}
+
+/// Environment switch for QUIC address validation (RFC 9000 section 8.1.2).
+const ADDRESS_VALIDATION_ENV: &str = "SMART_QUIC_ADDRESS_VALIDATION";
+/// When set to `1`, a self-signed server certificate aborts startup instead of
+/// warning. Off by default so an existing deployment is never taken down by an
+/// audit that is about to be fixed.
+const REQUIRE_TRUSTED_CERT_ENV: &str = "SMART_QUIC_REQUIRE_TRUSTED_CERT";
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => !matches!(value.trim(), "0" | "false" | "no"),
+        Err(_) => default,
+    }
+}
+
+/// Audits the certificate the QUIC server is about to present.
+///
+/// Why this exists: the deployed server presents a **self-signed** certificate
+/// whose subject claims `www.microsoft.com` (measured: `openssl verify` fails
+/// with error 18). That combination is not neutral camouflage -- it is a
+/// *positive* indicator, because a genuine Microsoft endpoint never does it, and
+/// active probing is exactly how such an endpoint would be found. The risk is
+/// easy to miss in a config file, so it is made explicit here, with the concrete
+/// remediation rather than a generic warning.
+fn audit_server_certificate(cert: &Path) -> Result<()> {
+    let certificates = load_certificates(cert)?;
+    let Some(leaf) = certificates.first() else {
+        bail!("certificate file is empty")
+    };
+    match certificate_is_self_signed(leaf.as_ref()) {
+        Some(true) => {
+            let require_trusted = env_flag(REQUIRE_TRUSTED_CERT_ENV, false);
+            let message = "the QUIC carrier is presenting a SELF-SIGNED certificate. Any \
+                 standards-compliant client -- including an active prober -- rejects this \
+                 chain, so the endpoint is trivially distinguishable from the real service \
+                 the --server-name claims. This is a positive fingerprint, not neutral \
+                 camouflage. Fix by deploying a publicly trusted certificate for a name you \
+                 control, or stop advertising a third-party name. Set \
+                 SMART_QUIC_REQUIRE_TRUSTED_CERT=1 to make this fatal.";
+            if require_trusted {
+                bail!("{message}");
+            }
+            warn!(cert = %cert.display(), certificates = certificates.len(), "{message}");
+        }
+        Some(false) => info!(
+            cert = %cert.display(),
+            chain_len = certificates.len(),
+            "QUIC carrier certificate is not self-signed"
+        ),
+        None => warn!(
+            cert = %cert.display(),
+            "could not parse the QUIC carrier certificate; fingerprint posture unverified"
+        ),
+    }
+    Ok(())
+}
+
 fn server_endpoint(listen: SocketAddr, cert: &Path, private_key: &Path) -> Result<Endpoint> {
+    audit_server_certificate(cert)?;
     let mut crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(load_certificates(cert)?, load_private_key(private_key)?)?;
@@ -1440,8 +1572,29 @@ pub async fn run_server(
     // Bound concurrent handshakes/relay tasks so unauthenticated connection
     // floods cannot create an unbounded number of Tokio tasks and sockets.
     let connection_slots = Arc::new(Semaphore::new(256));
-    info!(%listen, %upstream, "SFT QUIC relay server started");
-    while let Some(connecting) = endpoint.accept().await {
+    // RFC 9000 section 8.1 requires address validation before a server commits
+    // state to an unvalidated address; section 8.1.3 is the Retry packet
+    // mechanism itself. Validating bounds amplification and makes the server's
+    // first response identical to any other QUIC deployment's. This is
+    // hardening, not camouflage -- it does not change the certificate the
+    // endpoint presents, which is the actual fingerprint (see
+    // `audit_server_certificate`).
+    let address_validation = env_flag(ADDRESS_VALIDATION_ENV, true);
+    info!(
+        %listen,
+        %upstream,
+        address_validation,
+        "SFT QUIC relay server started"
+    );
+    while let Some(incoming) = endpoint.accept().await {
+        if address_validation && incoming.may_retry() {
+            if let Err(error) = incoming.retry() {
+                // `may_retry()` said yes, so this should not happen. The client
+                // simply retries with a token; nothing is lost by moving on.
+                warn!(%error, "QUIC address validation retry failed");
+            }
+            continue;
+        }
         let permit = connection_slots
             .clone()
             .acquire_owned()
@@ -1452,7 +1605,7 @@ pub async fn run_server(
         tokio::spawn(async move {
             let _permit = permit;
             let result = async {
-                let connection = connecting.await?;
+                let connection = incoming.await?;
                 let device_id = authenticate_server(&connection, &keys, &replays).await?;
                 info!(device_id, remote = %connection.remote_address(), "QUIC device authenticated");
                 let lanes = configured_stream_lanes()?;
@@ -2081,6 +2234,118 @@ mod tests {
             "bootstrap window {window} implies more than the {ceiling} byte/s ceiling"
         );
         assert!(window >= FIXED_RATE_MIN_WINDOW_MTUS * 1200);
+    }
+
+    /// Minimal DER encoder for building certificate fixtures.
+    fn der(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else {
+            let bytes = len.to_be_bytes();
+            let first = bytes.iter().position(|byte| *byte != 0).unwrap();
+            let count = bytes.len() - first;
+            out.push(0x80 | count as u8);
+            out.extend_from_slice(&bytes[first..]);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    fn der_seq(parts: &[Vec<u8>]) -> Vec<u8> {
+        der(0x30, &parts.concat())
+    }
+
+    /// Builds a structurally valid (but cryptographically meaningless)
+    /// certificate, which is all `certificate_is_self_signed` inspects.
+    fn cert_with(issuer: &[u8], subject: &[u8], with_version: bool) -> Vec<u8> {
+        let mut fields = Vec::new();
+        if with_version {
+            fields.push(der(0xa0, &der(0x02, &[2])));
+        }
+        fields.push(der(0x02, &[1])); // serialNumber
+        fields.push(der_seq(&[der(0x06, &[0x2a])])); // signature
+        fields.push(der(0x30, issuer)); // issuer Name
+        fields.push(der_seq(&[
+            der(0x17, b"240101000000Z"),
+            der(0x17, b"250101000000Z"),
+        ])); // validity
+        fields.push(der(0x30, subject)); // subject Name
+        fields.push(der_seq(&[der(0x03, &[0])])); // subjectPublicKeyInfo
+        let tbs = der_seq(&fields);
+        der_seq(&[
+            tbs,
+            der_seq(&[der(0x06, &[0x2a])]),
+            der(0x03, &[0x00, 0x01]),
+        ])
+    }
+
+    /// The decisive check: a publicly trusted server certificate is never
+    /// self-signed, so this boolean is exactly what an active prober computes.
+    #[test]
+    fn certificate_self_signedness_is_decided_by_subject_equalling_issuer() {
+        let name = der_seq(&[der(0x06, &[0x55, 0x04, 0x03])]);
+        // Self-signed: subject and issuer are the same DN.
+        let self_signed = cert_with(&name, &name, true);
+        assert_eq!(certificate_is_self_signed(&self_signed), Some(true));
+        // Same, but without the optional [0] version field, which shifts every
+        // subsequent index: getting this wrong would silently report the
+        // validity block as the issuer.
+        let self_signed = cert_with(&name, &name, false);
+        assert_eq!(certificate_is_self_signed(&self_signed), Some(true));
+
+        // Issued by something else: not self-signed.
+        let issuer = der_seq(&[der(0x06, &[0x55, 0x04, 0x03, 0x01])]);
+        let issued = cert_with(&issuer, &name, true);
+        assert_eq!(certificate_is_self_signed(&issued), Some(false));
+    }
+
+    #[test]
+    fn certificate_parsing_reports_none_instead_of_guessing() {
+        // Truncated / malformed input must not produce a verdict, because a
+        // wrong `false` would silently clear the fingerprint audit.
+        assert_eq!(certificate_is_self_signed(&[]), None);
+        assert_eq!(certificate_is_self_signed(&[0x30]), None);
+        assert_eq!(certificate_is_self_signed(&[0x30, 0x10, 0x01]), None);
+    }
+
+    #[test]
+    fn der_reader_handles_long_form_and_rejects_indefinite_length() {
+        // Long form: 200-byte content uses a two-byte length.
+        let long = der(0x04, &[0u8; 200]);
+        let (tag, content, used) = der_element(&long).unwrap();
+        assert_eq!(tag, 0x04);
+        assert_eq!(content.len(), 200);
+        assert_eq!(used, long.len());
+        // Indefinite length (0x80) is forbidden in DER and must be rejected
+        // rather than parsed as a zero-length element.
+        assert!(der_element(&[0x30, 0x80, 0x00, 0x00]).is_none());
+        assert!(der_element(&[0x30]).is_none());
+    }
+
+    /// Opt-in check against a **real** certificate.
+    ///
+    /// Synthetic fixtures exercise the DER walker's indexing, but they cannot
+    /// prove it behaves on a certificate actually produced by a CA or by
+    /// openssl. Set `SFT_TEST_CERT` to a PEM path to run this; without the
+    /// variable it passes vacuously so the default suite stays hermetic and
+    /// independent of the filesystem.
+    #[test]
+    fn self_signedness_is_decided_on_a_real_certificate_when_provided() {
+        let Ok(path) = std::env::var("SFT_TEST_CERT") else {
+            return;
+        };
+        let certificates = load_certificates(Path::new(&path)).expect("parse real certificate");
+        let verdict = certificate_is_self_signed(certificates[0].as_ref());
+        eprintln!(
+            "SFT_TEST_CERT={path} self_signed={verdict:?} chain_len={}",
+            certificates.len()
+        );
+        assert!(
+            verdict.is_some(),
+            "a real certificate must parse, not fall through to None"
+        );
     }
 
     #[test]
