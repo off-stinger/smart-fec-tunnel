@@ -88,18 +88,24 @@ RFC 9002 下限（2944 字节）、吞吐 4.5 KB/s，而 `bbr` 与 `fixed` 都�
 
 | 变量 | 作用域 | 默认 | 说明 |
 | --- | --- | --- | --- |
+| `SMART_FEC_KEY` | 两端 | 必填 | 共享密钥（clap `env=`）。init 硬性要求它被设置 |
+| `SMART_FEC_KEY_ID` | 两端 | 必填 | 密钥 ID（clap `env=`）。`deploy/openwrt-smart-fec-quic.init` **硬性要求**它，否则不启动 |
+| `SMART_FEC_KEYRING` | 服务端 | 无 | 多用户 keyring（clap `env=`）；`--keyring` 的服务端等价物 |
 | `SMART_QUIC_CONGESTION` | 两端 | `adaptive` | `adaptive`/`new_reno`/`cubic`/`bbr`/`fixed` |
-| `SMART_QUIC_MAX_RATE_MBPS` | 两端 | `30` | 仅 `adaptive`：**有效**发送速率硬顶 |
-| `SMART_QUIC_FIXED_RATE_MBPS` | 两端 | `28` | 仅 `fixed`：目标速率（有效速率可到 1.25 倍） |
+| `SMART_QUIC_MAX_RATE_MBPS` | 两端 | `30` | **`adaptive` 与 `fixed` 都生效**：**有效**发送速率硬顶（T3 起 `fixed` 也受约束） |
+| `SMART_QUIC_FIXED_RATE_MBPS` | 两端 | `28` | 仅 `fixed`：目标速率。有效速率仍受上一行的硬顶约束（不是无条件的 1.25 倍） |
 | `SMART_QUIC_ADDRESS_VALIDATION` | 服务端 | 开 | QUIC Retry 地址验证（RFC 9000 §8.1.3）；设 `0` 关闭 |
 | `SMART_QUIC_REQUIRE_TRUSTED_CERT` | 服务端 | 关 | 设 `1` 时，自签证书直接拒绝启动 |
 | `SMART_FEC_TRAFFIC_LOG` | 两端 | 开 | T1 流量账目，每 5 秒一条；设 `0` 关闭 |
 | `SMART_FEC_MAX_PARITY` | 两端（**服务端有效**） | `8` | FEC parity 的有效上限，夹在 `[1, 8]`；见 §10.14 |
-| `SMART_QUIC_STREAM_LANES` | 客户端 | 不传 | 仅 `1` 有意义（不传 = DATAGRAM） |
+| `SMART_QUIC_STREAM_LANES` | **两端** | 不传 | 仅 `1` 有意义（不传 = DATAGRAM）。`run_server` 与 `run_client` **都**读它，两端必须一致 |
+
+**作用域写法说明**：前三行是 clap 的 `#[arg(env = "...")]`，其余是 `std::env::var` 字面量。
+两者都不在 `envs=` 拼接里显式出现（`SMART_FEC_KEY` 由 init 第 30 行拼接，`KEY_ID` 由命令行传入）。
 
 `tests/deploy_env_coverage.rs` 会检查路由器 init 是否转发了**二进制读取的每个**
-`SMART_*` 环境变量（扫描 `src/quic_relay.rs` 与 `src/main.rs` 里的
-`std::env::var("SMART_...")` 字面量）：**新增环境变量时必须同时更新 init**，否则在
+`SMART_*` 环境变量：它在**运行时枚举 `src/` 下的全部 `.rs`**（含 `src/bin/`）并扫描其中的
+`std::env::var("SMART_...")` 字面量，所以新增源文件自动被覆盖：**新增环境变量时必须同时更新 init**，否则在
 `/etc/smart-fec-quic.env` 里设置会被静默忽略。这类漏转发已发生两次（T3 的
 `MAX_RATE`，以及 `SMART_FEC_MAX_PARITY`——后者正是因为扫描范围只覆盖
 `quic_relay.rs` 才漏掉的，现已扩大扫描面）。有意不转发的变量必须写进用例的

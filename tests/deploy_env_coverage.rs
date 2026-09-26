@@ -6,24 +6,28 @@
 //! 没有任何报错，只是行为与预期不符。这与上一轮修掉的 procd `env` 覆盖问题
 //! 属于同一类"静默配置丢失"，而人手审查显然漏掉了它。
 //!
-//! 本用例最初的扫描范围只有 `src/quic_relay.rs`，并在注释里"诚实标注"了这个
-//! 局限。**该局限随后就命中了**：`SMART_FEC_MAX_PARITY` 加在 `src/main.rs`，
-//! 于是它可以被设置、被静默忽略，而本用例不响。所以现在扫描 `src/` 下所有
-//! 读取 `std::env::var("SMART_...")` 字面量的源文件，并对每个文件断言它至少
-//! 被扫出 N 个变量——**扫描本身失效时必须失败，而不是空过**。
+//! 本用例最初只扫描 `src/quic_relay.rs`，并在注释里"诚实标注"了这个局限。
+//! **该局限随后就命中了**：`SMART_FEC_MAX_PARITY` 加在 `src/main.rs`，于是它
+//! 可以被设置、被静默忽略，而本用例不响。第二版改成扫描一份**硬编码的两项清单**，
+//! 但那仍然漏掉"新增第三个源文件"——一处被文档记录下来的局限，不如直接修掉。
+//!
+//! **第三版（当前）在运行时枚举 `src/` 下的全部 `.rs`**，所以新增源文件自动被覆盖，
+//! 不再需要任何人记得维护清单。`KNOWN_FILES` 里的每文件下限只作为**扫描自检**：
+//! 正则/写法一旦变化导致扫不到东西，用例必须失败——恒真的守卫比没有守卫更糟。
 //!
 //! 仍然存在的局限（诚实标注）：以变量形式传名的读取（例如
 //! `std::env::var(ADDRESS_VALIDATION_ENV)`）以及 clap 的 `#[arg(env = "...")]`
-//! （例如 `SMART_FEC_KEY`，由 clap 读）不会被扫到。后者当前由 init 行 30 的
-//! 显式拼接覆盖，但没有自动守卫。
+//! （例如 `SMART_FEC_KEY`，由 clap 读）不会被扫到。后者当前由 init 第 30 行的显式
+//! 拼接覆盖，但没有自动守卫。
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::{Path, PathBuf};
 
-/// 扫描范围：(源文件, 该文件至少要扫出的变量个数)。
+/// 每文件至少要扫出的变量个数——**扫描自检**，不是覆盖面清单。
 ///
-/// 个数下限是**扫描自检**：正则/写法一旦变化导致扫不到东西，用例必须失败。
-const SCANNED: &[(&str, usize)] = &[
+/// 覆盖面由运行时枚举保证；这里只是让"扫描失效"必然失败。
+const KNOWN_FILES: &[(&str, usize)] = &[
     ("src/quic_relay.rs", 4),
     // SMART_FEC_MAX_PARITY / SMART_FEC_TRAFFIC_LOG / SMART_FEC_FORCE_PARITY
     ("src/main.rs", 3),
@@ -53,6 +57,30 @@ const NOT_FORWARDED: &[(&str, &str)] = &[
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 const MARKER: &str = "std::env::var(\"SMART_";
 
+/// 运行时枚举 `src/` 下的全部 `.rs`（含 `src/bin/`）。
+///
+/// 递归是必要的：只看 `src/*.rs` 会漏掉 `src/bin/*.rs`，而那正是"新增源文件"
+/// 最可能落地的位置。
+fn discovered_sources() -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(Path::new(MANIFEST).join("src").as_path(), &mut out);
+    out.sort();
+    out
+}
+
 /// 抽出一个源文件里所有 `std::env::var("<name>")` 字面量的变量名。
 fn scanned_names(source: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
@@ -74,16 +102,31 @@ fn openwrt_init_forwards_every_client_side_env_var() {
     let init = fs::read_to_string(format!("{MANIFEST}/deploy/openwrt-smart-fec-quic.init"))
         .expect("read openwrt init");
 
+    let sources = discovered_sources();
+    // 枚举本身失效（例如 src/ 被搬走）必须失败，而不是空过。
+    assert!(
+        sources.len() >= 3,
+        "discovered only {} source file(s) under src/; the discovery itself is broken",
+        sources.len()
+    );
+
     let mut names = BTreeSet::new();
-    for (path, floor) in SCANNED {
-        let source = fs::read_to_string(format!("{MANIFEST}/{path}"))
-            .unwrap_or_else(|error| panic!("read {path}: {error}"));
+    for path in &sources {
+        let rel = path
+            .strip_prefix(MANIFEST)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = fs::read_to_string(path).unwrap_or_else(|error| panic!("read {rel}: {error}"));
         let found = scanned_names(&source);
-        // 一个恒真的守卫比没有守卫更糟：扫描失效必须在这里失败。
-        assert!(
-            found.len() >= *floor,
-            "scan of {path} found only {found:?} (expected >= {floor}); the scan itself is broken"
-        );
+        // 已知文件的下限：扫描失效必须在这里失败。
+        if let Some((_, floor)) = KNOWN_FILES.iter().find(|(name, _)| *name == rel) {
+            assert!(
+                found.len() >= *floor,
+                "scan of {rel} found only {found:?} (expected >= {floor}); \
+                 the scan itself is broken"
+            );
+        }
         names.extend(found);
     }
 
@@ -108,10 +151,8 @@ fn openwrt_init_forwards_every_client_side_env_var() {
 #[test]
 fn not_forwarded_list_only_contains_variables_the_binary_reads() {
     let mut sources = String::new();
-    for (path, _) in SCANNED {
-        let source = fs::read_to_string(format!("{MANIFEST}/{path}"))
-            .unwrap_or_else(|error| panic!("read {path}: {error}"));
-        sources.push_str(&source);
+    for path in discovered_sources() {
+        sources.push_str(&fs::read_to_string(&path).unwrap_or_default());
     }
 
     let stale: Vec<&str> = NOT_FORWARDED
@@ -124,4 +165,25 @@ fn not_forwarded_list_only_contains_variables_the_binary_reads() {
         stale.is_empty(),
         "NOT_FORWARDED 里的 {stale:?} 已不再出现在被扫描源码中，请删除以免名单腐烂"
     );
+}
+
+/// 枚举必须真的覆盖到已知有读取的文件——否则"运行时发现"可能悄悄变成空集，
+/// 而上面两个用例都会因为缺少输入而通过。
+#[test]
+fn discovery_reaches_the_files_known_to_read_env_vars() {
+    let found: BTreeSet<String> = discovered_sources()
+        .iter()
+        .map(|p| {
+            p.strip_prefix(MANIFEST)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    for (name, _) in KNOWN_FILES {
+        assert!(
+            found.contains(*name),
+            "discovery missed {name}; the guard is no longer looking where the reads are"
+        );
+    }
 }
