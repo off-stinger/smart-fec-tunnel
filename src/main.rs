@@ -376,11 +376,8 @@ fn fec_goodput_factor(loss_ppm: u32, parity: usize) -> f64 {
 /// The loss input is the receiver's own wire-frame gap (`sequence_gap_ppm`),
 /// i.e. the loss observed on the network channel before recovery — not a
 /// post-recovery view. That is the correct signal for sizing redundancy.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Adaptive {
-    // Zero is intentional: speculative startup redundancy can create a
-    // congestion/loss loop on a rate-limited path before feedback is useful.
-    // `target()` lifts the steady-state value to MIN_PARITY.
     parity: usize,
     bad: u8,
     good: u16,
@@ -389,6 +386,26 @@ struct Adaptive {
     unavailable_reports: u8,
     /// 连续"有丢失但一个都没修回来"的报告次数（恢复驱动输入）。
     shortfall_reports: u8,
+}
+
+impl Default for Adaptive {
+    fn default() -> Self {
+        Self {
+            // 启动即带常态下限，而不是 0。
+            //
+            // 早先 `parity: 0` 的理由是"避免在拿到反馈前投机性发冗余"。但实测表明
+            // 真正的代价在另一头：冗余晚于丢包存在就等于没有冗余（18.3% 突发、
+            // `fec_recovered_symbols=0`）。MIN_PARITY 只有约 10% 开销，换的是"突发
+            // 到来时一定有东西可用"，代价方向是可接受的。
+            parity: MIN_PARITY,
+            bad: 0,
+            good: 0,
+            last_loss_ppm: 0,
+            smoothed_loss_ppm: 0,
+            unavailable_reports: 0,
+            shortfall_reports: 0,
+        }
+    }
 }
 
 /// 连续多少次"有丢失但一个都没修回来"就立刻抬一档冗余。
@@ -2306,6 +2323,9 @@ mod tests {
             a.report(0);
         }
         assert_eq!(a.parity, MIN_PARITY);
+
+        // 而且**启动时**就该有下限：冗余晚于丢包存在等于没有冗余。
+        assert_eq!(Adaptive::default().parity, MIN_PARITY);
     }
 
     #[test]
