@@ -70,7 +70,28 @@ echo 'SMART_QUIC_CONGESTION=cubic' >> /etc/smart-fec-quic.env
 
 对照时观察 `QUIC carrier stats`（5 秒一条）中的 `cwnd_bytes`、`congestion_events`、
 `wire_loss_ppm`、`mtu`、`black_holes`，判读方法见产品说明书 §10.1。
-对照结束后改回 `new_reno` 并重启。
+**对照结束后不要改回 `new_reno`**：本链路实测 `new_reno` 的窗口会被压到
+RFC 9002 下限（2944 字节）、吞吐 4.5 KB/s，而 `bbr` 与 `fixed` 都在 42–49 万 B/s。
+丢包率明确（链路专线或已知随机丢包）时用 `fixed` 并配 `SMART_QUIC_FIXED_RATE_MBPS`，
+否则用 `bbr`。完整对照见产品说明书 §10.6。
+
+**不要用 `fixed` 超过链路真实容量**：`fixed` 是按配置速率发送、对丢包不做退让，
+配高了丢包会变成永久性丢包，FEC 也补不回来（代码启动时会打印同样的告警）。
+另外实际发送速率上限是配置值的 **1.25 倍**（ACK 速率补偿），且 FEC 开销出自同一
+预算，因此 30 Mbps 链路应填 24 而不是 30（§10.5）。
+
+### 3.2 旁路由 init 脚本的两条硬约束
+
+`deploy/openwrt-smart-fec-quic.init` 的写法受两个 procd/解析器行为约束，改动时不要破坏：
+
+1. **`procd_set_param env` 只能调用一次。** 该参数走
+   `_procd_add_table → json_add_object("env")`，多次调用会生成重复的 `"env"` 键，
+   JSON 解析后只有最后一次生效，**前面的环境变量被静默丢弃**。曾因此把
+   `SMART_FEC_KEY` 弄丢，`quic-client` 以缺少 `--key` 崩溃并 crash loop。
+   要加分项环境变量时，请追加到既有的那个 `envs` 字符串里。
+2. **`SMART_QUIC_STREAM_LANES` 只在等于 `1` 时才传。** 不传即 DATAGRAM 模式（默认）。
+   脚本不再传 `"0"`，以兼容不认识 `0` 的旧二进制；新版本解析器已把
+   unset / 空白 / `"0"` 统一当作 DATAGRAM 处理。
 
 FEC 反馈帧自本版本起带能力协商（先发 4 字节，确认对端支持后才发 24 字节），
 因此两端**不再需要同时升级**，可以任意顺序滚动；若想绝对保守，升级一端后观察 5 分钟
