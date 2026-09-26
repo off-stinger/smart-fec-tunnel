@@ -11,7 +11,7 @@ use crate::quic_auth::{
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use quinn::{
-    congestion::{Controller, ControllerFactory, NewReno, NewRenoConfig},
+    congestion::{BbrConfig, Controller, ControllerFactory, CubicConfig, NewRenoConfig},
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     rustls::{self, pki_types::CertificateDer, pki_types::PrivateKeyDer},
     ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
@@ -120,19 +120,77 @@ fn parse_stream_lanes(value: Option<&str>) -> Result<usize> {
     Ok(lanes)
 }
 
+/// Selectable QUIC congestion controller for the carrier.
+///
+/// The carrier sits underneath the inner TUIC flow, which runs its own
+/// congestion controller, so the carrier's only job is to keep the path busy
+/// without collapsing on loss that FEC is already repairing. NewReno halves its
+/// window on every loss event and drops to the RFC 9002 minimum under
+/// persistent congestion, which on a 20-30 % loss path pins it near the floor.
+/// Cubic and BBR are exposed so the difference can be measured instead of
+/// guessed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CarrierController {
+    NewReno,
+    Cubic,
+    Bbr,
+}
+
+fn configured_congestion_controller() -> Result<CarrierController> {
+    let value = std::env::var("SMART_QUIC_CONGESTION").ok();
+    parse_congestion_controller(value.as_deref())
+}
+
+fn parse_congestion_controller(value: Option<&str>) -> Result<CarrierController> {
+    let Some(value) = value else {
+        return Ok(CarrierController::NewReno);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "new_reno" | "newreno" | "reno" => Ok(CarrierController::NewReno),
+        "cubic" => Ok(CarrierController::Cubic),
+        "bbr" => Ok(CarrierController::Bbr),
+        other => bail!("SMART_QUIC_CONGESTION must be new_reno, cubic or bbr, got {other:?}"),
+    }
+}
+
 #[derive(Debug)]
-struct CarrierControllerFactory;
+struct CarrierControllerFactory {
+    kind: CarrierController,
+}
 
 impl ControllerFactory for CarrierControllerFactory {
-    fn build(self: Arc<Self>, now: std::time::Instant, current_mtu: u16) -> Box<dyn Controller> {
-        // Use Quinn's maintained congestion controller. A fixed window that
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        // Use Quinn's maintained congestion controllers. A fixed window that
         // ignores losses can overload the path, even when the inner TUIC flow
         // also has its own congestion controller.
+        //
+        // RFC 9002 section 7.2: endpoints SHOULD use an initial congestion
+        // window of ten times the maximum datagram size, limiting it to the
+        // larger of 14,720 bytes or twice the maximum datagram size, and SHOULD
+        // recalculate it when the maximum datagram size changes. Quinn's
+        // `Default` for every bundled controller is the compile-time constant
+        // `14720.clamp(2 * 1200, 10 * 1200)`, i.e. a fixed 12,000 bytes that
+        // ignores the runtime MTU (v0.11.18, congestion.rs). Recompute it here
+        // from the MTU the connection actually negotiated.
         let mtu = u64::from(current_mtu);
         let initial_window = (10 * mtu).min((2 * mtu).max(14_720));
-        let mut config = NewRenoConfig::default();
-        config.initial_window(initial_window);
-        Box::new(NewReno::new(Arc::new(config), now, current_mtu))
+        match self.kind {
+            CarrierController::NewReno => {
+                let mut config = NewRenoConfig::default();
+                config.initial_window(initial_window);
+                <NewRenoConfig as ControllerFactory>::build(Arc::new(config), now, current_mtu)
+            }
+            CarrierController::Cubic => {
+                let mut config = CubicConfig::default();
+                config.initial_window(initial_window);
+                <CubicConfig as ControllerFactory>::build(Arc::new(config), now, current_mtu)
+            }
+            CarrierController::Bbr => {
+                let mut config = BbrConfig::default();
+                config.initial_window(initial_window);
+                <BbrConfig as ControllerFactory>::build(Arc::new(config), now, current_mtu)
+            }
+        }
     }
 }
 
@@ -263,7 +321,7 @@ fn spawn_lane_readers(receives: Vec<RecvStream>) -> (mpsc::Receiver<Vec<u8>>, Jo
     (rx, tasks)
 }
 
-fn transport_config() -> Arc<TransportConfig> {
+fn transport_config() -> Result<Arc<TransportConfig>> {
     let mut transport = TransportConfig::default();
     // One bidirectional stream authenticates the device; optional reliable
     // carrier lanes use the remaining streams.
@@ -273,11 +331,29 @@ fn transport_config() -> Arc<TransportConfig> {
     // 1472 bytes plus the IPv4 header is a standard 1500-byte packet. Quinn's
     // PMTU discovery and black-hole detection remain enabled and can lower it;
     // the carrier fragmentation layer handles the resulting smaller DATAGRAM.
+    // `min_mtu` is deliberately left at its 1200 default: Quinn's own guidance is
+    // to raise `initial_mtu` and let discovery adapt, because raising `min_mtu`
+    // past the real path MTU causes unrepairable packet loss.
     transport.initial_mtu(1472);
-    transport.congestion_controller_factory(Arc::new(CarrierControllerFactory));
+    let controller = configured_congestion_controller()?;
+    match controller {
+        CarrierController::Bbr => warn!(
+            ?controller,
+            "carrier congestion controller selected; BBR is marked experimental by Quinn"
+        ),
+        _ => info!(?controller, "carrier congestion controller selected"),
+    }
+    transport
+        .congestion_controller_factory(Arc::new(CarrierControllerFactory { kind: controller }));
+    // These are hard caps, not "unlimited": exceeding them makes Quinn drop the
+    // oldest buffered datagram, and `None` for the receive buffer means "refuse
+    // incoming datagrams", not "no limit". A drop here happens below FEC, so the
+    // datagram has already consumed an FEC sequence number without ever reaching
+    // the wire, and FEC cannot reconstruct a shard that was never sent. 4 MiB is
+    // far above any plausible bandwidth-delay product on this path.
     transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
     transport.datagram_send_buffer_size(4 * 1024 * 1024);
-    Arc::new(transport)
+    Ok(Arc::new(transport))
 }
 
 fn exporter(connection: &Connection, nonce: &[u8; 16]) -> Result<[u8; 32]> {
@@ -311,7 +387,7 @@ fn server_endpoint(listen: SocketAddr, cert: &Path, private_key: &Path) -> Resul
         .with_single_cert(load_certificates(cert)?, load_private_key(private_key)?)?;
     crypto.alpn_protocols = vec![ALPN.to_vec()];
     let mut config = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
-    config.transport_config(transport_config());
+    config.transport_config(transport_config()?);
     Endpoint::server(config, listen).context("bind QUIC server")
 }
 
@@ -325,7 +401,7 @@ fn client_endpoint(bind: SocketAddr, ca_cert: &Path) -> Result<Endpoint> {
         .with_no_client_auth();
     crypto.alpn_protocols = vec![ALPN.to_vec()];
     let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
-    config.transport_config(transport_config());
+    config.transport_config(transport_config()?);
     let mut endpoint = Endpoint::client(bind).context("bind QUIC client")?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
@@ -698,11 +774,48 @@ mod tests {
 
     #[test]
     fn congestion_controller_uses_rfc_sized_initial_window() {
-        let factory = Arc::new(CarrierControllerFactory);
-        let controller = factory.clone().build(std::time::Instant::now(), 1472);
-        assert_eq!(controller.initial_window(), 14_720);
-        let controller = factory.build(std::time::Instant::now(), 1200);
-        assert_eq!(controller.initial_window(), 12_000);
+        // RFC 9002 section 7.2: min(10 * mtu, max(2 * mtu, 14720)), recalculated
+        // from the MTU the connection actually negotiated rather than Quinn's
+        // compile-time 12,000 constant.
+        for kind in [
+            CarrierController::NewReno,
+            CarrierController::Cubic,
+            CarrierController::Bbr,
+        ] {
+            let factory = Arc::new(CarrierControllerFactory { kind });
+            let controller = factory.clone().build(std::time::Instant::now(), 1472);
+            assert_eq!(controller.initial_window(), 14_720, "{kind:?} at mtu 1472");
+            let controller = factory.build(std::time::Instant::now(), 1200);
+            assert_eq!(controller.initial_window(), 12_000, "{kind:?} at mtu 1200");
+        }
+    }
+
+    #[test]
+    fn congestion_controller_selection_is_explicit() {
+        assert_eq!(
+            parse_congestion_controller(None).unwrap(),
+            CarrierController::NewReno
+        );
+        assert_eq!(
+            parse_congestion_controller(Some("reno")).unwrap(),
+            CarrierController::NewReno
+        );
+        assert_eq!(
+            parse_congestion_controller(Some("Cubic")).unwrap(),
+            CarrierController::Cubic
+        );
+        assert_eq!(
+            parse_congestion_controller(Some(" bbr ")).unwrap(),
+            CarrierController::Bbr
+        );
+        // A typo must fail loudly instead of silently falling back to a
+        // controller the operator did not choose.
+        for invalid in ["", "vegas", "new-reno", "1"] {
+            assert!(
+                parse_congestion_controller(Some(invalid)).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
     }
 
     #[test]
