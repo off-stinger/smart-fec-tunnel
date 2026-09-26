@@ -10,6 +10,11 @@ bytes = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 quinn = "0.11.11"
+# 直接依赖仅用于命名 `quinn_proto::RttEstimator`：quinn 没有重新导出该类型，
+# 而自定义 `congestion::Controller` 必须在其 `on_ack` 签名里写它。
+# 版本与 quinn 的 quinn-proto 依赖保持一致，cargo 会统一到同一个 crate 实例。
+# 关闭默认特性以免额外启用 aws-lc-rs 等重依赖（quinn 已启用所需特性）。
+quinn-proto = { version = "0.11.18", default-features = false }
 rand = "0.8"
 reed-solomon-erasure = "6"
 rustls-pki-types = { version = "1.15", features = ["std"] }

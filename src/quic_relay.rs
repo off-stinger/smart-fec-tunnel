@@ -11,11 +11,14 @@ use crate::quic_auth::{
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use quinn::{
-    congestion::{BbrConfig, Controller, ControllerFactory, CubicConfig, NewRenoConfig},
+    congestion::{
+        BbrConfig, Controller, ControllerFactory, ControllerMetrics, CubicConfig, NewRenoConfig,
+    },
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     rustls::{self, pki_types::CertificateDer, pki_types::PrivateKeyDer},
     ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
 };
+use quinn_proto::RttEstimator;
 use rand::RngCore;
 use rustls::pki_types::pem::PemObject;
 use std::{
@@ -185,11 +188,16 @@ fn parse_stream_lanes(value: Option<&str>) -> Result<usize> {
 /// persistent congestion, which on a 20-30 % loss path pins it near the floor.
 /// Cubic and BBR are exposed so the difference can be measured instead of
 /// guessed.
+///
+/// `Fixed` is the loss-tolerant option, for paths where the loss is **not**
+/// congestion (measured: ~20 % random loss from the ISP/GFW on the home↔SG
+/// path). See [`FixedRate`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CarrierController {
     NewReno,
     Cubic,
     Bbr,
+    Fixed,
 }
 
 fn configured_congestion_controller() -> Result<CarrierController> {
@@ -205,13 +213,306 @@ fn parse_congestion_controller(value: Option<&str>) -> Result<CarrierController>
         "new_reno" | "newreno" | "reno" => Ok(CarrierController::NewReno),
         "cubic" => Ok(CarrierController::Cubic),
         "bbr" => Ok(CarrierController::Bbr),
-        other => bail!("SMART_QUIC_CONGESTION must be new_reno, cubic or bbr, got {other:?}"),
+        "fixed" | "brutal" => Ok(CarrierController::Fixed),
+        other => {
+            bail!("SMART_QUIC_CONGESTION must be new_reno, cubic, bbr or fixed, got {other:?}")
+        }
+    }
+}
+
+/// `SMART_QUIC_FIXED_RATE_MBPS` 的默认值，与 FEC 侧 `--rate-mbps` 的默认 28 对齐。
+const DEFAULT_FIXED_RATE_MBPS: u64 = 28;
+/// 固定速率的上限保护：超过 10 Gbit/s 视为配置错误。
+const MAX_FIXED_RATE_MBPS: u64 = 10_000;
+/// 固定速率窗口的下限（以 MTU 计）：至少几个包，避免极小窗口把 pacer 卡死。
+const FIXED_RATE_MIN_WINDOW_MTUS: u64 = 4;
+/// 固定速率窗口的引导 RTT 估计。
+///
+/// `ControllerFactory::build` 只拿到 MTU、拿不到 RTT，所以先按这个值估算窗口，
+/// 等第一个 ACK 带来真实 smoothed RTT 后由 `on_ack` 修正。
+/// **注意窗口必须按 pacer 实际除的那个 RTT（smoothed）来定尺寸**，否则实际速率
+/// 会被打折为 `rate * rtt_used / smoothed_rtt`。
+const FIXED_RATE_BOOTSTRAP_RTT: Duration = Duration::from_millis(100);
+/// 窗口尺寸计算时的 RTT 下限，避免退化到极小窗口。
+const FIXED_RATE_MIN_RTT: Duration = Duration::from_millis(1);
+/// ACK 成功率统计的槽位数（每槽 1 秒），用于反向补偿丢包。
+const FIXED_RATE_ACK_SLOTS: usize = 5;
+/// 样本不足时不补偿，避免起步阶段被噪声放大。
+const FIXED_RATE_MIN_ACK_SAMPLES: u64 = 50;
+/// ACK 成功率的下限：丢包再重也只把发送速率放大 1 / 0.8 = 1.25 倍。
+const FIXED_RATE_MIN_ACK_RATE: f64 = 0.8;
+
+/// ACK/丢包统计的一个时间槽（1 秒）。
+#[derive(Clone, Copy, Debug, Default)]
+struct AckSlot {
+    /// 槽对应的秒序号；`i64::MIN` 表示空槽。
+    ts: i64,
+    ack: u64,
+    loss: u64,
+}
+
+fn configured_fixed_rate() -> Result<u64> {
+    let value = std::env::var("SMART_QUIC_FIXED_RATE_MBPS").ok();
+    parse_fixed_rate_mbps(value.as_deref())
+}
+
+fn parse_fixed_rate_mbps(value: Option<&str>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_FIXED_RATE_MBPS);
+    };
+    let mbps: u64 = value
+        .trim()
+        .parse()
+        .context("SMART_QUIC_FIXED_RATE_MBPS must be an integer")?;
+    if mbps == 0 || mbps > MAX_FIXED_RATE_MBPS {
+        bail!("SMART_QUIC_FIXED_RATE_MBPS must be between 1 and {MAX_FIXED_RATE_MBPS}, got {mbps}")
+    }
+    Ok(mbps)
+}
+
+/// Window size for a target rate.
+///
+/// **Must be sized on the same RTT the pacer divides by.** quinn's pacer calls
+/// `optimal_capacity(smoothed_rtt, window, mtu)` and refills the token bucket
+/// with `window * 2ms / smoothed_rtt` bytes every 2 ms, so the send rate it
+/// enforces is exactly `window / smoothed_rtt`. Sizing the window on `min_rtt`
+/// therefore throttles the connection to `rate * min_rtt / smoothed_rtt` — on
+/// this link (min 100 ms bootstrap vs 400 ms smoothed) that is a quarter of the
+/// configured rate. `FixedRate::apply_rtt` is fed `RttEstimator::get()`, the
+/// same smoothed value the pacer uses, so `window = rate * srtt` yields the
+/// configured rate exactly.
+///
+/// Floored at a few MTUs so the pacer is never starved.
+///
+/// The `ack_rate` divisor is the second half of Brutal: sending at exactly
+/// `rate` on a 20 % loss path only *delivers* `0.8 * rate`, so the window is
+/// divided by the recent ACK success rate to compensate (20 % loss -> ~25 %
+/// faster). Cross-checked against the quinn port of Hysteria2's Brutal
+/// (`rsteria2::congestion`), which encodes the target rate into the window the
+/// same way for the same reason: quinn has no independent pacer.
+///
+/// Extracted as a free function so the sizing rule can be tested directly —
+/// `quinn_proto::RttEstimator` cannot be constructed outside quinn (no `Default`,
+/// `new`/`update` are `pub(crate)`), so it is not usable in a unit test.
+fn fixed_rate_window(
+    rate_bytes_per_sec: u64,
+    smoothed_rtt: Duration,
+    mtu: u64,
+    ack_rate: f64,
+) -> u64 {
+    let ack_rate = if ack_rate.is_finite() && ack_rate > 0.0 {
+        ack_rate.clamp(FIXED_RATE_MIN_ACK_RATE, 1.0)
+    } else {
+        1.0
+    };
+    let bdp = rate_bytes_per_sec as f64 * smoothed_rtt.as_secs_f64() / ack_rate;
+    let bdp = if bdp.is_finite() && bdp >= 1.0 {
+        bdp as u64
+    } else {
+        0
+    };
+    bdp.max(FIXED_RATE_MIN_WINDOW_MTUS * mtu).max(1)
+}
+
+/// Fixed-rate, **loss-tolerant** carrier congestion controller.
+///
+/// Why this exists: this link was measured at ~20 % random packet loss and
+/// ~400 ms RTT during peak hours. That loss is not a congestion signal — it is
+/// the ISP/GFW dropping packets — yet NewReno and Cubic halve the window on
+/// every loss event and BBR also yields once loss exceeds its 2 % objective, so
+/// the measured window collapsed to the RFC 9002 minimum (2944 bytes) and
+/// bandwidth utilisation fell to 17 %.
+///
+/// The approach follows Hysteria's "Brutal": send at a **known** rate and do not
+/// yield on loss, leaving loss repair to the FEC layer above.
+///
+/// Implementation note: quinn's pacer derives its rate from
+/// `congestion.window() / RTT` — `optimal_capacity()` refills the token bucket
+/// with `window * 2ms / rtt` bytes every 2 ms and `delay()` applies the 4/5
+/// factor recommended by RFC 9002 section 7.7 (quinn-proto
+/// `connection/pacing.rs`). Returning a fixed window is therefore equivalent to
+/// sending at a fixed rate: a window of `rate * min_rtt` is exactly the
+/// bandwidth-delay product for the target rate.
+///
+/// This deliberately does **not** satisfy RFC 9002's congestion control
+/// requirements, so it must only be enabled explicitly, on a dedicated link
+/// whose capacity is known and whose loss is known not to be congestion.
+#[derive(Debug, Clone)]
+struct FixedRate {
+    /// Target rate in bytes per second.
+    rate: u64,
+    /// Latest smoothed RTT — deliberately the same quantity quinn's pacer
+    /// divides by, so that `window / rtt` equals `rate`.
+    rtt: Duration,
+    mtu: u64,
+    /// First event time, used as the epoch for the ACK-rate slots.
+    base: Option<Instant>,
+    /// Recent ACK success rate in `[FIXED_RATE_MIN_ACK_RATE, 1.0]`.
+    ack_rate: f64,
+    slots: [AckSlot; FIXED_RATE_ACK_SLOTS],
+    /// Counted for observability only; the controller keeps sending regardless.
+    persistent_congestion_events: u64,
+}
+
+impl FixedRate {
+    fn new(rate_bytes_per_sec: u64, current_mtu: u16) -> Self {
+        let mtu = u64::from(current_mtu).max(1);
+        Self {
+            rate: rate_bytes_per_sec.max(1),
+            rtt: FIXED_RATE_BOOTSTRAP_RTT,
+            mtu,
+            base: None,
+            ack_rate: 1.0,
+            slots: [AckSlot::default(); FIXED_RATE_ACK_SLOTS],
+            persistent_congestion_events: 0,
+        }
+    }
+
+    /// The window actually in force: `rate * srtt / ack_rate`, floored.
+    fn window_bytes(&self) -> u64 {
+        fixed_rate_window(self.rate, self.rtt, self.mtu, self.ack_rate)
+    }
+
+    /// Testable core of [`Controller::on_ack`].
+    ///
+    /// Always re-sizes rather than only tracking a minimum. Two reasons:
+    /// 1. the pacer divides by the *smoothed* RTT, so the window must track it
+    ///    in both directions to hold the rate constant;
+    /// 2. after a persistent-congestion safety drop the window must return to
+    ///    the target rate once the path carries traffic again — gating on a new
+    ///    minimum would strand it at the floor forever on a stable path.
+    ///
+    /// Both failure modes were caught by
+    /// `fixed_rate_controller_sizes_window_to_rate_and_ignores_random_loss`.
+    fn apply_rtt(&mut self, smoothed_rtt: Duration) {
+        self.rtt = smoothed_rtt.max(FIXED_RATE_MIN_RTT);
+    }
+
+    /// Record one second-bucketed observation of delivered vs lost packets and
+    /// refresh [`Self::ack_rate`] from the last [`FIXED_RATE_ACK_SLOTS`] seconds.
+    fn record(&mut self, now: Instant, acks: u64, losses: u64) {
+        let base = *self.base.get_or_insert(now);
+        let ts = now.saturating_duration_since(base).as_secs() as i64;
+        let slot = &mut self.slots[(ts as usize) % FIXED_RATE_ACK_SLOTS];
+        if slot.ts == ts {
+            slot.ack = slot.ack.saturating_add(acks);
+            slot.loss = slot.loss.saturating_add(losses);
+        } else {
+            slot.ts = ts;
+            slot.ack = acks;
+            slot.loss = losses;
+        }
+
+        let min_ts = ts - FIXED_RATE_ACK_SLOTS as i64;
+        let (mut total_ack, mut total_loss) = (0u64, 0u64);
+        for slot in &self.slots {
+            if slot.ts < min_ts {
+                continue;
+            }
+            total_ack = total_ack.saturating_add(slot.ack);
+            total_loss = total_loss.saturating_add(slot.loss);
+        }
+        let total = total_ack.saturating_add(total_loss);
+        if total < FIXED_RATE_MIN_ACK_SAMPLES {
+            // Not enough evidence yet: do not amplify on noise.
+            self.ack_rate = 1.0;
+            return;
+        }
+        let rate = total_ack as f64 / total as f64;
+        self.ack_rate = if rate.is_finite() {
+            rate.clamp(FIXED_RATE_MIN_ACK_RATE, 1.0)
+        } else {
+            1.0
+        };
+    }
+}
+
+impl Controller for FixedRate {
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        _sent: Instant,
+        _bytes: u64,
+        _app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        self.apply_rtt(rtt.get());
+        self.record(now, 1, 0);
+    }
+
+    /// The whole point: a loss event must not shrink the window.
+    ///
+    /// Loss is still *counted*, but only to drive the ACK-rate compensation in
+    /// [`FixedRate::record`] — a 20 % loss path must send ~25 % faster to
+    /// deliver the configured rate. Random loss, which is what this controller
+    /// exists for, therefore never reduces the window.
+    ///
+    /// The only safety valve kept is persistent congestion (consecutive PTOs
+    /// with no progress), which drops the window to the floor so a genuinely
+    /// dead path cannot be hammered forever.
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        _sent: Instant,
+        is_persistent_congestion: bool,
+        lost_bytes: u64,
+    ) {
+        let lost_packets = (lost_bytes / self.mtu.max(1)).max(1);
+        self.record(now, 0, lost_packets);
+        if is_persistent_congestion {
+            self.persistent_congestion_events = self.persistent_congestion_events.saturating_add(1);
+            // Deliberately NOT a window change: the window is derived from
+            // `rate`, `rtt` and `ack_rate`, and the ACK-rate floor already caps
+            // how far the send rate can run ahead. Recorded and logged instead,
+            // because persistent congestion means the path is dead rather than
+            // merely lossy.
+            warn!(
+                rate_bytes_per_sec = self.rate,
+                ack_rate = self.ack_rate,
+                events = self.persistent_congestion_events,
+                "fixed-rate carrier hit persistent congestion"
+            );
+        }
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.mtu = u64::from(new_mtu).max(1);
+    }
+
+    fn window(&self) -> u64 {
+        self.window_bytes()
+    }
+
+    fn metrics(&self) -> ControllerMetrics {
+        let mut metrics = ControllerMetrics::default();
+        metrics.congestion_window = self.window_bytes();
+        // No ssthresh: the window is not governed by a slow-start threshold.
+        metrics.ssthresh = None;
+        // Reported for visibility only. quinn's pacer uses `window() / RTT`
+        // rather than this field, so it is informational.
+        let effective = (self.rate as f64 / self.ack_rate) as u64;
+        metrics.pacing_rate = Some(effective.saturating_mul(8));
+        metrics
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.window_bytes()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
     }
 }
 
 #[derive(Debug)]
 struct CarrierControllerFactory {
     kind: CarrierController,
+    /// Only used by [`CarrierController::Fixed`]: target rate in bytes/second.
+    fixed_rate_bytes_per_sec: u64,
 }
 
 impl ControllerFactory for CarrierControllerFactory {
@@ -245,6 +546,9 @@ impl ControllerFactory for CarrierControllerFactory {
                 let mut config = BbrConfig::default();
                 config.initial_window(initial_window);
                 <BbrConfig as ControllerFactory>::build(Arc::new(config), now, current_mtu)
+            }
+            CarrierController::Fixed => {
+                Box::new(FixedRate::new(self.fixed_rate_bytes_per_sec, current_mtu))
             }
         }
     }
@@ -392,15 +696,33 @@ fn transport_config() -> Result<Arc<TransportConfig>> {
     // past the real path MTU causes unrepairable packet loss.
     transport.initial_mtu(1472);
     let controller = configured_congestion_controller()?;
+    // Resolved once: reading the environment twice could in principle disagree
+    // between the logged value and the value actually used.
+    let fixed_rate_mbps = match controller {
+        CarrierController::Fixed => Some(configured_fixed_rate()?),
+        _ => None,
+    };
     match controller {
         CarrierController::Bbr => warn!(
             ?controller,
             "carrier congestion controller selected; BBR is marked experimental by Quinn"
         ),
+        CarrierController::Fixed => warn!(
+            ?controller,
+            rate_mbps = fixed_rate_mbps.unwrap_or(0),
+            "carrier congestion controller selected; fixed rate ignores packet loss and does \
+             not satisfy RFC 9002 -- only for dedicated links whose capacity is known and \
+             whose loss is known not to be congestion. The configured rate must not exceed \
+             the real link capacity, otherwise loss becomes permanent and FEC cannot cover it."
+        ),
         _ => info!(?controller, "carrier congestion controller selected"),
     }
-    transport
-        .congestion_controller_factory(Arc::new(CarrierControllerFactory { kind: controller }));
+    let fixed_rate_bytes_per_sec =
+        fixed_rate_mbps.map_or(0, |mbps| mbps.saturating_mul(1_000_000) / 8);
+    transport.congestion_controller_factory(Arc::new(CarrierControllerFactory {
+        kind: controller,
+        fixed_rate_bytes_per_sec,
+    }));
     // These are hard caps, not "unlimited": exceeding them makes Quinn drop the
     // oldest buffered datagram, and `None` for the receive buffer means "refuse
     // incoming datagrams", not "no limit". A drop here happens below FEC, so the
@@ -887,12 +1209,191 @@ mod tests {
             CarrierController::Cubic,
             CarrierController::Bbr,
         ] {
-            let factory = Arc::new(CarrierControllerFactory { kind });
+            let factory = Arc::new(CarrierControllerFactory {
+                kind,
+                fixed_rate_bytes_per_sec: 0,
+            });
             let controller = factory.clone().build(std::time::Instant::now(), 1472);
             assert_eq!(controller.initial_window(), 14_720, "{kind:?} at mtu 1472");
             let controller = factory.build(std::time::Instant::now(), 1200);
             assert_eq!(controller.initial_window(), 12_000, "{kind:?} at mtu 1200");
         }
+    }
+
+    #[test]
+    fn fixed_rate_controller_sizes_window_to_rate_and_ignores_random_loss() {
+        // 28 Mbit/s = 3_500_000 bytes/s.
+        let rate = 28u64 * 1_000_000 / 8;
+
+        // Window sizing rule: window = rate x smoothed RTT / ack_rate, which
+        // makes quinn's pacer (rate = window / smoothed_rtt) emit `rate`.
+        assert_eq!(
+            fixed_rate_window(rate, FIXED_RATE_BOOTSTRAP_RTT, 1472, 1.0),
+            rate / 10,
+            "bootstrap window is rate x 100ms"
+        );
+        assert_eq!(
+            fixed_rate_window(rate, Duration::from_millis(400), 1472, 1.0),
+            rate * 4 / 10,
+            "at 400ms RTT the window is 1.4 MB, so the pacer holds 28 Mbit/s"
+        );
+        // Loss compensation: on a 20 % loss path Brutal sends ~25 % faster so
+        // the *delivered* rate matches the configured rate.
+        assert_eq!(
+            fixed_rate_window(rate, Duration::from_millis(400), 1472, 0.8),
+            rate * 5 / 10,
+            "20% loss must enlarge the window by 1/0.8"
+        );
+        // The divisor is clamped: worse loss must not amplify without bound.
+        assert_eq!(
+            fixed_rate_window(rate, Duration::from_millis(400), 1472, 0.1),
+            rate * 5 / 10,
+            "ack_rate is clamped at FIXED_RATE_MIN_ACK_RATE"
+        );
+        // A nonsensical ack_rate must degrade to "no compensation".
+        assert_eq!(
+            fixed_rate_window(rate, Duration::from_millis(400), 1472, f64::NAN),
+            rate * 4 / 10
+        );
+        // Floor: a tiny RTT must not produce a window smaller than a few MTUs.
+        assert_eq!(
+            fixed_rate_window(rate, Duration::from_micros(1), 1472, 1.0),
+            FIXED_RATE_MIN_WINDOW_MTUS * 1472
+        );
+        // A zero rate must still yield a usable (non-zero) window.
+        assert_eq!(
+            fixed_rate_window(0, Duration::from_millis(400), 1200, 1.0),
+            FIXED_RATE_MIN_WINDOW_MTUS * 1200
+        );
+
+        let mut controller = FixedRate::new(rate, 1472);
+        assert_eq!(controller.window(), rate / 10);
+        assert_eq!(controller.ack_rate, 1.0);
+
+        // The contract that matters: random loss must NOT shrink the window.
+        // This is the whole reason the controller exists -- NewReno/Cubic/BBR
+        // all collapse here, which measured out at 2944 bytes (RFC minimum)
+        // and 17 % bandwidth utilisation.
+        let t0 = std::time::Instant::now();
+        for i in 0..20 {
+            controller.on_congestion_event(t0, t0, false, 1200);
+            let _ = i;
+        }
+        assert_eq!(
+            controller.window(),
+            rate / 10,
+            "random loss must not reduce the fixed window"
+        );
+        assert_eq!(controller.persistent_congestion_events, 0);
+
+        // ...but loss IS counted, to drive the compensation. 50 acks + 50 losses
+        // in the same second is a 50 % ACK rate, clamped to the 0.8 floor.
+        let mut controller = FixedRate::new(rate, 1472);
+        controller.apply_rtt(Duration::from_millis(400));
+        for _ in 0..50 {
+            controller.record(t0, 1, 0);
+        }
+        for _ in 0..50 {
+            controller.record(t0, 0, 1);
+        }
+        assert_eq!(controller.ack_rate, FIXED_RATE_MIN_ACK_RATE);
+        assert_eq!(controller.window(), rate * 5 / 10);
+
+        // Below the sample threshold the estimator must not amplify on noise.
+        let mut controller = FixedRate::new(rate, 1472);
+        for _ in 0..10 {
+            controller.record(t0, 1, 0);
+        }
+        for _ in 0..10 {
+            controller.record(t0, 0, 1);
+        }
+        assert_eq!(controller.ack_rate, 1.0, "too few samples to compensate");
+
+        // A clean path leaves the window at exactly rate x RTT.
+        let mut controller = FixedRate::new(rate, 1472);
+        controller.apply_rtt(Duration::from_millis(400));
+        for _ in 0..100 {
+            controller.record(t0, 1, 0);
+        }
+        assert_eq!(controller.ack_rate, 1.0);
+        assert_eq!(controller.window(), rate * 4 / 10);
+
+        // Persistent congestion is recorded and logged, but it is not a window
+        // collapse: the ACK-rate floor already bounds how far ahead we can run.
+        // It does contribute one loss sample, so the window may nudge up via the
+        // compensation but must never fall.
+        controller.on_congestion_event(t0, t0, true, 1200);
+        assert_eq!(controller.persistent_congestion_events, 1);
+        assert!(
+            controller.window() >= rate * 4 / 10,
+            "persistent congestion must not collapse the fixed window (got {})",
+            controller.window()
+        );
+        assert!(
+            controller.window() < rate * 45 / 100,
+            "the one recorded loss may only nudge the window via ack_rate (got {})",
+            controller.window()
+        );
+
+        // The window tracks the smoothed RTT in BOTH directions: a smaller RTT
+        // shrinks it, a larger RTT grows it. Either way `window / rtt` stays
+        // equal to `rate / ack_rate`. A fresh controller is used here so that
+        // ack_rate is back to 1.0 and the pure RTT relation is observable.
+        let mut controller = FixedRate::new(rate, 1472);
+        controller.apply_rtt(Duration::from_millis(400));
+        assert_eq!(controller.window(), rate * 4 / 10);
+        controller.apply_rtt(Duration::from_millis(50));
+        assert_eq!(controller.window(), rate / 20);
+        controller.apply_rtt(Duration::from_millis(900));
+        assert_eq!(controller.window(), rate * 9 / 10);
+        // The degenerate case is clamped twice: FIXED_RATE_MIN_RTT (1 ms) then
+        // the MTU floor, which wins because rate x 1 ms < 4 MTUs here.
+        controller.apply_rtt(Duration::from_micros(1));
+        assert_eq!(
+            controller.window(),
+            FIXED_RATE_MIN_WINDOW_MTUS * 1472,
+            "the MTU floor must win at a degenerate RTT"
+        );
+
+        // An MTU update changes the floor and nothing else.
+        controller.on_mtu_update(1200);
+        assert_eq!(controller.window(), FIXED_RATE_MIN_WINDOW_MTUS * 1200);
+
+        // Metrics must expose the window and a pacing rate for observability.
+        let metrics = controller.metrics();
+        assert_eq!(metrics.congestion_window, controller.window());
+        assert_eq!(metrics.pacing_rate, Some(rate * 8));
+        assert_eq!(metrics.ssthresh, None);
+    }
+
+    #[test]
+    fn fixed_rate_parsing_rejects_zero_and_garbage() {
+        assert_eq!(
+            parse_fixed_rate_mbps(None).unwrap(),
+            DEFAULT_FIXED_RATE_MBPS
+        );
+        assert_eq!(parse_fixed_rate_mbps(Some(" 100 ")).unwrap(), 100);
+        assert_eq!(parse_fixed_rate_mbps(Some("1")).unwrap(), 1);
+        for invalid in ["", "0", "abc", "-5", "10001", "1.5"] {
+            assert!(
+                parse_fixed_rate_mbps(Some(invalid)).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_rate_factory_honours_the_configured_rate() {
+        let rate = 10u64 * 1_000_000 / 8;
+        let factory = Arc::new(CarrierControllerFactory {
+            kind: CarrierController::Fixed,
+            fixed_rate_bytes_per_sec: rate,
+        });
+        let controller = factory.build(std::time::Instant::now(), 1472);
+        // Bootstrap BDP from FIXED_RATE_BOOTSTRAP_RTT.
+        assert_eq!(controller.initial_window(), rate / 10);
+        // And it must be recognisably not one of the RFC-IW controllers.
+        assert_ne!(controller.initial_window(), 14_720);
     }
 
     #[test]
@@ -912,6 +1413,15 @@ mod tests {
         assert_eq!(
             parse_congestion_controller(Some(" bbr ")).unwrap(),
             CarrierController::Bbr
+        );
+        // Loss-tolerant fixed-rate mode, including its documented alias.
+        assert_eq!(
+            parse_congestion_controller(Some("fixed")).unwrap(),
+            CarrierController::Fixed
+        );
+        assert_eq!(
+            parse_congestion_controller(Some("BRUTAL")).unwrap(),
+            CarrierController::Fixed
         );
         // A typo must fail loudly instead of silently falling back to a
         // controller the operator did not choose.
