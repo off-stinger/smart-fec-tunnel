@@ -1697,14 +1697,32 @@ enum PeerVerdict {
     Accept,
     /// 与已锁定的对端相同：正常。
     Same,
-    /// 第二个对端：拒绝，且**不**接管回程路径。
+    /// 第二个对端，但已锁定的对端**已经静默**：允许交接。
+    ///
+    /// 这一条是必需的，不是宽松：永久锁定会带来可用性缺陷——合法的单客户端（例如
+    /// passwall 的 sing-box）重启后源端口会变，若旧端口永远不会"离场"，新端口就永远
+    /// 被拒，隧道要等到 FEC 客户端自己重启才恢复。
+    Handover,
+    /// 第二个对端且已锁定对端**仍活跃**：拒绝，且**不**接管回程路径。
     Conflict,
 }
 
-fn classify_inner_peer(current: Option<SocketAddr>, incoming: SocketAddr) -> PeerVerdict {
+/// 已锁定内层对端静默多久之后，允许新的对端接管。
+///
+/// 取值权衡：太短则"并发的第二个对端"仍可能趁一次抖动抢走回程；太长则客户端重启后
+/// 要等很久才恢复。2 秒远大于正常收包间隔（毫秒级），又远小于运维能感知的故障时长。
+const PEER_HANDOVER_IDLE: Duration = Duration::from_secs(2);
+
+/// `locked_idle` = 距上次从**已锁定**对端收到数据的时长；`current` 为 `None` 时无意义。
+fn classify_inner_peer(
+    current: Option<SocketAddr>,
+    locked_idle: Duration,
+    incoming: SocketAddr,
+) -> PeerVerdict {
     match current {
         None => PeerVerdict::Accept,
         Some(peer) if peer == incoming => PeerVerdict::Same,
+        Some(_) if locked_idle >= PEER_HANDOVER_IDLE => PeerVerdict::Handover,
         Some(_) => PeerVerdict::Conflict,
     }
 }
@@ -1735,6 +1753,8 @@ async fn client(
     // 否则旧版本对端会整帧丢弃并彻底失去丢包样本（详见 feedback_frame）。
     let mut peer_feedback_v2 = false;
     let mut app_peer = None;
+    // 上次从**已锁定**对端收到数据的时刻，用于 `PEER_HANDOVER_IDLE` 的交接判定。
+    let mut app_peer_seen = Instant::now();
     let mut local_buf = vec![0u8; 65535];
     let mut net_buf = vec![0u8; 2048];
     let mut report = time::interval(Duration::from_secs(2));
@@ -1747,11 +1767,24 @@ async fn client(
         tokio::select! {
             r = local.recv_from(&mut local_buf) => {
                 let (n, peer) = r?;
-                match classify_inner_peer(app_peer, peer) {
-                    PeerVerdict::Accept => app_peer = Some(peer),
-                    PeerVerdict::Same => {}
+                let locked_idle = app_peer_seen.elapsed();
+                match classify_inner_peer(app_peer, locked_idle, peer) {
+                    PeerVerdict::Accept | PeerVerdict::Same => {
+                        app_peer = Some(peer);
+                        app_peer_seen = Instant::now();
+                    }
+                    PeerVerdict::Handover => {
+                        warn!(
+                            previous = ?app_peer,
+                            new = %peer,
+                            idle_ms = locked_idle.as_millis() as u64,
+                            "inner peer handover: the previously locked peer went idle"
+                        );
+                        app_peer = Some(peer);
+                        app_peer_seen = Instant::now();
+                    }
                     PeerVerdict::Conflict => {
-                        // 拒绝而不是接管：接管会把已锁定对端的回程流量错投给新对端。
+                        // 拒绝而不是接管：接管会把仍活跃的已锁定对端的回程错投给新对端。
                         COUNTERS.inner_peer_conflicts.fetch_add(1, Ordering::Relaxed);
                         // 只在第一次冲突时告警，避免刷日志。
                         if COUNTERS.inner_peer_conflicts.load(Ordering::Relaxed) == 1 {
@@ -3079,26 +3112,42 @@ mod tests {
     fn a_second_inner_peer_must_not_take_over_the_return_path() {
         let first: SocketAddr = "127.0.0.1:40001".parse().unwrap();
         let second: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        let fresh = Duration::from_millis(0);
+        let stale = PEER_HANDOVER_IDLE + Duration::from_millis(1);
 
         // 第一个对端被接受
-        assert_eq!(classify_inner_peer(None, first), PeerVerdict::Accept);
+        assert_eq!(classify_inner_peer(None, fresh, first), PeerVerdict::Accept);
         // 同一个对端继续正常
-        assert_eq!(classify_inner_peer(Some(first), first), PeerVerdict::Same);
-        // 第二个对端必须被拒绝——无论它多"新"
         assert_eq!(
-            classify_inner_peer(Some(first), second),
+            classify_inner_peer(Some(first), fresh, first),
+            PeerVerdict::Same
+        );
+        // **已锁定对端仍活跃**时，第二个对端必须被拒绝
+        assert_eq!(
+            classify_inner_peer(Some(first), fresh, second),
             PeerVerdict::Conflict,
-            "a second inner peer must be rejected, not allowed to take over the return path"
+            "a second inner peer must be rejected while the locked one is alive"
         );
-        // 而且反复出现也仍然是 Conflict（不会被"重新接受"）
+        // 刚好不到静默阈值时仍是冲突（阈值不能被"擦边"绕过）
         assert_eq!(
-            classify_inner_peer(Some(first), second),
-            PeerVerdict::Conflict
+            classify_inner_peer(
+                Some(first),
+                PEER_HANDOVER_IDLE - Duration::from_millis(1),
+                second
+            ),
+            PeerVerdict::Conflict,
+            "just under the idle threshold must still be a conflict"
         );
-        // 反向亦然：锁定的是谁就锁死谁
+        // 已锁定对端静默超时后允许交接：否则重启的合法客户端永远回不来
         assert_eq!(
-            classify_inner_peer(Some(second), first),
-            PeerVerdict::Conflict
+            classify_inner_peer(Some(first), stale, second),
+            PeerVerdict::Handover,
+            "a legitimately restarted client must be able to take over after going idle"
+        );
+        // 锁定的对端自己回来不算冲突
+        assert_eq!(
+            classify_inner_peer(Some(second), stale, second),
+            PeerVerdict::Same
         );
     }
 

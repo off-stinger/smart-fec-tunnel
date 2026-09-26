@@ -230,14 +230,23 @@ impl Harness {
         warmup_secs: f64,
         pump: bool,
     ) -> f64 {
+        // **预热与测量共用同一个 socket。**
+        //
+        // 原先预热用一个临时 socket、测量再 bind 一个新 socket，于是隧道客户端看到
+        // **两个不同的内层对端**。这既不忠实于生产（生产只有一个内层对端），又会在
+        // "客户端锁定内层对端"之后让测量阶段的每个数据报都被当成第二个对端拒绝——
+        // 表现为到达率塌到 0，看起来像 FEC 回归，实际是测试台自己在换端口。
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
+        sock.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
         if pump {
-            let wsock = UdpSocket::bind("127.0.0.1:0").expect("bind warmup");
             let end = Instant::now() + Duration::from_secs_f64(warmup_secs);
             let mut i = 0u32;
             while Instant::now() < end {
                 let mut p = vec![0xab; payload_size];
                 p[..4].copy_from_slice(&i.to_be_bytes());
-                let _ = wsock.send_to(&p, ("127.0.0.1", self.client_port));
+                let _ = sock.send_to(&p, ("127.0.0.1", self.client_port));
                 i = i.wrapping_add(1);
                 thread::sleep(Duration::from_millis(8));
             }
@@ -245,12 +254,13 @@ impl Harness {
             thread::sleep(Duration::from_secs_f64(warmup_secs));
         }
 
-        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
+        // 预热阶段的回包必须**排空**，否则它们的序号会被计入测量结果而虚高。
+        let mut drain = [0u8; 65535];
+        while sock.recv_from(&mut drain).is_ok() {}
+
         // Drain replies concurrently with the sender. Otherwise the host UDP
         // receive queue can overflow while the test is still transmitting,
         // which measures harness drops instead of tunnel behavior.
-        sock.set_read_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
         let sender = sock.try_clone().expect("clone test socket");
         let client_port = self.client_port;
         let sending = thread::spawn(move || {
