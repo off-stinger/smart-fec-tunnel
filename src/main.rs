@@ -702,6 +702,22 @@ struct Decoder {
     seen_sequences: BTreeSet<u64>,
     late_sequences: u64,
     duplicate_sequences: u64,
+    /// 每个 FEC 组重建成功时记一次账，键是**被重建的那个数据分片自己的线上序号**，
+    /// 值为 (重建出的符号数, 组数)。选择"丢失分片的序号"而不是"触发重建的分片序号"
+    /// 是有意的：这样恢复就被计入"观测到该丢包的那个窗口"，也就是丢包与恢复同窗，
+    /// `report_feedback` 的 `fec_recovered_symbols > 0` 门控才有意义。
+    ///
+    /// 保证：`sequence_report()` 用 `split_off(&(cutoff + 1))` 排空所有键 ≤ cutoff 的
+    /// 条目，因此每个事件恰好被计入一次；若键早于已 finalize 的窗口，它只会推迟到
+    /// 下一个窗口，绝不会丢失。也不会重复计数：重建后 `delivered` 全为 true，
+    /// `any(|x| !*x)` 不再成立（即便该条件被放宽，`recovered_indices` 也已为空，
+    /// 仍然不会重复记账）。
+    ///
+    /// 边界：cutoff 恒为 `highest_sequence - REORDER_WINDOW`，所以"最后 64 个序号内"
+    /// 的事件必须等 `highest_sequence` 继续前进才会被排空。流量持续时这不是问题；
+    /// 一旦连接停止，尾部最多一个窗口内的事件不会进入任何报告（有界，且只影响统计
+    /// 口径，不影响数据面）。这一点由
+    /// `fec_recovery_is_counted_once_per_group_across_window_boundaries` 覆盖。
     fec_recovery_events: BTreeMap<u64, (u64, u64)>,
     groups: BTreeMap<u64, Group>,
     packets: HashMap<u64, Reassembly>,
@@ -2245,6 +2261,76 @@ mod tests {
         assert!(output.iter().any(|x| x == &vec![4u8; 20]));
         assert!(output.iter().any(|x| x == &vec![5u8; 20]));
     }
+    #[test]
+    fn fec_recovery_is_counted_once_per_group_across_window_boundaries() {
+        // 不变量：一个 FEC 组最多记一次账。
+        // 触发条件里的 `any(|x| !*x)` 只是避免重复做 Reed-Solomon 运算；真正防止
+        // 重复计数的是重建后把 delivered 全部置 true，使 recovered_indices 变空。
+        // 因此"重建后继续到达的冗余分片"与"迟到的原数据分片"都不会再次计数。
+        // 这里跨窗口累计，避免依赖窗口具体在哪里切开。
+        let mut enc = Encoder::new(13);
+        enc.adaptive.parity = 2;
+        let mut dec = Decoder::new(13);
+        let mut expected_symbols = 0u64;
+        for group in 0..10u8 {
+            let mut frames = Vec::new();
+            for _ in 0..DATA_SHARDS {
+                frames.extend(enc.encode_datagram(&[group; 20]).unwrap());
+            }
+            let data: Vec<_> = frames
+                .iter()
+                .filter(|frame| frame.kind == KIND_DATA)
+                .cloned()
+                .collect();
+            let parity: Vec<_> = frames
+                .iter()
+                .filter(|frame| frame.kind == KIND_PARITY)
+                .cloned()
+                .collect();
+            assert_eq!(data.len(), DATA_SHARDS);
+            assert!(!parity.is_empty());
+            let late = data
+                .iter()
+                .find(|frame| frame.index == 4)
+                .expect("data shard 4")
+                .clone();
+            // 丢掉索引 4 的数据分片，用其余数据分片加一个冗余分片触发重建。
+            for frame in data.iter().filter(|frame| frame.index != 4) {
+                dec.frame(frame.clone()).unwrap();
+            }
+            dec.frame(parity[0].clone()).unwrap();
+            expected_symbols += 1;
+            // 重建之后才到达的冗余分片：不得重复计数。
+            for frame in parity.iter().skip(1) {
+                dec.frame(frame.clone()).unwrap();
+            }
+            // 迟到的原数据分片：同样不得重复计数。
+            dec.frame(late).unwrap();
+        }
+
+        // 尾部事件只有等 highest_sequence 继续前进才会被排空，所以先灌入一组
+        // 无丢包的组把窗口推过去，否则最后 REORDER_WINDOW 个序号内的恢复事件
+        // 不会进入任何报告（这是已知且有界的边界，见 fec_recovery_events 注释）。
+        for _ in 0..10 {
+            for _ in 0..DATA_SHARDS {
+                for frame in enc.encode_datagram(&[0xEE; 20]).unwrap() {
+                    dec.frame(frame).unwrap();
+                }
+            }
+        }
+
+        let mut symbols = 0u64;
+        let mut groups = 0u64;
+        while let Some(report) = dec.sequence_report() {
+            symbols += report.fec_recovered_symbols;
+            groups += report.fec_recovered_groups;
+        }
+        // 每组只丢 1 个分片，故符号数应恰好等于组数。
+        assert_eq!(symbols, expected_symbols, "每个被重建的符号只计一次");
+        assert_eq!(groups, expected_symbols, "每组只计一次");
+        assert_eq!(dec.sequence_report(), None);
+    }
+
     #[test]
     fn sequence_report_distinguishes_wire_gaps_from_fec_recovery() {
         let mut enc = Encoder::new(9);
