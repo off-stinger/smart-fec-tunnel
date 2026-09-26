@@ -1473,6 +1473,71 @@ HTTP/3 部署一律使用协议默认的 **100**，公布 2 相当于自报"这�
 | **每次连接都发 Retry** | `SMART_QUIC_ADDRESS_VALIDATION` 默认开 | Retry 是 RFC 9000 §8.1.3 的 DoS 防护；常见做法是"仅在高负载/可疑时 Retry"。关掉默认值削弱 DoS 防护，属安全取舍，应由用户决定 |
 | **2 秒心跳节奏** | QUIC `keep_alive_interval(2s)` + 应用层 `CARRIER_HEARTBEAT = 2s` | 空闲隧道上每 2 秒一次的周期性可观察发包确实不像常规 h3 服务端；但它同时承担 NAT 保活与 `CARRIER_DEAD_TIMEOUT = 6s`（3 次缺失）的死对端发现。拉长会拖慢故障切换 |
 
+### 10.21 T3：预算硬顶对 `fixed` 也生效，并把生产默认从 `fixed` 换成 `adaptive`
+
+T3 的验收条件是"**硬顶不越 1.25x 补偿**，替代 `fixed` 当默认"。审计发现前半句只做了一半。
+
+#### 缺陷：`fixed` 是唯一能突破预算的控制器
+
+`adaptive_window()` 把上限作用在**有效**速率上（`effective = min(target/ack_rate, ceiling)`），
+并已有用例覆盖。但 `fixed_rate_window()` 的公式是
+
+    bdp = rate × srtt / ack_rate            // 没有任何上限
+
+而 quinn 的 pacer 又乘了它自己的 1.25 倍填充因子，所以 `fixed@24` 在 20% 丢包路径上的实际
+请求速率可达 `24 / 0.8 × 1.25 = 37.5 Mbps` —— 同时越过 30 Mbps 的预算硬顶与服务器
+30.8 Mbps 的计量出口上限。代码注释里其实早写着"`fixed` never did this"，只是没修。
+
+#### 修复
+
+1. `fixed_rate_window()` 增加 `ceiling_bytes_per_sec` 参数，与 `adaptive_window()` 一样把上限
+   作用在**有效**速率上；`0` 表示不设上限（保持旧语义，便于隔离测试尺寸规则）。
+2. `FixedRate` 增加 `ceiling` 字段；`CarrierControllerFactory` 的 `adaptive_ceiling_bytes_per_sec`
+   更名为 `ceiling_bytes_per_sec`——它现在同时约束两个控制器。
+3. **`SMART_QUIC_MAX_RATE_MBPS` 现在对 `fixed` 也会被读取**（此前只有 `adaptive` 读，
+   `fixed` 分支拿到的是 `None`）。
+
+回归断言写在 `fixed_rate_controller_sizes_window_to_rate_and_ignores_random_loss` 里，并已按
+"先证明它能抓住旧实现"的方式验证：把 `.min(ceiling)` 去掉后，用例以
+
+    assertion failed: the ceiling must cancel ACK-rate compensation once it would exceed the budget
+    left: 1750000   right: 1400000
+
+失败——即有效速率 4.375 MB/s（35 Mbps）而不是被限住的 3.5 MB/s（28 Mbps）。
+
+#### 生产默认改为 `adaptive`
+
+`/etc/smart-fec/quic.env` 从 `fixed@24` 改为 `SMART_QUIC_CONGESTION=adaptive` +
+`SMART_QUIC_MAX_RATE_MBPS=30`。启动日志确认：
+
+    controller=Adaptive max_rate_mbps=30
+
+好处：不再依赖运维猜一个固定容量；不再打那条"fixed 不满足 RFC 9002、仅限专用链路"的 WARN；
+预算硬顶真正是硬顶（两个控制器都受约束）。
+
+#### A/B：**因又落到不同 WAN 而不成立**（诚实记录）
+
+同一 OVH 100 MB 稳态目标：
+
+| Arm | 样本 | 均值 |
+| --- | --- | --- |
+| `fixed@24`（§10.19 的 DATAGRAM arm） | 1.178 / 1.162 / 1.112 / 1.199 / 1.201 MB/s | **1.171 MB/s** |
+| `adaptive` + 上限 30 | 1.167 / 1.208 / 0.914 MB/s | **1.096 MB/s** |
+
+adaptive 名义上慢 6.4%，但**两个 arm 不在同一条 WAN 上**：`fixed` 那组载体是 `rtt=343 ms`、
+丢包 ~0；`adaptive` 这组是 `rtt=86 ms`、丢包 **12.9–17.9%**。**因此差异未被确立**，本手册不
+据此宣称 adaptive 更差或更好；保留 adaptive 是因为它满足 T3 的验收条件且预算真正闭合。
+
+#### 由一个意外数据点得到的统一解释
+
+`adaptive` 那次测量意外落在**丢包那条 WAN**（86 ms、17% 丢包），却仍交出 ~1.05–1.2 MB/s，
+与干净 WAN（343 ms、0 丢包）的 ~1.10–1.20 MB/s 几乎一样。按纯窗口模型，86 ms 上
+512 KB 窗口应给出约 6 MB/s，实际只有 1.1 MB/s。
+
+**这说明两条 WAN 各自有不同的绑定约束**——干净那条是内层 TUIC 的连接窗口（§10.18），
+丢包那条是丢包本身——而两者恰好都落在 **~1.1 MB/s** 附近。这解释了本次会话中最顽固的困惑：
+**吞吐看起来"与 WAN 无关、与每一层单独改动都无关"，因为两条路径的约束不同却数值相近。**
+
 ## 11. 内核感知优化阶段
 
 内核优化按能力和验证结果分级，不以固定 `sysctl` 大全作为产品功能。

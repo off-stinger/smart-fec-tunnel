@@ -388,13 +388,26 @@ fn fixed_rate_window(
     smoothed_rtt: Duration,
     mtu: u64,
     ack_rate: f64,
+    ceiling_bytes_per_sec: u64,
 ) -> u64 {
     let ack_rate = if ack_rate.is_finite() && ack_rate > 0.0 {
         ack_rate.clamp(FIXED_RATE_MIN_ACK_RATE, 1.0)
     } else {
         1.0
     };
-    let bdp = rate_bytes_per_sec as f64 * smoothed_rtt.as_secs_f64() / ack_rate;
+    // The budget ceiling must bind the **effective** rate, exactly as
+    // `adaptive_window` does. Without this, `fixed@24` on a 20 % loss path asked
+    // for `24 / 0.8 = 30` Mbps and, with quinn's pacer adding its own 1.25x
+    // refill factor, could reach `24 / 0.8 * 1.25 = 37.5` Mbps -- over both the
+    // configured budget and the server's 30.8 Mbps metered egress. `fixed` was
+    // the only controller that could exceed the budget.
+    let ceiling = if ceiling_bytes_per_sec == 0 {
+        f64::INFINITY
+    } else {
+        ceiling_bytes_per_sec as f64
+    };
+    let effective = (rate_bytes_per_sec as f64 / ack_rate).min(ceiling);
+    let bdp = effective * smoothed_rtt.as_secs_f64();
     let bdp = if bdp.is_finite() && bdp >= 1.0 {
         bdp as u64
     } else {
@@ -434,6 +447,10 @@ struct FixedRate {
     /// divides by, so that `window / rtt` equals `rate`.
     rtt: Duration,
     mtu: u64,
+    /// Hard budget ceiling on the **effective** rate, bytes/s. `0` means "no
+    /// ceiling". Shared with [`AdaptiveRate`]: whichever controller is chosen,
+    /// ACK-rate compensation must not push the effective rate past the budget.
+    ceiling: u64,
     /// First event time, used as the epoch for the ACK-rate slots.
     base: Option<Instant>,
     /// Recent ACK success rate in `[FIXED_RATE_MIN_ACK_RATE, 1.0]`.
@@ -444,12 +461,13 @@ struct FixedRate {
 }
 
 impl FixedRate {
-    fn new(rate_bytes_per_sec: u64, current_mtu: u16) -> Self {
+    fn new(rate_bytes_per_sec: u64, ceiling_bytes_per_sec: u64, current_mtu: u16) -> Self {
         let mtu = u64::from(current_mtu).max(1);
         Self {
             rate: rate_bytes_per_sec.max(1),
             rtt: FIXED_RATE_BOOTSTRAP_RTT,
             mtu,
+            ceiling: ceiling_bytes_per_sec,
             base: None,
             ack_rate: 1.0,
             slots: [AckSlot::default(); FIXED_RATE_ACK_SLOTS],
@@ -457,9 +475,10 @@ impl FixedRate {
         }
     }
 
-    /// The window actually in force: `rate * srtt / ack_rate`, floored.
+    /// The window actually in force: `rate * srtt / ack_rate`, clamped so the
+    /// effective rate never exceeds the budget, floored so the pacer never starves.
     fn window_bytes(&self) -> u64 {
-        fixed_rate_window(self.rate, self.rtt, self.mtu, self.ack_rate)
+        fixed_rate_window(self.rate, self.rtt, self.mtu, self.ack_rate, self.ceiling)
     }
 
     /// Testable core of [`Controller::on_ack`].
@@ -1133,9 +1152,11 @@ struct CarrierControllerFactory {
     kind: CarrierController,
     /// Only used by [`CarrierController::Fixed`]: target rate in bytes/second.
     fixed_rate_bytes_per_sec: u64,
-    /// Only used by [`CarrierController::Adaptive`]: absolute ceiling on the
-    /// *effective* send rate, and the floor it will not probe below.
-    adaptive_ceiling_bytes_per_sec: u64,
+    /// Absolute ceiling on the *effective* send rate, for **both** `Fixed` and
+    /// `Adaptive`. `Fixed` used to ignore it, which let ACK-rate compensation
+    /// (and quinn's own 1.25x pacer factor) push the real rate past the budget.
+    ceiling_bytes_per_sec: u64,
+    /// Floor the `Adaptive` controller will not probe below.
     adaptive_floor_bytes_per_sec: u64,
 }
 
@@ -1171,11 +1192,13 @@ impl ControllerFactory for CarrierControllerFactory {
                 config.initial_window(initial_window);
                 <BbrConfig as ControllerFactory>::build(Arc::new(config), now, current_mtu)
             }
-            CarrierController::Fixed => {
-                Box::new(FixedRate::new(self.fixed_rate_bytes_per_sec, current_mtu))
-            }
+            CarrierController::Fixed => Box::new(FixedRate::new(
+                self.fixed_rate_bytes_per_sec,
+                self.ceiling_bytes_per_sec,
+                current_mtu,
+            )),
             CarrierController::Adaptive => Box::new(AdaptiveRate::new(
-                self.adaptive_ceiling_bytes_per_sec,
+                self.ceiling_bytes_per_sec,
                 self.adaptive_floor_bytes_per_sec,
                 current_mtu,
             )),
@@ -1339,8 +1362,12 @@ fn transport_config() -> Result<Arc<TransportConfig>> {
         CarrierController::Fixed => Some(configured_fixed_rate()?),
         _ => None,
     };
+    // Read for both rate-governing controllers. `Fixed` used to skip this
+    // entirely, which is how `fixed@24` could ask a 30.8 Mbps pipe for more than
+    // its budget once ACK-rate compensation and quinn's 1.25x pacer factor
+    // applied.
     let max_rate_mbps = match controller {
-        CarrierController::Adaptive => Some(configured_max_rate()?),
+        CarrierController::Adaptive | CarrierController::Fixed => Some(configured_max_rate()?),
         _ => None,
     };
     match controller {
@@ -1369,12 +1396,11 @@ fn transport_config() -> Result<Arc<TransportConfig>> {
     }
     let fixed_rate_bytes_per_sec =
         fixed_rate_mbps.map_or(0, |mbps| mbps.saturating_mul(1_000_000) / 8);
-    let adaptive_ceiling_bytes_per_sec =
-        max_rate_mbps.map_or(0, |mbps| mbps.saturating_mul(1_000_000) / 8);
+    let ceiling_bytes_per_sec = max_rate_mbps.map_or(0, |mbps| mbps.saturating_mul(1_000_000) / 8);
     transport.congestion_controller_factory(Arc::new(CarrierControllerFactory {
         kind: controller,
         fixed_rate_bytes_per_sec,
-        adaptive_ceiling_bytes_per_sec,
+        ceiling_bytes_per_sec,
         adaptive_floor_bytes_per_sec: ADAPTIVE_MIN_RATE_MBPS.saturating_mul(1_000_000) / 8,
     }));
     // These are hard caps, not "unlimited": exceeding them makes Quinn drop the
@@ -2048,7 +2074,7 @@ mod tests {
             let factory = Arc::new(CarrierControllerFactory {
                 kind,
                 fixed_rate_bytes_per_sec: 0,
-                adaptive_ceiling_bytes_per_sec: 0,
+                ceiling_bytes_per_sec: 0,
                 adaptive_floor_bytes_per_sec: 0,
             });
             let controller = factory.clone().build(std::time::Instant::now(), 1472);
@@ -2065,46 +2091,64 @@ mod tests {
 
         // Window sizing rule: window = rate x smoothed RTT / ack_rate, which
         // makes quinn's pacer (rate = window / smoothed_rtt) emit `rate`.
+        // The last argument is the budget ceiling; 0 means "no ceiling", which is
+        // what isolates the sizing rule being tested here.
         assert_eq!(
-            fixed_rate_window(rate, FIXED_RATE_BOOTSTRAP_RTT, 1472, 1.0),
+            fixed_rate_window(rate, FIXED_RATE_BOOTSTRAP_RTT, 1472, 1.0, 0),
             rate / 10,
             "bootstrap window is rate x 100ms"
         );
         assert_eq!(
-            fixed_rate_window(rate, Duration::from_millis(400), 1472, 1.0),
+            fixed_rate_window(rate, Duration::from_millis(400), 1472, 1.0, 0),
             rate * 4 / 10,
             "at 400ms RTT the window is 1.4 MB, so the pacer holds 28 Mbit/s"
         );
         // Loss compensation: on a 20 % loss path Brutal sends ~25 % faster so
         // the *delivered* rate matches the configured rate.
         assert_eq!(
-            fixed_rate_window(rate, Duration::from_millis(400), 1472, 0.8),
+            fixed_rate_window(rate, Duration::from_millis(400), 1472, 0.8, 0),
             rate * 5 / 10,
             "20% loss must enlarge the window by 1/0.8"
         );
         // The divisor is clamped: worse loss must not amplify without bound.
         assert_eq!(
-            fixed_rate_window(rate, Duration::from_millis(400), 1472, 0.1),
+            fixed_rate_window(rate, Duration::from_millis(400), 1472, 0.1, 0),
             rate * 5 / 10,
             "ack_rate is clamped at FIXED_RATE_MIN_ACK_RATE"
         );
         // A nonsensical ack_rate must degrade to "no compensation".
         assert_eq!(
-            fixed_rate_window(rate, Duration::from_millis(400), 1472, f64::NAN),
+            fixed_rate_window(rate, Duration::from_millis(400), 1472, f64::NAN, 0),
             rate * 4 / 10
         );
         // Floor: a tiny RTT must not produce a window smaller than a few MTUs.
         assert_eq!(
-            fixed_rate_window(rate, Duration::from_micros(1), 1472, 1.0),
+            fixed_rate_window(rate, Duration::from_micros(1), 1472, 1.0, 0),
             FIXED_RATE_MIN_WINDOW_MTUS * 1472
         );
         // A zero rate must still yield a usable (non-zero) window.
         assert_eq!(
-            fixed_rate_window(0, Duration::from_millis(400), 1200, 1.0),
+            fixed_rate_window(0, Duration::from_millis(400), 1200, 1.0, 0),
             FIXED_RATE_MIN_WINDOW_MTUS * 1200
         );
 
-        let mut controller = FixedRate::new(rate, 1472);
+        // **The budget ceiling binds the effective rate.** On a 20 % loss path the
+        // window above was `rate * 1.25`; with a ceiling of `rate`, the window must
+        // fall back to the un-compensated size. This is the fix for `fixed` being
+        // the only controller that could exceed the metered budget.
+        assert_eq!(
+            fixed_rate_window(rate, Duration::from_millis(400), 1472, 0.8, rate),
+            rate * 4 / 10,
+            "the ceiling must cancel ACK-rate compensation once it would exceed the budget"
+        );
+        // A ceiling above the compensated rate must not bind at all.
+        assert_eq!(
+            fixed_rate_window(rate, Duration::from_millis(400), 1472, 0.8, rate * 2),
+            rate * 5 / 10,
+            "a ceiling above the compensated rate must not change anything"
+        );
+
+        let mut controller = FixedRate::new(rate, 0, 1472);
         assert_eq!(controller.window(), rate / 10);
         assert_eq!(controller.ack_rate, 1.0);
 
@@ -2126,7 +2170,7 @@ mod tests {
 
         // ...but loss IS counted, to drive the compensation. 50 acks + 50 losses
         // in the same second is a 50 % ACK rate, clamped to the 0.8 floor.
-        let mut controller = FixedRate::new(rate, 1472);
+        let mut controller = FixedRate::new(rate, 0, 1472);
         controller.apply_rtt(Duration::from_millis(400));
         for _ in 0..50 {
             controller.record(t0, 1, 0);
@@ -2138,7 +2182,7 @@ mod tests {
         assert_eq!(controller.window(), rate * 5 / 10);
 
         // Below the sample threshold the estimator must not amplify on noise.
-        let mut controller = FixedRate::new(rate, 1472);
+        let mut controller = FixedRate::new(rate, 0, 1472);
         for _ in 0..10 {
             controller.record(t0, 1, 0);
         }
@@ -2148,7 +2192,7 @@ mod tests {
         assert_eq!(controller.ack_rate, 1.0, "too few samples to compensate");
 
         // A clean path leaves the window at exactly rate x RTT.
-        let mut controller = FixedRate::new(rate, 1472);
+        let mut controller = FixedRate::new(rate, 0, 1472);
         controller.apply_rtt(Duration::from_millis(400));
         for _ in 0..100 {
             controller.record(t0, 1, 0);
@@ -2177,7 +2221,7 @@ mod tests {
         // shrinks it, a larger RTT grows it. Either way `window / rtt` stays
         // equal to `rate / ack_rate`. A fresh controller is used here so that
         // ack_rate is back to 1.0 and the pure RTT relation is observable.
-        let mut controller = FixedRate::new(rate, 1472);
+        let mut controller = FixedRate::new(rate, 0, 1472);
         controller.apply_rtt(Duration::from_millis(400));
         assert_eq!(controller.window(), rate * 4 / 10);
         controller.apply_rtt(Duration::from_millis(50));
@@ -2235,7 +2279,7 @@ mod tests {
         let factory = Arc::new(CarrierControllerFactory {
             kind: CarrierController::Fixed,
             fixed_rate_bytes_per_sec: rate,
-            adaptive_ceiling_bytes_per_sec: 0,
+            ceiling_bytes_per_sec: 0,
             adaptive_floor_bytes_per_sec: 0,
         });
         let controller = factory.build(std::time::Instant::now(), 1472);
@@ -2556,7 +2600,7 @@ mod tests {
         let factory = Arc::new(CarrierControllerFactory {
             kind: CarrierController::Adaptive,
             fixed_rate_bytes_per_sec: 0,
-            adaptive_ceiling_bytes_per_sec: ceiling,
+            ceiling_bytes_per_sec: ceiling,
             adaptive_floor_bytes_per_sec: floor,
         });
         let controller = factory.build(std::time::Instant::now(), 1200);
