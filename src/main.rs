@@ -793,7 +793,12 @@ struct Encoder {
     group: u64,
     shards: Vec<Vec<u8>>,
     adaptive: Adaptive,
-    /// 测试用：固定 parity，绕过自适应，用于量化 Reed-Solomon 的真实恢复能力。
+    /// 诊断/实验用：固定 parity，绕过自适应。
+    ///
+    /// 一度只在 debug 构建生效（怕误设环境变量绕过自适应）。但生产链路因此**无法
+    /// 固定 parity**，而"parity 的目标函数对不对"恰恰只能在真实链路上做受控 A/B
+    /// 才能回答——这个缺口把验证能力也一起关掉了。现在 release 同样生效，代之以
+    /// **显眼**：启用时打一条 WARN，且值夹到 `MAX_PARITY`。
     force_parity: Option<usize>,
 }
 
@@ -803,15 +808,22 @@ impl Encoder {
         Self::with_identity(session, VERSION_V1, 0)
     }
     fn with_identity(session: u64, version: u8, key_id: u64) -> Self {
-        // 测试钩子仅在 debug 构建生效；release 生产恒为 None，避免误设环境变量
-        // 绕过自适应 FEC（固定 parity）。
-        #[cfg(debug_assertions)]
         let force_parity = std::env::var("SMART_FEC_FORCE_PARITY")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|p| p.min(MAX_PARITY));
-        #[cfg(not(debug_assertions))]
-        let force_parity = None;
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|parity| parity.min(MAX_PARITY));
+        if let Some(parity) = force_parity {
+            // Loud on purpose. This bypasses the adaptive controller entirely, so
+            // a link left in this state carries whatever redundancy was typed in
+            // rather than what the path needs.
+            warn!(
+                parity,
+                "SMART_FEC_FORCE_PARITY is set: adaptive redundancy is DISABLED and \
+                 parity is pinned. Diagnostic/experiment use only."
+            );
+        }
         Self {
             version,
             key_id,
