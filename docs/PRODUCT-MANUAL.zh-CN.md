@@ -1304,34 +1304,52 @@ local.send_to(&d, peer).await       // 回程全部投给"最近一个"对端
 完全吻合：小请求能过（那一刻恰好是 app_peer）、批量下载归零、而另一条连接始终健康。
 还有一个安全侧面：本机任意进程只要往 `127.0.0.1:3333` 发一个包，就能劫持代理的回程路径。
 
-**修复**：把"谁是内层对端"变成**一次性决定**——第一个对端被接受并锁定，其它地址的数据报
-一律**拒绝并计数**（`inner_peer_conflicts`）且只告警一次，绝不接管：
+**修复**：把"谁是内层对端"变成**活跃时独占、静默后交接**：
 
 ```rust
-match classify_inner_peer(app_peer, peer) {
-    PeerVerdict::Accept => app_peer = Some(peer),
-    PeerVerdict::Same => {}
-    PeerVerdict::Conflict => { /* 计数 + 告警一次 + continue */ }
+match classify_inner_peer(app_peer, app_peer_seen.elapsed(), peer) {
+    Accept | Same   => { app_peer = Some(peer); app_peer_seen = now; }
+    Handover        => { warn!(...); app_peer = Some(peer); app_peer_seen = now; }
+    Conflict        => { /* 计数 inner_peer_conflicts + 首次告警 + continue */ }
 }
 ```
 
-回归用例 `a_second_inner_peer_must_not_take_over_the_return_path`。已按"先证明它能抓住旧
-实现"的方式验证：把 `classify_inner_peer` 改回恒 `Accept` 后用例失败。
-
-**线上验证（同一目标、http 全程 200）**：
-
-| 场景 | 连接1 吞吐 |
+| 情况 | 判定 |
 | --- | --- |
-| 无第二实例 | 1.879 MB/s |
-| 第二实例在跑且已活动过 | **1.851 MB/s（保持率 99%）** |
+| 无对端 | `Accept` |
+| 同一对端 | `Same` |
+| 新对端 + 已锁定对端**仍活跃** | `Conflict`（拒绝，不接管） |
+| 新对端 + 已锁定对端**静默 ≥ 2 s** | `Handover`（允许，并告警） |
 
-第二连接按设计被拒绝（`http=000`），并打出：
+**为什么不是永久锁定**：第一版写成永久锁定，随即被两个集成测试抓住代价——合法的单客户端
+（passwall 的 sing-box）**重启后源端口会变**，永久锁定意味着新端口永远被拒，隧道要等 FEC
+客户端自己重启才恢复。那是一个比原缺陷更严重的可用性问题。2 秒远大于正常收包间隔（毫秒
+级），又远小于运维能感知的故障时长。
 
-    WARN second inner peer rejected: this tunnel serves exactly one inner client;
-         its datagrams are dropped rather than allowed to take over the return path
-         locked=Some(127.0.0.1:48820) rejected=127.0.0.1:60895
+**测试台随之修正（诚实记录）**：`fec_loss_integration` 原先**预热用一个临时 socket、测量
+再 bind 一个新 socket**，于是客户端看到两个内层对端。这既不忠实于生产（生产只有一个内层
+对端），又在锁定之后让测量阶段的数据报被当成第二个对端拒绝，表现为到达率塌到 0——看起来
+像 FEC 回归。现在**预热与测量共用同一个 socket**，并在测量前排空预热回包。**那两个用例的
+失败不是 FEC 回归，而是它们一直依赖"最后来的对端赢"这个行为。**
 
-**修复前**同一场景连接1 会一起塌到 ~0。
+回归用例 `a_second_inner_peer_must_not_take_over_the_return_path` 覆盖四种判定（含"刚好
+不到阈值仍算冲突"）。已按"先证明它能抓住旧实现"验证：把 `classify_inner_peer` 改回恒
+`Accept` 后用例失败。
+
+**线上验证（校正后，OVH 静态文件；Cloudflare 测速端已对本机 429）**：连接1 持续活跃时让
+第二实例活动，日志给出完整判定序列——
+
+    05:42:04 WARN second inner peer rejected ... locked=Some(127.0.0.1:40878) rejected=127.0.0.1:54384
+    05:42:07 WARN inner peer handover ... previous=Some(:40878) new=:54384 idle_ms=3122
+    05:42:10 WARN inner peer handover ... previous=Some(:54384) new=:40878 idle_ms=2473
+
+即**活跃期间拒绝 → 静默 3 秒后交接 → 再静默后又交接回来**；连接1 全程 http=200、
+397,343 B/s，与预检基线一致，**未被抢走**。
+
+**仪器问题（顺带修掉）**：`speed.cloudflare.com` 先返回 **403+1 字节**、后返回 **429**
+（**直连也一样**）。旧脚本只看 `speed_download`，会把 403/429 读成"0 B/s"——上一版的错误
+归因正源于此。现在的验证脚本**强制校验 `http_code == 200`**，非 200 立即判无效并中止；
+本轮它当场拦下一次 429，避免又一个假结论。
 
 **对"多连接叠加"这条杠杆的结论**：**当前架构下不可行**，而且不是配置问题——隧道按设计只
 服务**一个**内层对端。要让多连接真正叠加，必须先让 FEC 帧携带**内层流标识**并按其解复用
