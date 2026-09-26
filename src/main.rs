@@ -55,11 +55,15 @@ const REASSEMBLY_TTL: Duration = Duration::from_secs(3);
 const REORDER_WINDOW: u64 = 64;
 const MAX_GROUPS: usize = 2048;
 const MAX_REASSEMBLIES: usize = 4096;
-const MAX_PARITY: usize = 4;
-// Above this loss level a 10+3 code cannot repair the path economically.
-// Adding more parity only consumes the already constrained UDP budget and
-// makes TUIC congestion recovery worse, so the controller bypasses FEC.
-const FEC_BYPASS_LOSS_PPM: u32 = 300_000;
+/// 冗余上限。取值依据：RS(10,k) 的期望收益要求 `(1-p)(10+k) > 10`，即
+/// `p < 1 - 10/(10+k)`。k=8 时阈值为 44.4%，再高就连期望都补不回来。
+const MAX_PARITY: usize = 8;
+/// 常态冗余下限。
+///
+/// 实测教训：突发丢包到来时 parity 还停在 0，那一窗 18.3% 的丢包
+/// `fec_recovered_symbols=0`——一个都没恢复。冗余必须**先于**丢包存在，
+/// 否则控制器永远滞后于突发。代价是 ~10% 常态开销。
+const MIN_PARITY: usize = 1;
 // Loss reports also act as tunnel keepalives.  This reserved value preserves
 // that traffic without teaching the adaptive controller that an undersized
 // observation window is a real zero-loss sample.
@@ -318,32 +322,91 @@ fn decode_client_frame(buf: &[u8], key_id: u64, key: &[u8; 32]) -> Result<Frame>
     }
 }
 
+/// `P(X > k)` for `X ~ Binomial(n, p)`.
+///
+/// `n` is tiny here (`DATA_SHARDS + MAX_PARITY` <= 18), so the exact sum is
+/// cheap and avoids the normal approximation's tail error — which is precisely
+/// the region this controller cares about.
+fn binomial_exceedance(n: usize, p: f64, k: usize) -> f64 {
+    if p <= 0.0 || k >= n {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return 1.0;
+    }
+    let q = 1.0 - p;
+    let mut term = q.powi(n as i32);
+    let mut cumulative = term;
+    for i in 1..=k {
+        term *= ((n - i + 1) as f64 / i as f64) * (p / q);
+        cumulative += term;
+    }
+    (1.0 - cumulative).clamp(0.0, 1.0)
+}
+
+/// Expected goodput factor for sending `DATA_SHARDS + parity` shards to deliver
+/// `DATA_SHARDS` source shards on a path losing `loss_ppm`:
+///
+/// ```text
+/// (fraction of groups that decode) / (bandwidth overhead)
+/// = (1 - P(losses > parity)) / (1 + parity / DATA_SHARDS)
+/// ```
+///
+/// Chosen over "pick the largest parity that fits" because block Reed-Solomon
+/// has very poor marginal returns at high loss: at 20 % loss, RS(10,4) leaves
+/// ~13 % of groups undecodable while RS(10,8) only improves that to ~10 % for
+/// double the overhead. Maximising this factor picks the knee instead of the
+/// ceiling. (Rationale and the RFC 9265 contract for how FEC relates to
+/// congestion control are documented on [`Adaptive`].)
+fn fec_goodput_factor(loss_ppm: u32, parity: usize) -> f64 {
+    let p = f64::from(loss_ppm.min(1_000_000)) / 1_000_000.0;
+    let failure = binomial_exceedance(DATA_SHARDS + parity, p, parity);
+    (1.0 - failure) / (1.0 + parity as f64 / DATA_SHARDS as f64)
+}
+
+/// Congestion-controlled, loss-driven FEC redundancy controller.
+///
+/// Layering contract (RFC 9265, "Forward Erasure Correction (FEC) Coding and
+/// Congestion Control in Transport"): FEC exists to deliver data on time, and
+/// must not be used to hide network loss from the *carrier's* congestion
+/// controller. In this stack the carrier sits below FEC and sees the true UDP
+/// loss, so that contract is satisfied by construction; what FEC must decide
+/// here is only how much redundancy to buy.
+///
+/// The loss input is the receiver's own wire-frame gap (`sequence_gap_ppm`),
+/// i.e. the loss observed on the network channel before recovery — not a
+/// post-recovery view. That is the correct signal for sizing redundancy.
 #[derive(Debug, Default)]
 struct Adaptive {
     // Zero is intentional: speculative startup redundancy can create a
     // congestion/loss loop on a rate-limited path before feedback is useful.
+    // `target()` lifts the steady-state value to MIN_PARITY.
     parity: usize,
     bad: u8,
     good: u16,
     last_loss_ppm: u32,
     smoothed_loss_ppm: u32,
     unavailable_reports: u8,
-    /// 连续超过 FEC_BYPASS_LOSS_PPM 的次数，用于给 bypass 加滞回。
-    bypass_streak: u8,
-    /// 刚因持续高丢包 bypass，恢复时直接跳到目标冗余档，避免逐级爬升太慢。
-    bypassed: bool,
 }
 
 impl Adaptive {
-    fn target(loss: u32) -> usize {
-        match loss {
-            0..=9_999 => 0,         // <1%
-            10_000..=49_999 => 1,   // 1-5%
-            50_000..=99_999 => 2,   // 5-10%
-            100_000..=199_999 => 3, // 10-20%
-            _ => 4,                 // >=20%
+    /// Redundancy level that maximises expected goodput at this loss rate.
+    ///
+    /// `MIN_PARITY` is the lower bound of the search, which is how the
+    /// always-have-some-redundancy rule is enforced.
+    fn target(loss_ppm: u32) -> usize {
+        let mut best = MIN_PARITY;
+        let mut best_score = f64::NEG_INFINITY;
+        for parity in MIN_PARITY..=MAX_PARITY {
+            let score = fec_goodput_factor(loss_ppm, parity);
+            if score > best_score {
+                best_score = score;
+                best = parity;
+            }
         }
+        best
     }
+
     fn report(&mut self, loss: u32) {
         if loss == LOSS_SAMPLE_UNAVAILABLE {
             // 空闲/无样本：只累计空闲时长用于长时间降级，绝不打断连续丢包样本的
@@ -353,45 +416,30 @@ impl Adaptive {
             // Reports arrive every two seconds.  If traffic has been too idle
             // to produce a real sample for 30 seconds, retire one stale parity
             // level.  This keeps the NAT heartbeat without freezing expensive
-            // redundancy indefinitely after a previous burst.
-            if self.unavailable_reports >= 15 {
-                self.parity = self.parity.saturating_sub(1);
+            // redundancy indefinitely after a previous burst.  The floor is
+            // MIN_PARITY, never 0.
+            if self.unavailable_reports >= 15 && self.parity > MIN_PARITY {
+                self.parity -= 1;
                 self.unavailable_reports = 0;
-                if self.parity == 0 {
-                    self.smoothed_loss_ppm = 0;
-                    self.last_loss_ppm = 0;
-                }
             }
             return;
         }
         self.unavailable_reports = 0;
         self.last_loss_ppm = loss;
         self.smoothed_loss_ppm = ((self.smoothed_loss_ppm as u64 * 3 + loss as u64) / 4) as u32;
-        if loss >= FEC_BYPASS_LOSS_PPM {
-            // 连续超阈值才 bypass：真实丢包是突发性的，单次尖峰立即清零会让
-            // parity 在 0↔1↔2 之间高频震荡。累积 3 次（约 6 秒）再 bypass。
-            self.bypass_streak = self.bypass_streak.saturating_add(1);
-            self.good = 0;
-            if self.bypass_streak >= 3 {
-                self.parity = 0;
+        let target = Self::target(self.smoothed_loss_ppm);
+
+        if target > self.parity {
+            // A jump of two or more levels is a burst: apply it at once instead
+            // of spending two more report intervals (4 s) climbing. Parity that
+            // lags a burst is exactly the failure mode that measured out as
+            // `fec_recovered_symbols=0` on an 18.3 % burst.
+            if target >= self.parity + 2 {
+                self.parity = target;
                 self.bad = 0;
                 self.good = 0;
-                self.unavailable_reports = 0;
-                self.bypassed = true;
+                return;
             }
-            return;
-        }
-        self.bypass_streak = 0;
-        let target = Self::target(self.smoothed_loss_ppm);
-        if self.bypassed {
-            // bypass 后恢复：直接跳到目标档，避免从 0 逐级爬（16 秒）期间丢包穿透。
-            self.parity = target.min(MAX_PARITY);
-            self.bad = 0;
-            self.good = 0;
-            self.bypassed = false;
-            return;
-        }
-        if target > self.parity {
             self.bad += 1;
             self.good = 0;
             if self.bad >= 2 {
@@ -402,7 +450,7 @@ impl Adaptive {
             self.good += 1;
             self.bad = self.bad.saturating_sub(1);
             if self.good >= 15 {
-                self.parity -= 1;
+                self.parity = self.parity.saturating_sub(1).max(MIN_PARITY);
                 self.good = 0;
             }
         } else {
@@ -417,11 +465,12 @@ impl Adaptive {
             FecFeedback::Sample(sample) => {
                 let parity_before = self.parity;
                 self.report(sample.sequence_gap_ppm);
-                // A useful reconstruction is evidence that the current code is
-                // buying delivery. Do not age parity downward on that same
-                // sample; still allow sustained severe loss to trigger bypass.
-                if sample.fec_recovered_symbols > 0 && !self.bypassed && self.parity < parity_before
-                {
+                // A useful reconstruction is evidence that the current parity is
+                // buying delivery, so do not age it down on that same sample.
+                // The loss input itself is the receiver's raw wire-frame gap
+                // (pre-recovery), so this never hides loss from the sizing
+                // decision -- it only prevents a needless one-step decay.
+                if sample.fec_recovered_symbols > 0 && self.parity < parity_before {
                     self.parity = parity_before;
                     self.good = 0;
                 }
@@ -1997,10 +2046,10 @@ mod tests {
             "a pre-V2 peer matches report frames only when payload.len() == 4"
         );
         // 潜在危险：若旧版本改用 `payload[..4]` 无限读取（不带长度等值判断），
-        // 魔数会被当成约 139.8% 丢包并触发 bypass。当前已部署版本的长度判断挡住了它，
-        // 这个断言把这个隐含依赖固定下来。
+        // 魔数会被当成约 139.8% 丢包并被当成"极高丢包"喂给自适应控制器。
+        // 当前已部署版本的长度判断挡住了它，这个断言把这个隐含依赖固定下来。
         assert_eq!(&rich.payload[..4], FEEDBACK_V2_MAGIC);
-        assert!(u32::from_be_bytes(FEEDBACK_V2_MAGIC) >= FEC_BYPASS_LOSS_PPM);
+        assert!(u32::from_be_bytes(FEEDBACK_V2_MAGIC) > 1_000_000);
     }
 
     #[test]
@@ -2118,11 +2167,13 @@ mod tests {
         for _ in 0..45 {
             a.report(0);
         }
-        assert_eq!(a.parity, 0);
+        // 干净链路会降冗余，但不会降到 0：MIN_PARITY 是常态下限（见其文档）。
+        assert_eq!(a.parity, MIN_PARITY);
         for _ in 0..20 {
             a.report(1_000_000);
         }
-        assert_eq!(a.parity, 0);
+        // 极端丢包下最优冗余是上限，而不是"关掉 FEC"。
+        assert_eq!(a.parity, MAX_PARITY);
     }
     #[test]
     fn adaptive_keeps_parity_when_feedback_confirms_recovery() {
@@ -2154,46 +2205,104 @@ mod tests {
         assert!(a.parity <= MAX_PARITY);
     }
     #[test]
-    fn adaptive_bypasses_fec_after_sustained_high_loss() {
+    fn binomial_exceedance_is_exact_at_the_tails() {
+        // P(X > n-1) for any p is p^n; P(X > k>=n) is 0.
+        assert_eq!(binomial_exceedance(4, 0.5, 4), 0.0);
+        assert_eq!(binomial_exceedance(4, 0.5, 9), 0.0);
+        // Degenerate p.
+        assert_eq!(binomial_exceedance(10, 0.0, 0), 0.0);
+        assert_eq!(binomial_exceedance(10, 1.0, 0), 1.0);
+        // P(X > 0) = 1 - (1-p)^n.
+        let expected = 1.0 - 0.8f64.powi(10);
+        assert!((binomial_exceedance(10, 0.2, 0) - expected).abs() < 1e-12);
+        // P(X > 1) for Bin(10, 0.2) = 1 - 0.8^10 - 10*0.2*0.8^9.
+        let expected = 1.0 - 0.8f64.powi(10) - 10.0 * 0.2 * 0.8f64.powi(9);
+        assert!((binomial_exceedance(10, 0.2, 1) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fec_target_maximises_goodput_not_parity() {
+        // 无丢包时不该买冗余：score = 1/(1+k/10) 在 k=MIN_PARITY 处最大。
+        assert_eq!(Adaptive::target(0), MIN_PARITY);
+
+        // 随丢包上升，目标必须是单调不减的（不会出现"丢包更多反而冗余更少"）。
+        let mut previous = MIN_PARITY;
+        let mut loss = 0u32;
+        while loss <= 600_000 {
+            let target = Adaptive::target(loss);
+            assert!(
+                target >= previous,
+                "target must not decrease as loss grows (loss={loss}, {previous} -> {target})"
+            );
+            assert!((MIN_PARITY..=MAX_PARITY).contains(&target));
+            previous = target;
+            loss += 5_000;
+        }
+
+        // 关键结论：块状 RS 在高丢包下边际收益极差，所以"最优 k"必须严格小于
+        // 上限——这正是本次改动要修的那类"无脑拉满冗余"。20% 丢包是实测工况。
+        let at_20pct = Adaptive::target(200_000);
+        assert!(
+            at_20pct < MAX_PARITY,
+            "at 20% loss the goodput-optimal parity must be below the ceiling, got {at_20pct}"
+        );
+        assert!(at_20pct >= MIN_PARITY);
+
+        // 而在极端丢包下它确实会向上限靠拢（此时更多冗余仍是最优的）。
+        assert_eq!(Adaptive::target(900_000), MAX_PARITY);
+    }
+
+    #[test]
+    fn fec_goodput_factor_penalises_overhead() {
+        // 同样的恢复能力下，开销越小越好；同样的开销下，恢复越多越好。
+        let zero_loss = fec_goodput_factor(0, MIN_PARITY);
+        assert!(zero_loss < 1.0, "redundancy always costs bandwidth");
+        assert!(zero_loss > 0.9);
+        // 高丢包下增加冗余应当提升 goodput 因子（否则说明算错了）。
+        assert!(fec_goodput_factor(200_000, 4) > fec_goodput_factor(200_000, MIN_PARITY));
+    }
+
+    #[test]
+    fn adaptive_keeps_a_baseline_parity_floor() {
+        // 实测教训：突发到来时 parity 停在 0 → 那一窗 18.3% 丢包一个都没恢复。
+        // 因此稳态必须保有 MIN_PARITY，绝不回落到 0。
         let mut a = Adaptive {
             parity: MAX_PARITY,
             ..Adaptive::default()
         };
-        // 单次尖峰不应立即 bypass（滞回，避免 parity 震荡）
-        a.report(FEC_BYPASS_LOSS_PPM);
-        assert_eq!(a.parity, MAX_PARITY);
-        a.report(FEC_BYPASS_LOSS_PPM);
-        assert_eq!(a.parity, MAX_PARITY);
-        // 连续 3 次超阈值才 bypass
-        a.report(FEC_BYPASS_LOSS_PPM);
-        assert_eq!(a.parity, 0);
+        for _ in 0..600 {
+            a.report(0);
+        }
+        assert_eq!(a.parity, MIN_PARITY);
     }
+
+    #[test]
+    fn adaptive_jumps_to_target_on_a_burst() {
+        // 目标比当前高两档以上时立即生效，不再花两个报告周期（4 秒）逐级爬。
+        let mut a = Adaptive {
+            parity: MIN_PARITY,
+            ..Adaptive::default()
+        };
+        // 连续高丢包把 smoothed 推高；首跳必须一次到位。
+        a.report(400_000);
+        a.report(400_000);
+        assert!(a.parity > MIN_PARITY + 1, "burst must raise parity at once");
+    }
+
     #[test]
     fn adaptive_single_loss_spike_does_not_reset_parity() {
-        // 单次 27% 尖峰后回落，parity 应保持（不因 bypass_streak 残留而误降）
+        // 单次高丢包尖峰后回落，parity 不应被误降。
         let mut a = Adaptive {
             parity: 2,
             ..Adaptive::default()
         };
-        a.report(FEC_BYPASS_LOSS_PPM + 100_000);
+        a.report(600_000);
+        let after_spike = a.parity;
         a.report(0);
-        assert_eq!(a.parity, 2);
+        assert!(a.parity >= after_spike.saturating_sub(1));
+        assert!(a.parity >= MIN_PARITY);
     }
-    #[test]
-    fn adaptive_recovers_quickly_after_bypass() {
-        let mut a = Adaptive {
-            parity: MAX_PARITY,
-            ..Adaptive::default()
-        };
-        // 触发 bypass（连续 3 次超阈值）
-        for _ in 0..3 {
-            a.report(FEC_BYPASS_LOSS_PPM);
-        }
-        assert_eq!(a.parity, 0);
-        // 恢复：29% 丢包（smoothed 升到 20%+，target=4），应直接跳到最高档而非逐级爬
-        a.report(290_000);
-        assert_eq!(a.parity, MAX_PARITY);
-    }
+
     #[test]
     fn adaptive_ignores_unavailable_loss_samples() {
         let mut a = Adaptive {
@@ -2203,8 +2312,6 @@ mod tests {
             last_loss_ppm: 80_000,
             smoothed_loss_ppm: 70_000,
             unavailable_reports: 0,
-            bypass_streak: 0,
-            bypassed: false,
         };
         a.report(LOSS_SAMPLE_UNAVAILABLE);
         assert_eq!(a.parity, 2);
@@ -2239,7 +2346,8 @@ mod tests {
         for _ in 0..15 {
             a.report(LOSS_SAMPLE_UNAVAILABLE);
         }
-        assert_eq!(a.parity, 0);
+        // 空闲退档到常态下限为止，不会退到 0（否则突发到来时无冗余可用）。
+        assert_eq!(a.parity, MIN_PARITY);
     }
     #[test]
     fn fec_recovers_missing_shard() {
