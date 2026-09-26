@@ -63,8 +63,47 @@ struct CarrierStatsSnapshot {
     lost_packets: u64,
     lost_bytes: u64,
     congestion_events: u64,
+    black_holes_detected: u64,
+    lost_plpmtud_probes: u64,
+    udp_tx_datagrams: u64,
+    udp_rx_datagrams: u64,
     udp_tx_bytes: u64,
     udp_rx_bytes: u64,
+    datagram_tx: u64,
+    datagram_rx: u64,
+}
+
+impl CarrierStatsSnapshot {
+    /// 单调计数器的窗口增量。
+    ///
+    /// 用 `saturating_sub` 而不是裸减法：连接重建时对端计数器会归零，裸减法会得到
+    /// 一个天文数字的"增量"，把一次重连误报成一次巨量丢包。
+    fn delta(&self, previous: &Self) -> Self {
+        Self {
+            sent_packets: self.sent_packets.saturating_sub(previous.sent_packets),
+            lost_packets: self.lost_packets.saturating_sub(previous.lost_packets),
+            lost_bytes: self.lost_bytes.saturating_sub(previous.lost_bytes),
+            congestion_events: self
+                .congestion_events
+                .saturating_sub(previous.congestion_events),
+            black_holes_detected: self
+                .black_holes_detected
+                .saturating_sub(previous.black_holes_detected),
+            lost_plpmtud_probes: self
+                .lost_plpmtud_probes
+                .saturating_sub(previous.lost_plpmtud_probes),
+            udp_tx_datagrams: self
+                .udp_tx_datagrams
+                .saturating_sub(previous.udp_tx_datagrams),
+            udp_rx_datagrams: self
+                .udp_rx_datagrams
+                .saturating_sub(previous.udp_rx_datagrams),
+            udp_tx_bytes: self.udp_tx_bytes.saturating_sub(previous.udp_tx_bytes),
+            udp_rx_bytes: self.udp_rx_bytes.saturating_sub(previous.udp_rx_bytes),
+            datagram_tx: self.datagram_tx.saturating_sub(previous.datagram_tx),
+            datagram_rx: self.datagram_rx.saturating_sub(previous.datagram_rx),
+        }
+    }
 }
 
 fn log_carrier_stats(
@@ -78,22 +117,39 @@ fn log_carrier_stats(
         lost_packets: stats.path.lost_packets,
         lost_bytes: stats.path.lost_bytes,
         congestion_events: stats.path.congestion_events,
+        // 黑洞检测与 PLPMTUD 探测失败是解释"实测 MTU 在 1200-1472 之间波动"的直接证据，
+        // 此前完全不可见。
+        black_holes_detected: stats.path.black_holes_detected,
+        lost_plpmtud_probes: stats.path.lost_plpmtud_probes,
+        udp_tx_datagrams: stats.udp_tx.datagrams,
+        udp_rx_datagrams: stats.udp_rx.datagrams,
         udp_tx_bytes: stats.udp_tx.bytes,
         udp_rx_bytes: stats.udp_rx.bytes,
+        // 应用层 DATAGRAM 帧计数才是"载体实际投递了多少个数据报"的口径——FEC 就架在它
+        // 上面，而 udp_* 只是下层的字节数。
+        datagram_tx: stats.frame_tx.datagram,
+        datagram_rx: stats.frame_rx.datagram,
     };
-    let sent_packets = current.sent_packets.saturating_sub(previous.sent_packets);
-    let lost_packets = current.lost_packets.saturating_sub(previous.lost_packets);
-    let wire_loss_ppm = (sent_packets >= MIN_WIRE_LOSS_SAMPLE_PACKETS)
-        .then(|| ((lost_packets as u128 * 1_000_000) / sent_packets as u128).min(1_000_000) as u32);
+    let delta = current.delta(previous);
+    let wire_loss_ppm = (delta.sent_packets >= MIN_WIRE_LOSS_SAMPLE_PACKETS).then(|| {
+        ((delta.lost_packets as u128 * 1_000_000) / delta.sent_packets as u128).min(1_000_000)
+            as u32
+    });
     info!(
         role,
         wire_loss_ppm=?wire_loss_ppm,
-        sent_packets,
-        lost_packets,
-        lost_bytes=current.lost_bytes.saturating_sub(previous.lost_bytes),
-        congestion_events=current.congestion_events.saturating_sub(previous.congestion_events),
-        tx_bytes=current.udp_tx_bytes.saturating_sub(previous.udp_tx_bytes),
-        rx_bytes=current.udp_rx_bytes.saturating_sub(previous.udp_rx_bytes),
+        sent_packets=delta.sent_packets,
+        lost_packets=delta.lost_packets,
+        lost_bytes=delta.lost_bytes,
+        congestion_events=delta.congestion_events,
+        black_holes=delta.black_holes_detected,
+        lost_plpmtud_probes=delta.lost_plpmtud_probes,
+        datagram_tx=delta.datagram_tx,
+        datagram_rx=delta.datagram_rx,
+        udp_tx_datagrams=delta.udp_tx_datagrams,
+        udp_rx_datagrams=delta.udp_rx_datagrams,
+        tx_bytes=delta.udp_tx_bytes,
+        rx_bytes=delta.udp_rx_bytes,
         rtt_ms=stats.path.rtt.as_millis(),
         cwnd_bytes=stats.path.cwnd,
         mtu=stats.path.current_mtu,
@@ -770,6 +826,55 @@ mod tests {
         for invalid in ["0", "2", "16", "invalid"] {
             assert!(parse_stream_lanes(Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn carrier_stats_delta_is_windowed_and_saturating() {
+        let previous = CarrierStatsSnapshot {
+            sent_packets: 100,
+            lost_packets: 5,
+            lost_bytes: 500,
+            congestion_events: 2,
+            black_holes_detected: 1,
+            lost_plpmtud_probes: 3,
+            udp_tx_datagrams: 50,
+            udp_rx_datagrams: 40,
+            udp_tx_bytes: 5_000,
+            udp_rx_bytes: 4_000,
+            datagram_tx: 10,
+            datagram_rx: 9,
+        };
+        let current = CarrierStatsSnapshot {
+            sent_packets: 160,
+            lost_packets: 9,
+            lost_bytes: 900,
+            congestion_events: 3,
+            black_holes_detected: 2,
+            lost_plpmtud_probes: 5,
+            udp_tx_datagrams: 80,
+            udp_rx_datagrams: 70,
+            udp_tx_bytes: 8_000,
+            udp_rx_bytes: 7_000,
+            datagram_tx: 20,
+            datagram_rx: 18,
+        };
+        let delta = current.delta(&previous);
+        assert_eq!(delta.sent_packets, 60);
+        assert_eq!(delta.lost_packets, 4);
+        assert_eq!(delta.lost_bytes, 400);
+        assert_eq!(delta.congestion_events, 1);
+        assert_eq!(delta.black_holes_detected, 1);
+        assert_eq!(delta.lost_plpmtud_probes, 2);
+        assert_eq!(delta.udp_tx_datagrams, 30);
+        assert_eq!(delta.udp_rx_datagrams, 30);
+        assert_eq!(delta.udp_tx_bytes, 3_000);
+        assert_eq!(delta.udp_rx_bytes, 3_000);
+        assert_eq!(delta.datagram_tx, 10);
+        assert_eq!(delta.datagram_rx, 9);
+        // 计数器归零（新连接）必须产出 0，而不是一个虚假的巨大增量。
+        assert_eq!(previous.delta(&current).sent_packets, 0);
+        assert_eq!(previous.delta(&current).lost_bytes, 0);
+        assert_eq!(previous.delta(&current).datagram_rx, 0);
     }
 
     #[test]
