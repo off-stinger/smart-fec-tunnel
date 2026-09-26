@@ -346,6 +346,47 @@ SMARTFEC 节点路径。
 回滚：把 `/etc/smart-fec/quic.env` 中的 `SMART_QUIC_CONGESTION` 改回 `new_reno`，
 然后 `systemctl restart smart-fec-quic`。
 
+### 10.4 Google 搜索显示"广东省 中国"且极慢的根因（已修复）
+
+现象：Google 搜索页页脚显示"广东省 中国 - 是根据您的 IP 地址推断出来的"，且页面加载极慢。
+
+逐项实测后排除掉两个常见猜测：
+
+- **不是 IP 泄露。** 在出问题的浏览器里实测 `https://api.ip.sb/geoip` 返回
+  `ip=104.28.222.43`、`organization=Cloudflare Warp`、`country=Singapore`，与经 SOCKS
+  测得的出口完全一致。浏览器确实走了代理。
+- **不是 DNS 泄露。** `www.google.com` 解析为真实 Google IP（142.251.x.x），未被污染。
+
+真正的原因有两条：
+
+1. **Google 对 Cloudflare WARP 该 IP 段的地理库是错的。** Cloudflare trace（`loc=SG`）、
+   ip.sb、ip-api 三方一致判定该出口为 Singapore，服务端自身 IP（腾讯云）也是 Singapore；
+   全链路里**唯一 geolocate 到广东省广州市的是家宽 IP**（120.85.127.231 China Unicom /
+   183.12.3.146 Chinanet GD），而它并未出现在出口路径上。Google 把被大量复用的 WARP 出口
+   判成了广东。
+2. **同一个 WARP 出口被 Google 判为异常流量。** 实测 `GET https://www.google.com/search`
+   经 WARP 返回 `302 → /sorry/index`（反机器人拦截页），经服务端直连返回 `200` 且无 CAPTCHA。
+   浏览器在拦截与重试之间打转，表现为"极慢"。
+
+**修复**：在 sing-box 路由中把 `google.com` 从 `warp-balance` 拆出来改走 `direct`
+（服务端自身出口）；`googleapis.com / gstatic.com / youtube* / googlevideo.com / ytimg.com`
+仍走 `warp-balance`。**规则顺序关键**：`google.com` 规则必须插在原规则之前（sing-box 首条
+匹配生效）。
+
+修复后实测：
+
+| 项目 | 修复前（WARP） | 修复后（direct） |
+| --- | --- | --- |
+| Google 搜索 | `302 → /sorry/`（CAPTCHA） | **`200`，无 CAPTCHA，1.27–1.96 s** |
+| Google CDN 8 MB | 737 KB/s | **918 KB/s** |
+| YouTube 首页 | `200` | `200`（未变，仍走 WARP） |
+
+回滚：`cp -p /etc/sing-box/config.json.bak-googlefix-<时间戳> /etc/sing-box/config.json && systemctl restart sing-box`
+
+**经验**：Cloudflare WARP 出口被大量用户复用，Google 对它的反机器人判定和地理位置都不可靠。
+凡是有风控的 Google 服务（搜索、账号）优先走 `direct`（自有机房 IP）；视频 CDN
+（googlevideo / ytimg）走 WARP 没有问题。
+
 ## 11. 内核感知优化阶段
 
 内核优化按能力和验证结果分级，不以固定 `sysctl` 大全作为产品功能。
