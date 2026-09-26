@@ -734,9 +734,11 @@ fn count_wire_rx(kind: u8) {
 /// The derived ratios are logged next to the raw counters so a reader does not
 /// have to recompute them and get it wrong:
 /// * `fec_overhead_ppm` -- wire bytes spent per inner byte offered;
-/// * `delivery_ppm` -- how much of the received wire actually reached the inner
-///   side. This is the number that was previously inferred from `curl` and got
-///   attributed to the wrong layer.
+/// * `wire_to_inner_ppm` -- of the wire bytes received, how many reached the
+///   inner side. **This is not a delivery ratio**: the denominator includes FEC
+///   parity, so a healthy 60 % here can coexist with zero loss. It is the number
+///   that was previously inferred from `curl` and attributed to the wrong layer.
+/// * `parity_frame_ppm` -- the overhead term, so overhead and loss are separable.
 fn log_traffic(role: &str, previous: &mut CounterSnapshot) {
     // Opt-out rather than opt-in: the whole point of these counters is to be
     // present when something goes wrong, and one record per 5 seconds is small
@@ -767,7 +769,16 @@ fn log_traffic(role: &str, previous: &mut CounterSnapshot) {
         unrecovered_shards = delta.unrecovered_shards,
         frames_rejected = delta.frames_rejected,
         fec_overhead_ppm = ratio_ppm(delta.wire_tx_bytes, delta.inner_rx_bytes),
-        delivery_ppm = ratio_ppm(delta.inner_tx_bytes, delta.wire_rx_bytes),
+        // Named for what it actually measures. It was `delivery_ppm`, which reads
+        // as "how much was delivered" and misled a diagnosis: the denominator is
+        // *wire* bytes, so the value is dominated by FEC parity overhead rather
+        // than by loss. On the live downlink it read 29 % while `groups_failed`
+        // was 0 and the carrier reported zero loss -- the other 71 % was parity
+        // and Reed-Solomon padding, not loss at all.
+        wire_to_inner_ppm = ratio_ppm(delta.inner_tx_bytes, delta.wire_rx_bytes),
+        // The overhead term of the above, exposed separately so overhead and loss
+        // can be told apart without arithmetic on the raw counts.
+        parity_frame_ppm = ratio_ppm(delta.wire_tx_parity_frames, delta.wire_tx_data_frames),
         "FEC traffic accounting"
     );
 }
