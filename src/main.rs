@@ -699,7 +699,11 @@ macro_rules! traffic_counters {
 /// [`COUNTERS`] is process-wide but `run_server_session` runs once per device
 /// session, so without this every concurrent session would emit its own record
 /// of the *same* global totals -- overlapping deltas that look like duplicated
-/// traffic. Exactly one session logs; the totals it reports are still complete.
+/// traffic. Exactly one **live** session logs; the totals it reports are still
+/// complete.
+///
+/// **The claim must be released when that session ends** -- use
+/// [`TrafficLoggerClaim`], never this flag directly.
 static TRAFFIC_LOGGER_CLAIMED: AtomicBool = AtomicBool::new(false);
 
         #[derive(Clone, Copy, Default)]
@@ -715,6 +719,38 @@ static TRAFFIC_LOGGER_CLAIMED: AtomicBool = AtomicBool::new(false);
             }
         }
     };
+}
+
+/// RAII claim on the server's single traffic-logging role.
+///
+/// Exists because the bare flag it wraps used to be a **one-shot per process**:
+/// it was set with `compare_exchange` and never cleared, so only the very first
+/// session after a restart ever logged, and every later session logged nothing.
+/// Production reconnects every few minutes, so the accounting was in practice
+/// silent almost always -- while the tunnel was busy, which is exactly when it
+/// is needed. A dead instrument that emits no error is worse than a noisy one:
+/// "no records" reads as "no traffic".
+///
+/// Observed live (2026-09-27): after the session at 04:47:17 replaced the one
+/// that had been logging, `FEC traffic accounting` produced **zero** lines for
+/// the rest of the process's life, while eth0 and the QUIC carrier carried
+/// 7.7 MB for a 5 MB download in the same window.
+struct TrafficLoggerClaim;
+
+impl TrafficLoggerClaim {
+    /// `Some` for exactly one live session at a time.
+    fn try_acquire() -> Option<Self> {
+        TRAFFIC_LOGGER_CLAIMED
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for TrafficLoggerClaim {
+    fn drop(&mut self) {
+        TRAFFIC_LOGGER_CLAIMED.store(false, Ordering::Relaxed);
+    }
 }
 
 // Field list for `traffic_counters!`. Attributes cannot be attached to an
@@ -1811,9 +1847,10 @@ async fn run_server_session(
     let mut flush = time::interval(Duration::from_millis(5));
     let mut traffic = time::interval(Duration::from_secs(TRAFFIC_INTERVAL_SECS));
     let mut traffic_previous = CounterSnapshot::default();
-    let logs_traffic = TRAFFIC_LOGGER_CLAIMED
-        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok();
+    // Named binding, NOT `let _`: the guard must live for the whole session so the
+    // role is released when this session ends and the next one can take over.
+    let _traffic_claim = TrafficLoggerClaim::try_acquire();
+    let logs_traffic = _traffic_claim.is_some();
     let mut last_logged_parity = 0usize;
     loop {
         tokio::select! {
@@ -2832,6 +2869,32 @@ mod tests {
                 "parse_max_parity({raw:?}) = {parity} is outside [{MIN_PARITY}, {MAX_PARITY}]"
             );
         }
+    }
+
+    /// 这条用例钉住的正是线上观测到的那个缺陷：**第一个 session 结束后，
+    /// 整个进程再也不记账**（2026-09-27 04:47:17 之后 `FEC traffic accounting`
+    /// 零行，而同一窗口 eth0 与 QUIC 载体为一次 5MB 下载搬了 7.7MB）。
+    #[test]
+    fn traffic_logger_claim_is_released_when_the_session_ends() {
+        // 同一时刻只能有一个 session 记账：否则每个并发 session 都会上报同一份
+        // 全局总量的重叠增量，看起来像流量翻倍。
+        let first = TrafficLoggerClaim::try_acquire()
+            .expect("the first session must be able to claim the logging role");
+        assert!(
+            TrafficLoggerClaim::try_acquire().is_none(),
+            "a second concurrent session must not claim the same logging role"
+        );
+
+        // 关键：session 结束后必须释放。修复前这里恒为 `None`，于是生产上
+        // （几分钟就重连一次）记账几乎永远是空的。
+        drop(first);
+        let second = TrafficLoggerClaim::try_acquire()
+            .expect("a later session must be able to take over after the previous one ended");
+        drop(second);
+        assert!(
+            TrafficLoggerClaim::try_acquire().is_some(),
+            "the role must be reusable for the lifetime of the process"
+        );
     }
 
     #[test]
