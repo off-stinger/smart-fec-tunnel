@@ -1441,6 +1441,38 @@ TUIC 配置**没有任何窗口字段**（已核对 v1.9 inbound/outbound schema
 **因此 T5 的"交付 20 Mbps"在本仓库范围内不可达**——它需要改 sing-box（打补丁放开
 `InitialConnectionReceiveWindow` / 让自动调优生效）或换内层协议，而不是继续调 FEC 或载体。
 
+### 10.20 T4 指纹：修掉"公布的双向流上限"，其余三项列出取舍
+
+objective 的 T4 是"UDP/443 指纹修复（自签证书 + 握手顺序）"。本轮先做**可在仓库内完成**的部分。
+
+#### 已修：公布给对端的双向流上限 2 → 100
+
+`transport_config()` 原先公布 `max_concurrent_bidi_streams(MAX_STREAM_LANES + 1)` = **2**。
+
+**该值是明文可读的**：传输参数位于 TLS 握手中，而 QUIC 的 Initial 包使用由公开 salt 派生的
+密钥（RFC 9001 §5.2），因此任何被动观察者都能解密并读到 `initial_max_streams_bidi`。真实
+HTTP/3 部署一律使用协议默认的 **100**，公布 2 相当于自报"这不是常规 HTTP/3 服务端"。
+
+现改为公布 **100**（协议默认）。该值仅约束**对端**可打开的流数，本项目真实用量仍是认证流 +
+可选 lane（≤2），故功能上完全中性。
+
+**守卫**：quinn 的 `TransportConfig` 只有 builder 式 setter、**没有 getter**，无法从配置中读回
+该值。因此把决定抽成 `advertised_bidi_streams()`；绕过它就会让该函数成为死代码，而 CI 运行
+`clippy -D warnings`，死代码会直接失败。用例
+`advertised_stream_limit_is_the_protocol_default_not_our_usage` 同时断言公布值 == 100，
+且真实用量远小于公布值。
+
+**诚实标注**：这是**代码级 + 用例级**验证；线级确认需要解密 Initial 包并解析传输参数，本轮
+未做。
+
+#### 未改：三项指纹都需要决策或有明确取舍
+
+| 指纹 | 现状 | 为何不擅自改 |
+| --- | --- | --- |
+| **自签证书 + SNI 伪装** | UDP/443 出示自签证书、声称 `www.microsoft.com`（§10.7 核验：`certificate_is_self_signed` 为 `Some(true)`，独立 `openssl verify` 报 error 18） | 需要一张**用户自有域名**的公开信任证书，属用户决策。拿到后设 `SMART_QUIC_REQUIRE_TRUSTED_CERT=1` 可让自签直接致命 |
+| **每次连接都发 Retry** | `SMART_QUIC_ADDRESS_VALIDATION` 默认开 | Retry 是 RFC 9000 §8.1.3 的 DoS 防护；常见做法是"仅在高负载/可疑时 Retry"。关掉默认值削弱 DoS 防护，属安全取舍，应由用户决定 |
+| **2 秒心跳节奏** | QUIC `keep_alive_interval(2s)` + 应用层 `CARRIER_HEARTBEAT = 2s` | 空闲隧道上每 2 秒一次的周期性可观察发包确实不像常规 h3 服务端；但它同时承担 NAT 保活与 `CARRIER_DEAD_TIMEOUT = 6s`（3 次缺失）的死对端发现。拉长会拖慢故障切换 |
+
 ## 11. 内核感知优化阶段
 
 内核优化按能力和验证结果分级，不以固定 `sysctl` 大全作为产品功能。

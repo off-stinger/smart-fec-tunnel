@@ -39,6 +39,23 @@ use tokio::{
 use tracing::{info, warn};
 
 const ALPN: &[u8] = b"h3";
+/// 向对端公布的双向流上限：**协议默认值 100**，而不是本项目真正用到的 2。
+///
+/// 该值会被写进 TLS 握手里的传输参数，而 QUIC 的 Initial 包用的是公开 salt 派生的密钥
+/// （RFC 9001 §5.2），**任何被动观察者都能解密并读到它**。真实 HTTP/3 部署一律是默认的
+/// 100，公布 2 等于自报"这不是常规 HTTP/3 服务端"。它只约束对端能开多少流，所以改成默认
+/// 值在功能上是中性的。
+const QUIC_DEFAULT_BIDI_STREAMS: u32 = 100;
+
+/// 公布给对端的双向流上限。
+///
+/// 单独抽成函数是为了**可守卫**：quinn 的 `TransportConfig` 只有 builder 式 setter、
+/// 没有 getter，无法从配置里读回这个值；如果直接在 `transport_config()` 里写常量，任何人
+/// 把它改回"贴合真实用量"的 2 都不会有任何用例报警。走这个函数之后，绕过它就等于让它变成
+/// 死代码，而 CI 跑 `clippy -D warnings`，死代码会直接失败。
+fn advertised_bidi_streams() -> u32 {
+    QUIC_DEFAULT_BIDI_STREAMS
+}
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-SFT-AUTH-v1";
 const MAX_DATAGRAM: usize = 65_535;
 const CARRIER_HEADER: usize = 12;
@@ -1295,9 +1312,17 @@ fn spawn_lane_readers(receives: Vec<RecvStream>) -> (mpsc::Receiver<Vec<u8>>, Jo
 
 fn transport_config() -> Result<Arc<TransportConfig>> {
     let mut transport = TransportConfig::default();
-    // One bidirectional stream authenticates the device; optional reliable
-    // carrier lanes use the remaining streams.
-    transport.max_concurrent_bidi_streams(((MAX_STREAM_LANES + 1) as u32).into());
+    // **Advertise the protocol default, not our real usage.**
+    //
+    // This number is a fingerprint. Transport parameters live in the TLS
+    // handshake, and QUIC Initial packets are protected with keys derived from a
+    // publicly known salt (RFC 9001 §5.2), so any passive observer can decrypt
+    // them and read `initial_max_streams_bidi` in the clear. Advertising our true
+    // usage — one auth stream plus at most `MAX_STREAM_LANES` carrier lanes, i.e.
+    // 2 — is trivially distinguishable from every real HTTP/3 deployment, which
+    // advertises the protocol default of 100. The value only bounds what the
+    // *peer* may open, so raising it to the default is functionally inert.
+    transport.max_concurrent_bidi_streams(advertised_bidi_streams().into());
     transport.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
     // 1472 bytes plus the IPv4 header is a standard 1500-byte packet. Quinn's
@@ -1922,6 +1947,26 @@ pub async fn run_client(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// 传输参数是在**明文可读**的 Initial 包里公布的（QUIC Initial 用公开 salt 派生的
+    /// 密钥，RFC 9001 §5.2），所以"公布的双向流上限"是指纹，不是内部常量。
+    ///
+    /// 本用例钉住它必须是协议默认值 100，防止有人为了"贴合真实用量"改回 1–2：那会让被动
+    /// 观察者一眼认出这不是常规 HTTP/3 服务端。
+    #[test]
+    fn advertised_stream_limit_is_the_protocol_default_not_our_usage() {
+        assert_eq!(
+            advertised_bidi_streams(),
+            100,
+            "the advertised bidi stream limit is a cleartext fingerprint and must stay at the \
+             protocol default"
+        );
+        assert!(
+            (MAX_STREAM_LANES as u32 + 1) < advertised_bidi_streams(),
+            "our real usage (auth stream + lanes) must stay well below the advertised default; \
+             if it ever approaches it, this guard no longer means anything"
+        );
+    }
 
     #[test]
     fn stream_lane_mode_is_explicit_and_rejects_unvalidated_parallel_lanes() {
