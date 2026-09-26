@@ -2,12 +2,15 @@
 //!
 //! 启动编译好的 client/server 二进制，中间插入随机丢包 relay，量化
 //! Reed-Solomon 在固定 parity 下的应用层恢复能力，并验证自适应修复后
-//! parity 能随丢包上升。使用动态端口，测试可并行。
+//! parity 能随丢包上升。
+//!
+//! **本文件的用例串行执行**（见 `HARNESS_LOCK`）：端口彼此独立，但 CPU 与 UDP
+//! 收发时序不是，并行会互相抢 CPU 并按固定阈值判定到达率，导致假失败。
 
 use std::net::{SocketAddr, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -74,10 +77,37 @@ struct Harness {
     children: Vec<Child>,
     client_port: u16,
     keyring_path: std::path::PathBuf,
+    /// 见 [`HARNESS_LOCK`]：本 harness 存活期间独占时序敏感资源。
+    _serial: MutexGuard<'static, ()>,
+}
+
+/// 时序敏感用例的全局串行锁。
+///
+/// 本文件的用例**端口**是独立的（动态/错开的 base port），但**CPU 与 UDP 收发
+/// 时序不是**：每个 harness 要跑 2 个子进程 + relay 线程 + echo 线程 + 发送与
+/// 接收两个线程，并且用固定间隔灌包、按固定阈值判定到达率。四个用例在同一
+/// 测试二进制里并行时，观测到 `production_sized_datagrams_survive_ten_percent_loss`
+/// 偶发跌破 0.80（空载重跑 3/3 通过，24.4s）——即测到的是**测试台互相抢 CPU**，
+/// 不是 FEC 层回归。
+///
+/// 文件头原先写"测试可并行"，那句话只对端口成立，对时序不成立，已删除。
+/// 串行化会拉长这个二进制的墙钟时间（实测约 27s → 约 90s），但**一个会随机
+/// 失败的守卫比一个慢的守卫更贵**：假失败会训练人去忽略它。
+static HARNESS_LOCK: Mutex<()> = Mutex::new(());
+
+/// 取全局串行锁。**忽略中毒**：某个用例 panic 不应该让其余用例跟着报一个与
+/// 自身无关的错误；每个用例的断言已经各自给出诊断。
+fn serial_guard() -> MutexGuard<'static, ()> {
+    HARNESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Harness {
     fn new(loss: f64, force_parity: Option<usize>, base: u16) -> Self {
+        // 先取锁再起任何线程/进程：否则锁只保护了后半段，前一个用例的残留
+        // 线程仍在抢 CPU。
+        let serial = serial_guard();
         let stop = Arc::new(AtomicBool::new(false));
         let echo_port = base;
         let server_port = base + 1;
@@ -169,6 +199,7 @@ impl Harness {
             children: vec![server, client],
             client_port,
             keyring_path,
+            _serial: serial,
         }
     }
 
@@ -292,9 +323,8 @@ fn adaptive_parity_rises_without_force() {
     // 到达率应明显高于纯无 FEC 基线（~81%）。
     //
     // 阈值 0.83 留了很大余量：实测三次分别为 0.976 / 0.985 / 0.986，基线 0.807。
-    // 注意本用例对时序敏感——注入丢包的 pump 间隔固定，机器负载高（例如同时在进行
-    // 编译）时到达率会掉到阈值以下，曾观测到过一次失败而紧接着三次通过。因此**不要
-    // 把它的一次失败当成回归**，先空载重跑；真正的回归会稳定失败。
+    // 本文件内的并行竞争已由 `HARNESS_LOCK` 消除；**外部**负载（例如同时编译）仍
+    // 会压低到达率，因此一次失败不要当成回归，先空载重跑；真正的回归会稳定失败。
     let h = Harness::new(0.10, None, 25555);
     // 12 秒持续流量：debug 构建较慢，需更长预热让自适应 parity 充分升上去。
     let arrival = h.measure(2000, 12.0, true);
@@ -329,6 +359,9 @@ fn production_sized_datagrams_survive_zero_loss() {
 /// 阈值比小报文用例（0.83）更宽松：1200 字节报文的分组更大，突发丢包更容易
 /// 打穿一个整组，而分块 RS 对组内连续丢包无能为力（RFC 9265 §2.5 指出可解码
 /// 概率取决于"编码窗口大小、编码率与**信道删余的分布**"）。
+///
+/// 本用例是 `HARNESS_LOCK` 串行化的**直接原因**：并行运行时曾偶发跌破 0.80，
+/// 而空载单跑 3/3 通过（每次约 24.4s）。
 #[test]
 fn production_sized_datagrams_survive_ten_percent_loss() {
     let h = Harness::new(0.10, None, 45555);

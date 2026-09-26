@@ -406,15 +406,52 @@ struct Adaptive {
     shortfall_reports: u8,
 }
 
-/// `SMART_FEC_MAX_PARITY` 的默认值：即 [`MAX_PARITY`]，行为与改动前一致。
+/// `SMART_FEC_MAX_PARITY`：自适应 parity 的有效上限。
+///
+/// 约定与其它数值型开关一致：**空值 = 用默认**（`MAX_PARITY`，即与不设此变量逐位
+/// 一致）。但越界/无法解析的值**不能静默回落**——那正是本类开关被引入的原因
+/// （配置被无声忽略，行为与预期不符却没有任何信号）。所以这里对两种情况都打 WARN，
+/// 并明确说出实际生效的上限。
+///
+/// 与 `SMART_QUIC_MAX_RATE_MBPS` 的区别：那里越界是 `bail!`（因为速率上限写错会直接
+/// 改变可用带宽预算），这里只是一个搜索区间上界，钳到最近的合法值语义是明确的，
+/// 所以选择"钳 + WARN"而不是拒绝启动——FEC 是隧道的其中一层，不值得为一个良性拼写
+/// 错误让整条隧道起不来。
+///
+/// `SMART_FEC_FORCE_PARITY` 优先级更高且**不受**此上限约束：它显式关闭自适应并钉住
+/// parity，本来就是诊断用的旁路。
 fn configured_max_parity() -> usize {
-    std::env::var("SMART_FEC_MAX_PARITY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .and_then(|value| value.parse::<usize>().ok())
-        .map(|parity| parity.clamp(MIN_PARITY, MAX_PARITY))
-        .unwrap_or(MAX_PARITY)
+    let value = std::env::var("SMART_FEC_MAX_PARITY").ok();
+    parse_max_parity(value.as_deref())
+}
+
+/// 纯函数形式，便于测试：解析不依赖进程环境，测试无需 `set_var`（并发下不安全）。
+fn parse_max_parity(value: Option<&str>) -> usize {
+    // 空值/空白 = 未配置。env 文件里的 `SMART_FEC_MAX_PARITY=` 不能当成 0。
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return MAX_PARITY;
+    };
+    match raw.parse::<usize>() {
+        Ok(parity) => {
+            let clamped = parity.clamp(MIN_PARITY, MAX_PARITY);
+            if clamped != parity {
+                warn!(
+                    requested = parity,
+                    effective = clamped,
+                    "SMART_FEC_MAX_PARITY out of range [{MIN_PARITY}, {MAX_PARITY}]; clamped"
+                );
+            }
+            clamped
+        }
+        Err(_) => {
+            warn!(
+                value = %raw,
+                effective = MAX_PARITY,
+                "SMART_FEC_MAX_PARITY is not an integer; the parity ceiling is NOT in effect"
+            );
+            MAX_PARITY
+        }
+    }
 }
 
 impl Default for Adaptive {
@@ -2749,6 +2786,50 @@ mod tests {
             assert!(
                 Adaptive::target(loss, 3) <= 3,
                 "the ceiling must bound the target (loss={loss})"
+            );
+        }
+    }
+
+    /// 空值必须等于"不设"（env 文件里写 `SMART_FEC_MAX_PARITY=` 是常见事故），
+    /// 合法值原样通过，越界被钳到合法端点。
+    #[test]
+    fn fec_max_parity_parsing() {
+        assert_eq!(parse_max_parity(None), MAX_PARITY);
+        assert_eq!(parse_max_parity(Some("")), MAX_PARITY);
+        assert_eq!(parse_max_parity(Some("   ")), MAX_PARITY);
+
+        assert_eq!(parse_max_parity(Some("1")), 1);
+        assert_eq!(parse_max_parity(Some(" 3 ")), 3);
+        assert_eq!(parse_max_parity(Some("8")), MAX_PARITY);
+
+        // 越界钳到最近端点；0 不是"关掉冗余"（MIN_PARITY 是设计上的地板）。
+        assert_eq!(parse_max_parity(Some("0")), MIN_PARITY);
+        assert_eq!(parse_max_parity(Some("999")), MAX_PARITY);
+
+        // 无法解析时回落到默认 **并且** 走 WARN 分支——这里断言的是回落值，
+        // 静默与否由 warn! 保证（日志不可在单测中断言）。
+        assert_eq!(parse_max_parity(Some("1x")), MAX_PARITY);
+        assert_eq!(parse_max_parity(Some("one")), MAX_PARITY);
+        assert_eq!(parse_max_parity(Some("-1")), MAX_PARITY);
+
+        // 任何取值下结果都必须落在合法区间内——这是 `target()` 循环
+        // `MIN_PARITY..=max_parity` 非空的前提。
+        for raw in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("1"),
+            Some("5"),
+            Some("8"),
+            Some("9"),
+            Some("abc"),
+            Some("-5"),
+            Some("18446744073709551616"),
+        ] {
+            let parity = parse_max_parity(raw);
+            assert!(
+                (MIN_PARITY..=MAX_PARITY).contains(&parity),
+                "parse_max_parity({raw:?}) = {parity} is outside [{MIN_PARITY}, {MAX_PARITY}]"
             );
         }
     }

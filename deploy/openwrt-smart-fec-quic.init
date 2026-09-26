@@ -24,6 +24,10 @@ start_service() {
     # T1 的流量账目默认开启，每 5 秒一条。路由器 syslog 环形缓冲只有 128KB，
     # 需要时可用 SMART_FEC_TRAFFIC_LOG=0 关掉。
     traffic_log="${SMART_FEC_TRAFFIC_LOG:-}"
+    # FEC parity 的有效上限，夹在 [1, 8]。默认 8 = 不设限。**上行**冗余由本端
+    # （客户端）生成，所以这个变量在路由器上是有效的：实测本链路 parity=1 比
+    # parity=5 快 40.9%（PRODUCT-MANUAL §10.13），需要按实测覆盖模型时设它。
+    max_parity="${SMART_FEC_MAX_PARITY:-}"
     # 注意：procd 的 env 参数走 _procd_add_table -> json_add_object("env")，多次调用
     # procd_set_param env 会生成重复的 "env" 键，JSON 解析后只有最后一次生效，前面几组
     # 环境变量会被静默丢弃（表现为二进制报缺少 --key）。必须只调用一次、合并传入。
@@ -31,6 +35,7 @@ start_service() {
     [ -z "$fixed_rate_mbps" ] || envs="$envs SMART_QUIC_FIXED_RATE_MBPS=$fixed_rate_mbps"
     [ -z "$max_rate_mbps" ] || envs="$envs SMART_QUIC_MAX_RATE_MBPS=$max_rate_mbps"
     [ -z "$traffic_log" ] || envs="$envs SMART_FEC_TRAFFIC_LOG=$traffic_log"
+    [ -z "$max_parity" ] || envs="$envs SMART_FEC_MAX_PARITY=$max_parity"
     # 只有显式配置为 1 时才传这一项：不传即 datagram 模式（默认，配合 FEC 纠错）。
     # 不传 "0" 是为了兼容旧二进制对 "0" 的拒绝（见 parse_stream_lanes）。
     [ "${SMART_QUIC_STREAM_LANES:-}" != "1" ] || envs="$envs SMART_QUIC_STREAM_LANES=1"

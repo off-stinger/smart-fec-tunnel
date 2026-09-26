@@ -97,9 +97,13 @@ RFC 9002 下限（2944 字节）、吞吐 4.5 KB/s，而 `bbr` 与 `fixed` 都�
 | `SMART_FEC_MAX_PARITY` | 两端（**服务端有效**） | `8` | FEC parity 的有效上限，夹在 `[1, 8]`；见 §10.14 |
 | `SMART_QUIC_STREAM_LANES` | 客户端 | 不传 | 仅 `1` 有意义（不传 = DATAGRAM） |
 
-`tests/deploy_env_coverage.rs` 会检查路由器 init 是否转发了客户端侧读的每个
-`SMART_QUIC_*`：**新增客户端环境变量时必须同时更新 init**，否则在
-`/etc/smart-fec-quic.env` 里设置会被静默忽略（T3 引入 `MAX_RATE` 时就是这样漏掉的）。
+`tests/deploy_env_coverage.rs` 会检查路由器 init 是否转发了**二进制读取的每个**
+`SMART_*` 环境变量（扫描 `src/quic_relay.rs` 与 `src/main.rs` 里的
+`std::env::var("SMART_...")` 字面量）：**新增环境变量时必须同时更新 init**，否则在
+`/etc/smart-fec-quic.env` 里设置会被静默忽略。这类漏转发已发生两次（T3 的
+`MAX_RATE`，以及 `SMART_FEC_MAX_PARITY`——后者正是因为扫描范围只覆盖
+`quic_relay.rs` 才漏掉的，现已扩大扫描面）。有意不转发的变量必须写进用例的
+`NOT_FORWARDED` 并附理由，该名单本身也有用例审计是否腐烂。
 
 ### 3.2 旁路由 init 脚本的两条硬约束
 

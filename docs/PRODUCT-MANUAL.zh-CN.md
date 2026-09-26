@@ -880,6 +880,53 @@ T3/T3b/T3c 三次"控制器改完直接上生产"的教训一致：没有配套�
 `fec_target_maximises_goodput_not_parity` 保持原样（在 `max_parity = MAX_PARITY` 下），
 **原模型的形状没有被改动**，改动前后 86 项测试全绿。
 
+#### 联网查证：独立文献复述了同一条结论
+
+本项目的 §10.13 是**先测出来、再回头看规范**。查证到一篇 2025 年的 ACM 论文独立复述了
+同一现象，且它正是该论文的立论动机：
+
+> "This **sparse- yet- bursty** nature makes it difficult for **reactive FEC schemes** to
+> configure an appropriate redundancy rate."
+> —— *Triage: Boosting Cross-region Video Conferencing with Proactive FEC on Overlay
+> Network*, Proc. ACM Netw. (CoNEXT) 2025, DOI
+> [10.1145/3830396](https://dl.acm.org/doi/abs/10.1145/3830396)
+
+这与 §10.13 的实测同向：**突发**（实测组失败率 21.3% vs 独立模型预期 2.0–8.7%）使"反应式"
+FEC 冗余控制无法定出合适的冗余率——本项目三轮基于丢包的设计（T2/T3/T3b）全部失败，是同一
+原因的不同表现。该论文的解法是 **proactive**（不等丢包、提前编码），而不是把反应式系数调得
+更好；本项目 §10.13 末尾"换输入"（用交付量而不是损失量）属于同一方向。
+
+**注意这条引用的边界**：它支持"反应式+突发⇒冗余率定不准"，**不支持**"parity 就该是 1"。
+后者目前只有本项目自己在一条 WAN 上的 A/B 证据（n=25，p≈0.85%），不构成普适结论——这正是
+把它做成**可配置上限**而不是改成默认值的原因。
+
+#### 本次改动的审计发现（同批修复）
+
+改完自查发现三处问题，都已修并有守卫：
+
+1. **部署守卫有盲区（真缺口，会静默失效）**：`tests/deploy_env_coverage.rs` 只扫描
+   `src/quic_relay.rs`，并在注释里"诚实标注"了这个局限。而 `SMART_FEC_MAX_PARITY` 加在
+   `src/main.rs`——于是它可以被设置、被**静默忽略**，守卫却毫无反应，即守卫存在的理由本身。
+   现在扫描 `src/` 下所有读取 `std::env::var("SMART_...")` 字面量的文件，并对每个文件断言
+   最少扫出 N 个变量（扫描失效必须失败，恒真的守卫比没有守卫更糟）。
+   同时路由器 init 转发该变量（**上行**冗余由客户端生成，所以在路由器上有效）。
+2. **豁免名单腐烂（守卫升级后立刻抓到）**：`NOT_FORWARDED` 里列着 `SMART_QUIC_UPSTREAM`，
+   但它早已改成 clap 的 `--upstream` 参数、不再是环境变量。新增的
+   `not_forwarded_list_only_contains_variables_the_binary_reads` 用例把它抓了出来。
+3. **拼写错误静默回落**：初版对无法解析的值无声回落到 `MAX_PARITY`，即"以为设了上限、其实
+   没设"，与第 1 条是同一类伤害。现在越界打 WARN 并钳到最近端点、无法解析打 WARN 并说明
+   "上限未生效"。解析抽成纯函数 `parse_max_parity(Option<&str>)` 以便测试（不依赖进程环境，
+   并发下 `set_var` 不安全）。
+
+**测试时序假失败（同批修复）**：`production_sized_datagrams_survive_ten_percent_loss` 在
+四个用例并行时偶发跌破 0.80，空载单跑 3/3 通过（每次约 24.4s）。原因是每个 harness 要跑
+2 个子进程 + 3 个线程并按固定间隔灌包，**网络端口独立但 CPU 与时序不独立**。已加全局
+`HARNESS_LOCK` 串行化（27s → 79s），并把文件头"使用动态端口，测试可并行"这句只对端口成立的
+话删掉。理由：**一个会随机失败的守卫比一个慢的守卫更贵**，假失败会训练人去忽略它。
+
+门禁：`cargo fmt --check` 与 `cargo clippy --all-targets -- -D warnings` 干净，
+`cargo test` **88 项全绿**（37 lib + 45 bin + 2 deploy_env_coverage + 4 fec_loss_integration）。
+
 #### 仍未达成
 
 交付 20+ Mbps。本链路（快/丢包条）parity=1 中位数 1.61 MB/s ≈ 12.9 Mbps，受 §10.12/§10.8
