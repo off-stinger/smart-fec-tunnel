@@ -94,6 +94,7 @@ RFC 9002 下限（2944 字节）、吞吐 4.5 KB/s，而 `bbr` 与 `fixed` 都�
 | `SMART_QUIC_ADDRESS_VALIDATION` | 服务端 | 开 | QUIC Retry 地址验证（RFC 9000 §8.1.3）；设 `0` 关闭 |
 | `SMART_QUIC_REQUIRE_TRUSTED_CERT` | 服务端 | 关 | 设 `1` 时，自签证书直接拒绝启动 |
 | `SMART_FEC_TRAFFIC_LOG` | 两端 | 开 | T1 流量账目，每 5 秒一条；设 `0` 关闭 |
+| `SMART_FEC_MAX_PARITY` | 两端（**服务端有效**） | `8` | FEC parity 的有效上限，夹在 `[1, 8]`；见 §10.14 |
 | `SMART_QUIC_STREAM_LANES` | 客户端 | 不传 | 仅 `1` 有意义（不传 = DATAGRAM） |
 
 `tests/deploy_env_coverage.rs` 会检查路由器 init 是否转发了客户端侧读的每个

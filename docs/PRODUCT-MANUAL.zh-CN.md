@@ -642,6 +642,9 @@ T3b 还有一个独立的纯逻辑缺陷：`BurstBackoff` 把 `clean_intervals` 
   信任证书。
 - `SMART_FEC_FORCE_PARITY=<n>` 固定 FEC parity、**关闭自适应冗余**。release 亦生效，
   启用时打 WARN。仅用于诊断/受控实验，不要长期留在生产上。
+- `SMART_FEC_MAX_PARITY=<n>` 给自适应 parity 加**有效上限**（夹在 `[1, 8]`，默认 8 =
+  与改动前一致）。它**不改控制律**，只是让实测出来的最优点能被显式使用；理由见 §10.14。
+  下行方向由**服务端**的该变量决定（冗余由服务端生成）。
 
 ### 10.12 长期"效率恒定 22–29%"缺口的真正根因（已修复）
 
@@ -841,7 +844,49 @@ parity 1 → 0.293、parity 5 → 0.626，即**强烈偏好高 parity**。把代
 **仍未达成**：交付 20+ Mbps。本链路（快/丢包条）上 parity=1 的中位数为 1.61 MB/s
 （≈12.9 Mbps）。
 
-## 11. 内核感知优化阶段
+### 10.14 实现：`SMART_FEC_MAX_PARITY`（给已知错误的模型加边界，而不是继续信它）
+
+§10.13 的结论是**换控制律**（由实测 `unrecovered_shards` 驱动，而不是由推测丢包率经模型
+反推），但那需要把**接收端 goodput** 放进反馈帧，而 `FEEDBACK_V2_LEN=24` 已经占满，属于
+线格式变更 + 三级协商，不能顺手做。**在那之前，能做且诚实的只有一件事：让模型的结果可以被
+运维按实测覆盖。**
+
+改动只有一个字段：
+
+```rust
+struct Adaptive { parity: usize, max_parity: usize, /* … */ }
+fn configured_max_parity() -> usize { /* SMART_FEC_MAX_PARITY，clamp 到 [MIN_PARITY, MAX_PARITY] */ }
+fn target(loss_ppm: u32, max_parity: usize) -> usize { for parity in MIN_PARITY..=max_parity { … } }
+```
+
+两条升级路径（`report()` 里 `target > parity` 的跳升、以及 `bad >= 2` 的逐级上升）也都
+`.min(self.max_parity)`，所以上限在任何路径下都成立。**默认值等于 `MAX_PARITY`，行为与
+改动前逐位一致**——这不是一个"默认开启的优化"。
+
+#### 为什么不做成"自动找 parity 1"
+
+因为**任何由丢包驱动的规则都找不到 parity 1**：parity 1 时残余丢包必然存在（§10.13 实测
+`unrecovered_shards` 662 / 1217 / 505 / 305），规则看到它就会升。要找到最优点，输入必须是
+**交付量**而不是**损失量**——这正是 §10.13 末尾那条"换输入"的路，需要线格式变更。
+
+用 `SMART_FEC_MAX_PARITY=1` 等于**用运维的实测判断替换掉一个已被实测否证的模型**。这与
+T3/T3b/T3c 三次"控制器改完直接上生产"的教训一致：没有配套可验证实验的控制器改动不上生产，
+而在实验台已具备（§10.13 第三版）之后，这个决定是可以被测的。
+
+#### 测试
+
+`fec_target_respects_the_configured_ceiling`：对 loss ∈ {0, 5%, 20%, 90%} 断言
+`target(loss, MIN_PARITY) == MIN_PARITY`（上限压到地板时必须钉死）且 `target(loss, 3) <= 3`。
+`fec_target_maximises_goodput_not_parity` 保持原样（在 `max_parity = MAX_PARITY` 下），
+**原模型的形状没有被改动**，改动前后 86 项测试全绿。
+
+#### 仍未达成
+
+交付 20+ Mbps。本链路（快/丢包条）parity=1 中位数 1.61 MB/s ≈ 12.9 Mbps，受 §10.12/§10.8
+的 30.8 Mbps 出口硬顶与 1.09× 非冗余项共同约束（`20 × 1.1 × 1.09 = 24.0 Mbps < 30.8`，即在
+干净那条 WAN 上可达，在快/丢包条上 `20 × 1.5 × 1.09 = 32.7 > 30.8` 物理不可达）。
+
+
 
 内核优化按能力和验证结果分级，不以固定 `sysctl` 大全作为产品功能。
 

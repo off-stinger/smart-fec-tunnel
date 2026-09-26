@@ -379,6 +379,24 @@ fn fec_goodput_factor(loss_ppm: u32, parity: usize) -> f64 {
 #[derive(Debug)]
 struct Adaptive {
     parity: usize,
+    /// Effective ceiling on parity, normally [`MAX_PARITY`].
+    ///
+    /// Why this is a knob rather than the output of a better model: deployment
+    /// measurement (PRODUCT-MANUAL §10.13) found parity=1 beating parity=5 by
+    /// **40.9 %** in median goodput on the same WAN at the same 15-35 % loss
+    /// (permutation p ≈ 0.85 %), because the loss is bursty -- measured group
+    /// failure 21.3 % against 2.0-8.7 % predicted by independence -- so extra
+    /// redundancy did not buy proportional protection. Parity 5 paid 50 %
+    /// overhead and still lost data.
+    ///
+    /// **No loss-based rule can find that optimum**: every such rule sees
+    /// residual loss at parity 1 and raises. Finding it properly needs the
+    /// receiver's *goodput* in the feedback path, which is a wire-format change
+    /// (`FEEDBACK_V2_LEN` is already full). Until that exists, exposing the
+    /// ceiling is the honest option -- it lets the measured optimum be used
+    /// deliberately instead of being overridden by a model that measurement has
+    /// already disproved.
+    max_parity: usize,
     bad: u8,
     good: u16,
     last_loss_ppm: u32,
@@ -386,6 +404,17 @@ struct Adaptive {
     unavailable_reports: u8,
     /// 连续"有丢失但一个都没修回来"的报告次数（恢复驱动输入）。
     shortfall_reports: u8,
+}
+
+/// `SMART_FEC_MAX_PARITY` 的默认值：即 [`MAX_PARITY`]，行为与改动前一致。
+fn configured_max_parity() -> usize {
+    std::env::var("SMART_FEC_MAX_PARITY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|parity| parity.clamp(MIN_PARITY, MAX_PARITY))
+        .unwrap_or(MAX_PARITY)
 }
 
 impl Default for Adaptive {
@@ -398,6 +427,7 @@ impl Default for Adaptive {
             // `fec_recovered_symbols=0`）。MIN_PARITY 只有约 10% 开销，换的是"突发
             // 到来时一定有东西可用"，代价方向是可接受的。
             parity: MIN_PARITY,
+            max_parity: configured_max_parity(),
             bad: 0,
             good: 0,
             last_loss_ppm: 0,
@@ -431,7 +461,7 @@ impl Adaptive {
         }
         self.shortfall_reports = self.shortfall_reports.saturating_add(1);
         if self.shortfall_reports >= FEC_SHORTFALL_REPORTS_TO_RAISE {
-            self.parity = (self.parity + 1).min(MAX_PARITY);
+            self.parity = (self.parity + 1).min(self.max_parity);
             self.good = 0;
             self.bad = 0;
             self.shortfall_reports = 0;
@@ -441,10 +471,16 @@ impl Adaptive {
     ///
     /// `MIN_PARITY` is the lower bound of the search, which is how the
     /// always-have-some-redundancy rule is enforced.
-    fn target(loss_ppm: u32) -> usize {
+    ///
+    /// **This model is known to be wrong on this link** (§10.13: it predicts
+    /// parity 5 where measurement shows parity 1 is 40.9 % faster). It is kept
+    /// because it is still the right shape for a non-bursty path, and because
+    /// `SMART_FEC_MAX_PARITY` now bounds its influence -- an operator who has
+    /// measured their own link can cap the result instead of trusting it.
+    fn target(loss_ppm: u32, max_parity: usize) -> usize {
         let mut best = MIN_PARITY;
         let mut best_score = f64::NEG_INFINITY;
-        for parity in MIN_PARITY..=MAX_PARITY {
+        for parity in MIN_PARITY..=max_parity {
             let score = fec_goodput_factor(loss_ppm, parity);
             if score > best_score {
                 best_score = score;
@@ -474,7 +510,7 @@ impl Adaptive {
         self.unavailable_reports = 0;
         self.last_loss_ppm = loss;
         self.smoothed_loss_ppm = ((self.smoothed_loss_ppm as u64 * 3 + loss as u64) / 4) as u32;
-        let target = Self::target(self.smoothed_loss_ppm);
+        let target = Self::target(self.smoothed_loss_ppm, self.max_parity);
 
         if target > self.parity {
             // A jump of two or more levels is a burst: apply it at once instead
@@ -490,7 +526,7 @@ impl Adaptive {
             self.bad += 1;
             self.good = 0;
             if self.bad >= 2 {
-                self.parity = (self.parity + 1).min(MAX_PARITY);
+                self.parity = (self.parity + 1).min(self.max_parity);
                 self.bad = 0;
             }
         } else if target < self.parity {
@@ -2669,13 +2705,13 @@ mod tests {
     #[test]
     fn fec_target_maximises_goodput_not_parity() {
         // 无丢包时不该买冗余：score = 1/(1+k/10) 在 k=MIN_PARITY 处最大。
-        assert_eq!(Adaptive::target(0), MIN_PARITY);
+        assert_eq!(Adaptive::target(0, MAX_PARITY), MIN_PARITY);
 
         // 随丢包上升，目标必须是单调不减的（不会出现"丢包更多反而冗余更少"）。
         let mut previous = MIN_PARITY;
         let mut loss = 0u32;
         while loss <= 600_000 {
-            let target = Adaptive::target(loss);
+            let target = Adaptive::target(loss, MAX_PARITY);
             assert!(
                 target >= previous,
                 "target must not decrease as loss grows (loss={loss}, {previous} -> {target})"
@@ -2687,7 +2723,7 @@ mod tests {
 
         // 关键结论：块状 RS 在高丢包下边际收益极差，所以"最优 k"必须严格小于
         // 上限——这正是本次改动要修的那类"无脑拉满冗余"。20% 丢包是实测工况。
-        let at_20pct = Adaptive::target(200_000);
+        let at_20pct = Adaptive::target(200_000, MAX_PARITY);
         assert!(
             at_20pct < MAX_PARITY,
             "at 20% loss the goodput-optimal parity must be below the ceiling, got {at_20pct}"
@@ -2695,7 +2731,26 @@ mod tests {
         assert!(at_20pct >= MIN_PARITY);
 
         // 而在极端丢包下它确实会向上限靠拢（此时更多冗余仍是最优的）。
-        assert_eq!(Adaptive::target(900_000), MAX_PARITY);
+        assert_eq!(Adaptive::target(900_000, MAX_PARITY), MAX_PARITY);
+    }
+
+    /// The measured optimum on this link is parity 1 (§10.13): parity 5 cost 50 %
+    /// overhead and still lost data, delivering 40.9 % less median goodput. No
+    /// loss-based rule finds that, so an operator who has measured their own link
+    /// can bound the model instead of trusting it.
+    #[test]
+    fn fec_target_respects_the_configured_ceiling() {
+        for loss in [0u32, 50_000, 200_000, 900_000] {
+            assert_eq!(
+                Adaptive::target(loss, MIN_PARITY),
+                MIN_PARITY,
+                "a ceiling at the floor must pin the target there (loss={loss})"
+            );
+            assert!(
+                Adaptive::target(loss, 3) <= 3,
+                "the ceiling must bound the target (loss={loss})"
+            );
+        }
     }
 
     #[test]
@@ -2802,6 +2857,7 @@ mod tests {
     fn adaptive_ignores_unavailable_loss_samples() {
         let mut a = Adaptive {
             parity: 2,
+            max_parity: MAX_PARITY,
             bad: 1,
             good: 7,
             last_loss_ppm: 80_000,
