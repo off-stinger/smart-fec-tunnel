@@ -27,7 +27,7 @@ jobs:
         run: bash -n deploy/*.sh && python3 -m json.tool configs/sing-box-deployment.example.json >/dev/null
       - name: Static build
         run: cargo build --release --target x86_64-unknown-linux-musl
-      - name: Loss recovery integration test
+      - name: V3 loopback integration test
         env:
           SMART_FEC_BIN: ./target/x86_64-unknown-linux-musl/release/smart-fec-tunnel
         run: python3 tests/integration_loopback.py

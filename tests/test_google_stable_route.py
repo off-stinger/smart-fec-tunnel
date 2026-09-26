@@ -10,25 +10,54 @@ SPEC.loader.exec_module(MODULE)
 
 
 class GoogleRouteTests(unittest.TestCase):
-    def test_rule_shape_and_domains(self):
+    def test_rule_routes_google_and_youtube_via_warp_balance(self):
+        rule = MODULE.build_rule()
+        self.assertEqual(rule["outbound"], "warp-balance")
+        self.assertEqual(rule["action"], "route")
+        self.assertNotIn("ip_cidr", rule)
         self.assertIn("google.com", MODULE.DOMAINS)
-        self.assertNotIn("youtube.com", MODULE.DOMAINS)
+        self.assertIn("youtube.com", MODULE.DOMAINS)
+        self.assertIn("googlevideo.com", MODULE.DOMAINS)
 
-    def test_subtracts_cloud_ranges(self):
-        import ipaddress
+    def test_legacy_direct_rule_is_replaced(self):
+        self.assertTrue(MODULE.is_managed({
+            "domain_suffix": MODULE.DOMAINS,
+            "action": "route",
+            "outbound": "direct",
+        }))
 
-        source = [ipaddress.ip_network("192.0.2.0/24")]
-        excluded = [ipaddress.ip_network("192.0.2.0/25")]
-        self.assertEqual(
-            MODULE.subtract_networks(source, excluded),
-            [ipaddress.ip_network("192.0.2.128/25")],
-        )
+    def test_partial_legacy_direct_rule_is_removed(self):
+        config = {"route": {"rules": [
+            {"domain_suffix": ["google.com", "googleapis.com"], "action": "route", "outbound": "direct"},
+            {"network": "tcp", "action": "route", "outbound": "warp-balance"},
+        ]}}
+        # Exercise the same preservation predicate used by main without network access.
+        rules = config["route"]["rules"]
+        kept = [item for item in rules if not (
+            item.get("action") == "route" and item.get("outbound") == "direct"
+            and any(domain in item.get("domain_suffix", []) for domain in MODULE.DOMAINS)
+        )]
+        self.assertEqual(kept, [rules[1]])
 
-    def test_handles_mixed_ip_versions(self):
-        import ipaddress
+    def test_main_generates_and_replaces_rule_without_network(self):
+        import json
+        import tempfile
+        from unittest.mock import patch
 
-        source = [ipaddress.ip_network("192.0.2.0/24"), ipaddress.ip_network("2001:db8::/32")]
-        self.assertEqual(MODULE.subtract_networks(source, []), source)
+        config = {"route": {"rules": [
+            {"domain_suffix": ["google.com"], "action": "route", "outbound": "direct"},
+            {"network": "tcp", "action": "route", "outbound": "warp-balance"},
+        ]}}
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "source.json"
+            output = pathlib.Path(directory) / "output.json"
+            source.write_text(json.dumps(config), encoding="utf-8")
+            with patch.object(MODULE.sys, "argv", [str(PATH), str(source), str(output)]):
+                self.assertEqual(MODULE.main(), 0)
+            result = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(result["route"]["rules"][0]["outbound"], "warp-balance")
+        self.assertIn("youtube.com", result["route"]["rules"][0]["domain_suffix"])
+        self.assertEqual(result["route"]["rules"][1], config["route"]["rules"][1])
 
 
 if __name__ == "__main__":

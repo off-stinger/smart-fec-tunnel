@@ -1,7 +1,7 @@
 # Smart Gateway 第一版产品说明书
 
 > 文档状态：第一版产品设计基线
-> 当前仓库版本：`smart-fec-tunnel 0.2.0-alpha.3`
+> 当前仓库版本：`smart-fec-tunnel 0.2.0-alpha.9`
 > 适用对象：部署管理员、OpenWrt/Passwall 用户、Windows/v2rayN 用户、开发与测试人员
 
 ## 1. 产品目标
@@ -32,7 +32,7 @@ Smart Gateway 的目标是把弱网恢复、加密代理、多出口调度和多
 |---|---|---|
 | Rust FEC 客户端/服务端 | 已实现 | V3 AEAD 加密信封、Reed-Solomon FEC、乱序与内存上限；V1/V2 仅用于迁移 |
 | UDP 速率整形 | 已实现 | 通过 `--rate-mbps` 配置；不是完整公平调度器 |
-| WARP TCP 按连接轮询 | 已实现 | 三个 SOCKS 上游；失败时尝试其他上游 |
+| WARP TCP 按连接调度 | 已实现 | 健康优先，按活跃连接数和 `www.gstatic.com:443` TCP 探测 EWMA 延迟排序；连续 2 次失败下线、2 次成功恢复，单条 TCP 流固定在已选出口，不叠加带宽 |
 | UDP 稳定 WARP | 已实现于 sing-box 示例 | 默认固定到 `warp-b`，不是动态健康决策 |
 | sing-box 无损合并 | 已实现 | 按托管 tag 合并并保留非托管配置 |
 | sing-box 校验与失败回滚 | 已实现 | 候选配置检查、原子替换、启动失败恢复 |
@@ -43,8 +43,8 @@ Smart Gateway 的目标是把弱网恢复、加密代理、多出口调度和多
 | Rust Controller/事务 Revision | Alpha 骨架 | 已有类型化 Profile、只读端口规划、候选验证与 Revision 回滚原语；部署适配仍在脚本中 |
 | Passwall 自动创建节点 | 第一版目标 | 当前需手工把 TUIC 指向本地 FEC 入口 |
 | Windows Agent/v2rayN 导入 | 第一版目标 | 当前未实现 |
-| QUIC 可靠有序载体 | Alpha 已实现 | `SMART_QUIC_STREAM_LANES=1`；直接承载 TUIC 时旁路 FEC，避免双重恢复 |
-| 自适应 FEC、PMTU | 第一版目标 | 仅用于不可靠 DATAGRAM 模式；当前参数不是完整闭环自适应 |
+| QUIC 可靠有序载体 | Alpha 实验能力 | 两端显式设置 `SMART_QUIC_STREAM_LANES=1`；直接承载 TUIC 时旁路 FEC，避免双重恢复；部署模板默认仍为 DATAGRAM，需先完成目标网络验收 |
+| 自适应 FEC、PMTU | Alpha 已实现（有限闭环） | FEC 反馈区分序列缺口与按窗口对齐的重建符号，获益样本会阻止 parity 过早降档；QUIC PMTU 动态分片已实现；参数仍须按真实链路验收 |
 | 内核能力检测与自动调优 | 第一版目标 | 当前未实现 |
 | MASQUE | 后续实验 | 当前未实现，默认关闭 |
 | DoQ | 后续实验 | 当前未实现，不能替代现有 DoH 默认链路 |
@@ -66,7 +66,7 @@ Passwall / 本地代理
 
 TCP/443 可以继续提供现有 Reality/VLESS；Smart FEC 默认使用 UDP/443。内部端口应只监听回环，不应开放到公网。
 
-实测发现，将 TUIC 依次嵌套在 FEC 与不可靠 QUIC DATAGRAM 中会放大重传和错误序号缺口。生产候选因此增加可靠有序载体模式：OpenWrt QUIC 客户端直接监听 `127.0.0.1:3333`，服务端 QUIC 直接转发到 sing-box TUIC 入站 `127.0.0.1:4443`，中间 FEC 进程保持停用。该模式配置如下：
+实测发现，将 TUIC 依次嵌套在 FEC 与不可靠 QUIC DATAGRAM 中会放大重传和错误序号缺口。可靠有序载体作为可选实验模式：OpenWrt QUIC 客户端监听 Passwall 指向的本地端口，服务端 QUIC 直接转发到 sing-box TUIC 入站，中间 FEC 进程保持停用。该模式必须两端一致配置并先在备用线路验收；systemd 模板默认 DATAGRAM，不代表可靠流模式已是所有网络的稳定生产默认值。
 
 ```text
 OpenWrt: SMART_QUIC_LOCAL_PORT=3333
@@ -76,7 +76,7 @@ OpenWrt: SMART_QUIC_LOCAL_PORT=3333
 
 多条可靠流的轮询实验会造成 TUIC 报文深度乱序，当前版本明确拒绝大于 `1` 的通道数。DATAGRAM+FEC 作为兼容/实验路径保留，但不再是本环境的推荐默认路径。
 
-监测中必须区分 QUIC 协议栈确认的 `wire_loss_ppm` 与 FEC 层的 `sequence_gap_ppm`。后者还可能包含乱序、迟到和会话切换，不能称为公网物理丢包率。少于 100 个已发送 QUIC 包的窗口不计算丢包百分比，只保留原始包数。
+监测中必须区分 QUIC 协议栈确认的 `wire_loss_ppm` 与 FEC 层的 `sequence_gap_ppm`。后者是经过重排序窗口结算的 SFT 帧缺口，可能包括数据、冗余或反馈帧，不能称为公网物理丢包率；`fec_recovered_symbols`/`fec_recovered_groups` 是独立的 FEC 重建结果。新反馈仍接受旧版 4 字节 loss 报告；旧版端点会忽略新版扩展反馈，所以要使用恢复收益自适应必须两端都升级。少于 100 个已发送 QUIC 包的窗口不计算 QUIC 丢包百分比，只保留原始包数。
 
 ## 4. 第一版产品架构
 
@@ -314,6 +314,6 @@ ESXi、虚拟网卡、低 vCPU 和低带宽服务器必须使用保守策略。3
 
 ## 15. 已知限制
 
-当前 `0.2.0-alpha.3` 默认使用 FEC V3：设备 ID、会话、序列和 FEC 参数均位于 XChaCha20-Poly1305 加密信封内；动态 shard 最大1380字节，使常见1200–1350字节 QUIC数据报保持单片，并降低小包固定长度特征。公网仍可观察不透明选择器、密文长度及时序；V1/V2 仅用于迁移。它仍不应作为未经压测和外部审计的多人商业服务直接部署：尚未实现用户级公平队列、选择器轮换、在线撤销/热加载、无效认证速率限制和 100 用户验收。
+当前 `0.2.0-alpha.9` 默认使用 FEC V3：设备 ID、会话、序列和 FEC 参数均位于 XChaCha20-Poly1305 加密信封内；动态 shard 最大1380字节，使常见1200–1350字节 QUIC数据报保持单片，并降低小包固定长度特征。公网仍可观察不透明选择器、密文长度及时序；V1/V2 仅用于迁移。它仍不应作为未经压测和外部审计的多人商业服务直接部署：尚未实现用户级公平队列、选择器轮换、在线撤销/热加载、无效认证速率限制和 100 用户验收。
 
 在用户级公平调度、凭据在线撤销、完整 Controller 部署适配及计划中的验收全部完成前，本版本保持 Alpha 内测定位。

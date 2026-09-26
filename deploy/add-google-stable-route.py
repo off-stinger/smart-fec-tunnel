@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Add an idempotent stable direct route for Google web properties."""
+"""Add an idempotent WARP route for Google web properties."""
 
 import json
-import ipaddress
 import sys
-from urllib.request import urlopen
 
 
 DOMAINS = [
@@ -13,50 +11,17 @@ DOMAINS = [
     "gstatic.com",
     "googleusercontent.com",
     "ggpht.com",
+    "youtube.com",
+    "youtube-nocookie.com",
+    "googlevideo.com",
+    "ytimg.com",
+    "youtubei.googleapis.com",
 ]
-RANGE_URLS = {
-    "goog": "https://www.gstatic.com/ipranges/goog.json",
-    "cloud": "https://www.gstatic.com/ipranges/cloud.json",
-}
-
-
-def load_networks(url):
-    with urlopen(url, timeout=15) as response:
-        data = json.load(response)
-    return [
-        ipaddress.ip_network(item.get("ipv4Prefix") or item.get("ipv6Prefix"))
-        for item in data["prefixes"]
-    ]
-
-
-def subtract_networks(source, excluded):
-    result = list(source)
-    for removal in excluded:
-        updated = []
-        for network in result:
-            if network.version != removal.version or not network.overlaps(removal):
-                updated.append(network)
-            elif removal.supernet_of(network) or removal == network:
-                continue
-            elif network.supernet_of(removal):
-                updated.extend(network.address_exclude(removal))
-            else:
-                raise ValueError(f"unexpected partial CIDR overlap: {network}, {removal}")
-        result = updated
-    ipv4 = ipaddress.collapse_addresses(item for item in result if item.version == 4)
-    ipv6 = ipaddress.collapse_addresses(item for item in result if item.version == 6)
-    return list(ipv4) + list(ipv6)
-
-
 def build_rule():
-    google = load_networks(RANGE_URLS["goog"])
-    cloud = load_networks(RANGE_URLS["cloud"])
-    service_ranges = subtract_networks(google, cloud)
     return {
         "domain_suffix": DOMAINS,
-        "ip_cidr": [str(item) for item in service_ranges],
         "action": "route",
-        "outbound": "direct",
+        "outbound": "warp-balance",
     }
 
 
@@ -64,7 +29,7 @@ def is_managed(item):
     return (
         item.get("domain_suffix") == DOMAINS
         and item.get("action") == "route"
-        and item.get("outbound") == "direct"
+        and item.get("outbound") in ("direct", "warp-balance")
     )
 
 
@@ -76,9 +41,21 @@ def main():
         config = json.load(handle)
     route = config.setdefault("route", {})
     rules = route.setdefault("rules", [])
-    rules[:] = [item for item in rules if not is_managed(item)]
+    rules[:] = [
+        item for item in rules
+        if not is_managed(item)
+        and not (
+            isinstance(item, dict)
+            and item.get("action") == "route"
+            and item.get("outbound") == "direct"
+            and any(domain in item.get("domain_suffix", []) for domain in DOMAINS)
+        )
+    ]
     position = next(
-        (index for index, item in enumerate(rules) if item.get("network") == "tcp"),
+        (
+            index for index, item in enumerate(rules)
+            if isinstance(item, dict) and item.get("network") in ("tcp", ["tcp"])
+        ),
         len(rules),
     )
     rules.insert(position, build_rule())

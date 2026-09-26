@@ -2,6 +2,8 @@
 set -eu
 
 BIN=${BIN:-target/debug/smart-fec-tunnel}
+QUIC_SERVER_BIN=${SMART_FEC_QUIC_SERVER_BIN:-$BIN}
+QUIC_CLIENT_BIN=${SMART_FEC_QUIC_CLIENT_BIN:-$BIN}
 TEST_DIR=$(mktemp -d)
 PIDS=""
 
@@ -41,17 +43,17 @@ PIDS="$PIDS $!"
 "$BIN" server --listen 127.0.0.1:18443 --upstream 127.0.0.1:19000 \
     --keyring "$TEST_DIR/keys" --rate-mbps 100 >"$TEST_DIR/fec-server.log" 2>&1 &
 PIDS="$PIDS $!"
-"$BIN" quic-server --listen 127.0.0.1:14443 --upstream 127.0.0.1:18443 \
+"$QUIC_SERVER_BIN" quic-server --listen 127.0.0.1:14443 --upstream 127.0.0.1:18443 \
     --cert "$TEST_DIR/cert.pem" --private-key "$TEST_DIR/key.pem" \
     --keyring "$TEST_DIR/keys" >"$TEST_DIR/quic-server.log" 2>&1 &
 QUIC_SERVER_PID=$!
 PIDS="$PIDS $QUIC_SERVER_PID"
-SMART_FEC_KEY="$SECRET" "$BIN" quic-client --listen 127.0.0.1:18444 \
+SMART_FEC_KEY="$SECRET" "$QUIC_CLIENT_BIN" quic-client --listen 127.0.0.1:18444 \
     --server 127.0.0.1:14443 --server-name localhost --ca-cert "$TEST_DIR/cert.pem" \
-    --key-id 1 >"$TEST_DIR/quic-client.log" 2>&1 &
+    --key-id 1 --key "$SECRET" >"$TEST_DIR/quic-client.log" 2>&1 &
 PIDS="$PIDS $!"
 SMART_FEC_KEY="$SECRET" "$BIN" client --listen 127.0.0.1:13333 \
-    --server 127.0.0.1:18444 --key-id 1 --rate-mbps 100 \
+    --server 127.0.0.1:18444 --key-id 1 --key "$SECRET" --rate-mbps 100 \
     >"$TEST_DIR/fec-client.log" 2>&1 &
 PIDS="$PIDS $!"
 
@@ -71,7 +73,7 @@ echo 'QUIC channel authentication verified'
 
 kill "$QUIC_SERVER_PID"
 wait "$QUIC_SERVER_PID" 2>/dev/null || true
-"$BIN" quic-server --listen 127.0.0.1:14443 --upstream 127.0.0.1:18443 \
+"$QUIC_SERVER_BIN" quic-server --listen 127.0.0.1:14443 --upstream 127.0.0.1:18443 \
     --cert "$TEST_DIR/cert.pem" --private-key "$TEST_DIR/key.pem" \
     --keyring "$TEST_DIR/keys" >>"$TEST_DIR/quic-server.log" 2>&1 &
 QUIC_SERVER_PID=$!

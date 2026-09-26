@@ -13,7 +13,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -22,6 +22,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{mpsc, Mutex},
+    task::JoinSet,
     time,
 };
 use tracing::{info, warn};
@@ -33,6 +34,8 @@ const VERSION_V3: u8 = 3;
 const KIND_DATA: u8 = 1;
 const KIND_PARITY: u8 = 2;
 const KIND_REPORT: u8 = 3;
+const FEEDBACK_V2_MAGIC: [u8; 4] = *b"SFR2";
+const FEEDBACK_V2_LEN: usize = 24;
 const HEADER: usize = 36;
 const HEADER_V2: usize = 44;
 const V3_SELECTOR: usize = 8; // selector 总长度 = 4 字节 key_id 哈希前缀 + 4 字节随机后缀
@@ -334,11 +337,11 @@ struct Adaptive {
 impl Adaptive {
     fn target(loss: u32) -> usize {
         match loss {
-            0..=9_999 => 0,           // <1%
-            10_000..=49_999 => 1,     // 1-5%
-            50_000..=99_999 => 2,     // 5-10%
-            100_000..=199_999 => 3,   // 10-20%
-            _ => 4,                   // >=20%
+            0..=9_999 => 0,         // <1%
+            10_000..=49_999 => 1,   // 1-5%
+            50_000..=99_999 => 2,   // 5-10%
+            100_000..=199_999 => 3, // 10-20%
+            _ => 4,                 // >=20%
         }
     }
     fn report(&mut self, loss: u32) {
@@ -407,6 +410,82 @@ impl Adaptive {
             self.good = 0;
         }
     }
+
+    fn report_feedback(&mut self, feedback: FecFeedback) {
+        match feedback {
+            FecFeedback::Legacy(loss) => self.report(loss),
+            FecFeedback::Sample(sample) => {
+                let parity_before = self.parity;
+                self.report(sample.sequence_gap_ppm);
+                // A useful reconstruction is evidence that the current code is
+                // buying delivery. Do not age parity downward on that same
+                // sample; still allow sustained severe loss to trigger bypass.
+                if sample.fec_recovered_symbols > 0 && !self.bypassed && self.parity < parity_before
+                {
+                    self.parity = parity_before;
+                    self.good = 0;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FeedbackSample {
+    sequence_gap_ppm: u32,
+    expected: u32,
+    missing: u32,
+    fec_recovered_symbols: u32,
+    fec_recovered_groups: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FecFeedback {
+    Legacy(u32),
+    Sample(FeedbackSample),
+}
+
+fn decode_fec_feedback(payload: &[u8]) -> Option<FecFeedback> {
+    if payload.len() == 4 {
+        return Some(FecFeedback::Legacy(u32::from_be_bytes(
+            payload.try_into().ok()?,
+        )));
+    }
+    if payload.len() != FEEDBACK_V2_LEN || payload[..4] != FEEDBACK_V2_MAGIC {
+        return None;
+    }
+    let read = |offset| u32::from_be_bytes(payload[offset..offset + 4].try_into().unwrap());
+    let sample = FeedbackSample {
+        sequence_gap_ppm: read(4),
+        expected: read(8),
+        missing: read(12),
+        fec_recovered_symbols: read(16),
+        fec_recovered_groups: read(20),
+    };
+    if sample.sequence_gap_ppm > 1_000_000
+        || sample.expected < 32
+        || sample.missing > sample.expected
+        || sample.fec_recovered_groups > sample.fec_recovered_symbols
+    {
+        return None;
+    }
+    let calculated_gap = ((sample.missing as u64 * 1_000_000) / sample.expected as u64) as u32;
+    (calculated_gap == sample.sequence_gap_ppm).then_some(FecFeedback::Sample(sample))
+}
+
+fn encode_fec_feedback(sample: &SequenceReport) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(FEEDBACK_V2_LEN);
+    payload.extend_from_slice(&FEEDBACK_V2_MAGIC);
+    payload.extend_from_slice(&sample.sequence_gap_ppm.to_be_bytes());
+    payload.extend_from_slice(&(sample.expected.min(u32::MAX as u64) as u32).to_be_bytes());
+    payload.extend_from_slice(&(sample.missing.min(u32::MAX as u64) as u32).to_be_bytes());
+    payload.extend_from_slice(
+        &(sample.fec_recovered_symbols.min(u32::MAX as u64) as u32).to_be_bytes(),
+    );
+    payload.extend_from_slice(
+        &(sample.fec_recovered_groups.min(u32::MAX as u64) as u32).to_be_bytes(),
+    );
+    payload
 }
 
 #[derive(Debug)]
@@ -465,6 +544,14 @@ impl Encoder {
         };
         self.sequence += 1;
         f
+    }
+    fn feedback_frame(&mut self, sample: Option<SequenceReport>) -> Frame {
+        let mut frame = self
+            .report_frame(sample.map_or(LOSS_SAMPLE_UNAVAILABLE, |sample| sample.sequence_gap_ppm));
+        if let Some(sample) = sample {
+            frame.payload = encode_fec_feedback(&sample);
+        }
+        frame
     }
     fn encode_datagram(&mut self, payload: &[u8]) -> Result<Vec<Frame>> {
         let packet_id = self.packet;
@@ -571,6 +658,7 @@ impl Encoder {
 #[derive(Debug)]
 struct Group {
     created: Instant,
+    start_sequence: u64,
     data: usize,
     parity: usize,
     shards: Vec<Option<Vec<u8>>>,
@@ -588,7 +676,11 @@ struct SequenceReport {
     expected: u64,
     received: u64,
     missing: u64,
+    /// Sequence gaps are observed wire-frame gaps, not necessarily unrecovered
+    /// application datagrams. Recovery events are aligned to this finalized window.
     sequence_gap_ppm: u32,
+    fec_recovered_symbols: u64,
+    fec_recovered_groups: u64,
     late: u64,
     duplicates: u64,
 }
@@ -601,6 +693,7 @@ struct Decoder {
     seen_sequences: BTreeSet<u64>,
     late_sequences: u64,
     duplicate_sequences: u64,
+    fec_recovery_events: BTreeMap<u64, (u64, u64)>,
     groups: BTreeMap<u64, Group>,
     packets: HashMap<u64, Reassembly>,
 }
@@ -614,6 +707,7 @@ impl Decoder {
             seen_sequences: BTreeSet::new(),
             late_sequences: 0,
             duplicate_sequences: 0,
+            fec_recovery_events: BTreeMap::new(),
             groups: BTreeMap::new(),
             packets: HashMap::new(),
         }
@@ -656,11 +750,27 @@ impl Decoder {
         let gap_ppm = ((missing as u128 * 1_000_000) / expected as u128) as u32;
         self.seen_sequences = self.seen_sequences.split_off(&(cutoff + 1));
         self.finalized_sequence = cutoff;
+        let future_recoveries = self
+            .fec_recovery_events
+            .split_off(&cutoff.saturating_add(1));
+        let finalized_recoveries =
+            std::mem::replace(&mut self.fec_recovery_events, future_recoveries);
+        let (fec_recovered_symbols, fec_recovered_groups) = finalized_recoveries.values().fold(
+            (0u64, 0u64),
+            |(symbols, groups), (next_symbols, next_groups)| {
+                (
+                    symbols.saturating_add(*next_symbols),
+                    groups.saturating_add(*next_groups),
+                )
+            },
+        );
         let report = SequenceReport {
             expected,
             received,
             missing,
             sequence_gap_ppm: gap_ppm.min(1_000_000),
+            fec_recovered_symbols,
+            fec_recovered_groups,
             late: std::mem::take(&mut self.late_sequences),
             duplicates: std::mem::take(&mut self.duplicate_sequences),
         };
@@ -729,15 +839,21 @@ impl Decoder {
             bail!("too many fec groups")
         }
         let pos = frame.index as usize;
+        let group_start_sequence = frame
+            .sequence
+            .checked_sub(pos as u64)
+            .filter(|sequence| *sequence > 0)
+            .context("invalid FEC group sequence")?;
         let (immediate, recovered) = {
             let g = self.groups.entry(frame.group).or_insert_with(|| Group {
                 created: Instant::now(),
+                start_sequence: group_start_sequence,
                 data,
                 parity,
                 shards: vec![None; data + parity],
                 delivered: vec![false; data],
             });
-            if g.data != data || g.parity != parity {
+            if g.data != data || g.parity != parity || g.start_sequence != group_start_sequence {
                 bail!("group mismatch")
             }
             if g.shards[pos].is_none() {
@@ -752,6 +868,12 @@ impl Decoder {
             let present = g.shards.iter().filter(|x| x.is_some()).count();
             let mut recovered = Vec::new();
             if parity > 0 && present >= data && g.delivered.iter().any(|x| !*x) {
+                let recovered_indices = g
+                    .delivered
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, delivered)| (!*delivered).then_some(index))
+                    .collect::<Vec<_>>();
                 let rs = ReedSolomon::new(data, parity)?;
                 rs.reconstruct(&mut g.shards)?;
                 recovered = (0..data)
@@ -760,6 +882,20 @@ impl Decoder {
                     .collect();
                 for i in 0..data {
                     g.delivered[i] = true;
+                }
+                for index in &recovered_indices {
+                    let event = self
+                        .fec_recovery_events
+                        .entry(g.start_sequence.saturating_add(*index as u64))
+                        .or_insert((0, 0));
+                    event.0 = event.0.saturating_add(1);
+                }
+                if let Some(last_index) = recovered_indices.last() {
+                    let event = self
+                        .fec_recovery_events
+                        .entry(g.start_sequence.saturating_add(*last_index as u64))
+                        .or_insert((0, 0));
+                    event.1 = event.1.saturating_add(1);
                 }
             }
             (immediate, recovered)
@@ -960,11 +1096,7 @@ async fn client(
         .context("bind client listen")?;
     let tunnel = UdpSocket::bind("0.0.0.0:0").await?;
     tunnel.connect(server).await?;
-    let encoder = Arc::new(Mutex::new(Encoder::with_identity(
-        session,
-        version,
-        key_id,
-    )));
+    let encoder = Arc::new(Mutex::new(Encoder::with_identity(session, version, key_id)));
     let mut decoder = Decoder::new(session);
     let mut app_peer = None;
     let mut local_buf = vec![0u8; 65535];
@@ -986,10 +1118,13 @@ async fn client(
                     Ok(f) if f.version != version || f.key_id != key_id || f.session != session => {
                         warn!("discard frame for different identity or session");
                     }
-                    Ok(f) if f.kind == KIND_REPORT && f.payload.len() == 4 => {
+                    Ok(f) if f.kind == KIND_REPORT => {
                         if decoder.observe_seq(f.sequence) {
-                            let loss = u32::from_be_bytes(f.payload[..4].try_into().unwrap());
-                            encoder.lock().await.adaptive.report(loss);
+                            if let Some(feedback) = decode_fec_feedback(&f.payload) {
+                                encoder.lock().await.adaptive.report_feedback(feedback);
+                            } else {
+                                warn!(payload_len=f.payload.len(), "discard invalid FEC feedback");
+                            }
                         }
                     }
                     Ok(f) => match decoder.frame(f) {
@@ -1003,7 +1138,7 @@ async fn client(
                 let report = decoder.sequence_report();
                 let mut enc = encoder.lock().await;
                 let parity = enc.adaptive.parity;
-                let f = enc.report_frame(report.map_or(LOSS_SAMPLE_UNAVAILABLE, |sample| sample.sequence_gap_ppm));
+                let f = enc.feedback_frame(report);
                 drop(enc); send_frames(&tunnel, None, vec![f], &key, &mut pacer).await?;
                 if let Some(sample) = report {
                     info!(
@@ -1011,6 +1146,9 @@ async fn client(
                         expected=sample.expected,
                         received=sample.received,
                         missing=sample.missing,
+                        fec_recovered_symbols=sample.fec_recovered_symbols,
+                        fec_recovered_groups=sample.fec_recovered_groups,
+                        fec_counter_scope="finalized_sequence_window",
                         late=sample.late,
                         duplicates=sample.duplicates,
                         tx_parity=parity,
@@ -1116,9 +1254,13 @@ async fn run_server_session(
                 if frame.session != runtime.session || frame.version != runtime.version || frame.key_id != runtime.key_id {
                     continue;
                 }
-                if frame.kind == KIND_REPORT && frame.payload.len() == 4 {
+                if frame.kind == KIND_REPORT {
                     if decoder.observe_seq(frame.sequence) {
-                        encoder.adaptive.report(u32::from_be_bytes(frame.payload[..4].try_into().unwrap()));
+                        if let Some(feedback) = decode_fec_feedback(&frame.payload) {
+                            encoder.adaptive.report_feedback(feedback);
+                        } else {
+                            warn!(payload_len=frame.payload.len(), "discard invalid FEC feedback");
+                        }
                     }
                 } else {
                     match decoder.frame(frame) {
@@ -1149,7 +1291,7 @@ async fn run_server_session(
                     info!(tx_parity = parity, "server FEC parity changed");
                     last_logged_parity = parity;
                 }
-                let frame = encoder.report_frame(report.map_or(LOSS_SAMPLE_UNAVAILABLE, |sample| sample.sequence_gap_ppm));
+                let frame = encoder.feedback_frame(report);
                 send_session_frames(&runtime.public, peer.unwrap(), vec![frame], &runtime.key, &runtime.pacer).await;
             }
             _ = flush.tick(), if peer.is_some() => {
@@ -1292,6 +1434,95 @@ struct BalanceUpstream {
     address: SocketAddr,
     healthy: AtomicBool,
     active: AtomicUsize,
+    consecutive_failures: AtomicU8,
+    consecutive_successes: AtomicU8,
+    latency_ewma_us: AtomicU64,
+}
+
+impl BalanceUpstream {
+    fn record_success(&self, latency: Option<Duration>) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        let successes = self
+            .consecutive_successes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            })
+            .unwrap_or(0)
+            .saturating_add(1);
+        if successes >= 2 {
+            self.healthy.store(true, Ordering::Relaxed);
+        }
+
+        if let Some(latency) = latency {
+            let sample = latency.as_micros().clamp(1, u64::MAX as u128) as u64;
+            let _ = self.latency_ewma_us.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |previous| {
+                    Some(
+                        if previous == 0 {
+                            sample
+                        } else {
+                            previous.saturating_mul(7).saturating_add(sample) / 8
+                        }
+                        .max(1),
+                    )
+                },
+            );
+        }
+    }
+
+    fn record_failure(&self) {
+        self.consecutive_successes.store(0, Ordering::Relaxed);
+        let failures = self
+            .consecutive_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            })
+            .unwrap_or(0)
+            .saturating_add(1);
+        if failures >= 2 {
+            self.healthy.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn reserve(&self) {
+        let _ = self
+            .active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            });
+    }
+
+    fn release(&self) {
+        let _ = self
+            .active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
+    }
+}
+
+fn balance_order(upstreams: &[BalanceUpstream], cursor: usize, healthy_only: bool) -> Vec<usize> {
+    let count = upstreams.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let start = cursor % count;
+    let mut candidates = (0..count)
+        .filter(|index| !healthy_only || upstreams[*index].healthy.load(Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|index| {
+        let state = &upstreams[*index];
+        let latency = state.latency_ewma_us.load(Ordering::Relaxed);
+        (
+            state.active.load(Ordering::Relaxed),
+            latency == 0,
+            latency,
+            (*index + count - start) % count,
+        )
+    });
+    candidates
 }
 
 async fn read_socks_address(stream: &mut TcpStream, atyp: u8) -> Result<Vec<u8>> {
@@ -1376,21 +1607,24 @@ async fn handle_balanced_client(
     let start = cursor.fetch_add(1, Ordering::Relaxed) % upstreams.len();
     let mut chosen = None;
     let mut last_error = None;
+    let mut attempted = vec![false; upstreams.len()];
     for healthy_only in [true, false] {
-        for offset in 0..upstreams.len() {
-            let index = (start + offset) % upstreams.len();
-            let state = &upstreams[index];
-            if healthy_only && !state.healthy.load(Ordering::Relaxed) {
+        for index in balance_order(&upstreams, start, healthy_only) {
+            if attempted[index] {
                 continue;
             }
+            attempted[index] = true;
+            let state = &upstreams[index];
+            state.reserve();
             match socks_connect(state.address, &request).await {
                 Ok((stream, response)) => {
-                    state.healthy.store(true, Ordering::Relaxed);
+                    state.record_success(None);
                     chosen = Some((index, stream, response));
                     break;
                 }
                 Err(error) => {
-                    state.healthy.store(false, Ordering::Relaxed);
+                    state.release();
+                    state.record_failure();
                     last_error = Some(error);
                 }
             }
@@ -1403,10 +1637,12 @@ async fn handle_balanced_client(
         client.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
         return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no healthy WARP upstream")));
     };
-    client.write_all(&response).await?;
-    upstreams[index].active.fetch_add(1, Ordering::Relaxed);
-    let copied = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
-    upstreams[index].active.fetch_sub(1, Ordering::Relaxed);
+    let copied = async {
+        client.write_all(&response).await?;
+        tokio::io::copy_bidirectional(&mut client, &mut remote).await
+    }
+    .await;
+    upstreams[index].release();
     copied?;
     Ok(())
 }
@@ -1425,6 +1661,9 @@ async fn balance(listen: SocketAddr, addresses: Vec<SocketAddr>) -> Result<()> {
                 address,
                 healthy: AtomicBool::new(true),
                 active: AtomicUsize::new(0),
+                consecutive_failures: AtomicU8::new(0),
+                consecutive_successes: AtomicU8::new(0),
+                latency_ewma_us: AtomicU64::new(0),
             })
             .collect::<Vec<_>>(),
     );
@@ -1433,11 +1672,32 @@ async fn balance(listen: SocketAddr, addresses: Vec<SocketAddr>) -> Result<()> {
     tokio::spawn(async move {
         let request = [&[5, 1, 0, 3, 15][..], b"www.gstatic.com", &[0x01, 0xbb]].concat();
         let mut interval = time::interval(Duration::from_secs(10));
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            for state in health_upstreams.iter() {
-                let healthy = socks_connect(state.address, &request).await.is_ok();
-                state.healthy.store(healthy, Ordering::Relaxed);
+            let mut probes = JoinSet::new();
+            for index in 0..health_upstreams.len() {
+                let states = health_upstreams.clone();
+                let request = request.clone();
+                probes.spawn(async move {
+                    let started = Instant::now();
+                    match time::timeout(
+                        Duration::from_secs(4),
+                        socks_connect(states[index].address, &request),
+                    )
+                    .await
+                    {
+                        Ok(Ok((_stream, _response))) => {
+                            states[index].record_success(Some(started.elapsed()))
+                        }
+                        _ => states[index].record_failure(),
+                    }
+                });
+            }
+            while let Some(result) = probes.join_next().await {
+                if let Err(error) = result {
+                    warn!(%error, "WARP health probe task failed");
+                }
             }
         }
     });
@@ -1512,6 +1772,49 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_balance_upstream(
+        port: u16,
+        healthy: bool,
+        active: usize,
+        latency_ewma_us: u64,
+    ) -> BalanceUpstream {
+        BalanceUpstream {
+            address: SocketAddr::from(([127, 0, 0, 1], port)),
+            healthy: AtomicBool::new(healthy),
+            active: AtomicUsize::new(active),
+            consecutive_failures: AtomicU8::new(0),
+            consecutive_successes: AtomicU8::new(0),
+            latency_ewma_us: AtomicU64::new(latency_ewma_us),
+        }
+    }
+
+    #[test]
+    fn balance_prefers_healthy_low_load_and_low_latency() {
+        let states = vec![
+            test_balance_upstream(1, true, 2, 10_000),
+            test_balance_upstream(2, true, 1, 80_000),
+            test_balance_upstream(3, true, 1, 20_000),
+            test_balance_upstream(4, false, 0, 1_000),
+        ];
+        assert_eq!(balance_order(&states, 0, true), vec![2, 1, 0]);
+        assert_eq!(balance_order(&states, 0, false)[0], 3);
+    }
+
+    #[test]
+    fn balance_health_uses_two_success_or_failure_hysteresis() {
+        let state = test_balance_upstream(1, true, 0, 0);
+        state.record_failure();
+        assert!(state.healthy.load(Ordering::Relaxed));
+        state.record_failure();
+        assert!(!state.healthy.load(Ordering::Relaxed));
+        state.record_success(Some(Duration::from_millis(20)));
+        assert!(!state.healthy.load(Ordering::Relaxed));
+        state.record_success(Some(Duration::from_millis(40)));
+        assert!(state.healthy.load(Ordering::Relaxed));
+        assert_eq!(state.latency_ewma_us.load(Ordering::Relaxed), 22_500);
+    }
+
     #[test]
     fn frame_auth_roundtrip() {
         let k = key("test");
@@ -1586,6 +1889,56 @@ mod tests {
         assert!(decode_server_frame(&tampered, None, &HashMap::new(), &selectors).is_err());
     }
     #[test]
+    fn fec_feedback_accepts_legacy_and_validates_v2_samples() {
+        assert_eq!(
+            decode_fec_feedback(&1234u32.to_be_bytes()),
+            Some(FecFeedback::Legacy(1234))
+        );
+        let sample = SequenceReport {
+            expected: 1000,
+            received: 990,
+            missing: 10,
+            sequence_gap_ppm: 10_000,
+            fec_recovered_symbols: 2,
+            fec_recovered_groups: 1,
+            late: 0,
+            duplicates: 0,
+        };
+        let payload = encode_fec_feedback(&sample);
+        assert_eq!(payload.len(), FEEDBACK_V2_LEN);
+        assert_eq!(
+            decode_fec_feedback(&payload),
+            Some(FecFeedback::Sample(FeedbackSample {
+                sequence_gap_ppm: 10_000,
+                expected: 1000,
+                missing: 10,
+                fec_recovered_symbols: 2,
+                fec_recovered_groups: 1,
+            }))
+        );
+        let mut invalid = payload;
+        invalid[7] ^= 1;
+        assert_eq!(decode_fec_feedback(&invalid), None);
+        assert_eq!(decode_fec_feedback(&[0; 8]), None);
+
+        // Reconstructed symbols can also represent useful early recovery from
+        // reordering even when the finalized wire-gap window later closes to 0.
+        let reordered = SequenceReport {
+            expected: 1000,
+            received: 1000,
+            missing: 0,
+            sequence_gap_ppm: 0,
+            fec_recovered_symbols: 1,
+            fec_recovered_groups: 1,
+            late: 0,
+            duplicates: 0,
+        };
+        assert!(matches!(
+            decode_fec_feedback(&encode_fec_feedback(&reordered)),
+            Some(FecFeedback::Sample(_))
+        ));
+    }
+    #[test]
     fn keyring_rejects_reserved_duplicate_and_short_entries() {
         assert!(parse_keyring("0 a-very-long-secret").is_err());
         assert!(parse_keyring("1 too-short").is_err());
@@ -1655,6 +2008,23 @@ mod tests {
             a.report(1_000_000);
         }
         assert_eq!(a.parity, 0);
+    }
+    #[test]
+    fn adaptive_keeps_parity_when_feedback_confirms_recovery() {
+        let mut adaptive = Adaptive {
+            parity: 1,
+            good: 14,
+            ..Adaptive::default()
+        };
+        adaptive.report_feedback(FecFeedback::Sample(FeedbackSample {
+            sequence_gap_ppm: 10_000,
+            expected: 1000,
+            missing: 10,
+            fec_recovered_symbols: 1,
+            fec_recovered_groups: 1,
+        }));
+        assert_eq!(adaptive.parity, 1);
+        assert_eq!(adaptive.good, 0);
     }
     #[test]
     fn adaptive_reacts_to_bursty_loss() {
@@ -1768,12 +2138,64 @@ mod tests {
         let mut output = Vec::new();
         for f in all
             .into_iter()
-            .filter(|f| !(f.kind == KIND_DATA && f.index == 4))
+            .filter(|f| !(f.kind == KIND_DATA && matches!(f.index, 4 | 5)))
         {
             output.extend(dec.frame(f).unwrap());
         }
         assert_eq!(output.len(), 10);
         assert!(output.iter().any(|x| x == &vec![4u8; 20]));
+        assert!(output.iter().any(|x| x == &vec![5u8; 20]));
+    }
+    #[test]
+    fn sequence_report_distinguishes_wire_gaps_from_fec_recovery() {
+        let mut enc = Encoder::new(9);
+        enc.adaptive.parity = 2;
+        let mut dec = Decoder::new(9);
+        for group in 0..10u8 {
+            let mut frames = Vec::new();
+            for _ in 0..DATA_SHARDS {
+                frames.extend(enc.encode_datagram(&[group; 20]).unwrap());
+            }
+            for frame in frames.into_iter().filter(|frame| {
+                !(matches!(group, 0 | 9) && frame.kind == KIND_DATA && matches!(frame.index, 4 | 5))
+            }) {
+                dec.frame(frame).unwrap();
+            }
+        }
+
+        let report = dec.sequence_report().unwrap();
+        assert_eq!(report.missing, 2);
+        assert_eq!(report.fec_recovered_symbols, 2);
+        assert_eq!(report.fec_recovered_groups, 1);
+        assert!(dec.sequence_report().is_none());
+        for group in 10..20u8 {
+            for _ in 0..DATA_SHARDS {
+                for frame in enc.encode_datagram(&[group; 20]).unwrap() {
+                    dec.frame(frame).unwrap();
+                }
+            }
+        }
+        let next = dec.sequence_report().unwrap();
+        assert_eq!(next.fec_recovered_symbols, 2);
+        assert_eq!(next.fec_recovered_groups, 1);
+        assert!(dec.sequence_report().is_none());
+    }
+    #[test]
+    fn decoder_rejects_fec_group_indexes_before_sequence_baseline() {
+        let mut decoder = Decoder::new(9);
+        let frame = Frame {
+            version: VERSION_V3,
+            key_id: 7,
+            kind: KIND_DATA,
+            session: 9,
+            sequence: 1,
+            group: 1,
+            index: 1,
+            data: 2,
+            parity: 1,
+            payload: vec![0; FRAGMENT_HEADER],
+        };
+        assert!(decoder.frame(frame).is_err());
     }
     #[test]
     fn reorder_window_does_not_report_loss() {

@@ -19,6 +19,7 @@ set -eu
 config=/etc/sing-box/config.json
 candidate=$config.google-auto-new
 lock=/run/smart-fec-google-route.lock
+backup=
 
 if ! mkdir "$lock" 2>/dev/null; then
     echo "Google route update is already running" >&2
@@ -28,15 +29,31 @@ cleanup() {
     rm -f "$candidate"
     rmdir "$lock" 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+rollback() {
+    if [ -n "$backup" ] && [ -f "$backup" ]; then
+        echo "Activation failed; restoring $backup" >&2
+        cp -a "$backup" "$config"
+        systemctl restart sing-box || true
+        exit 1
+    fi
+}
+trap 'rollback; cleanup' EXIT INT TERM
 
 [ -f "$config" ] || { echo "Missing $config" >&2; exit 1; }
 python3 /usr/local/lib/smart-fec/add-google-stable-route.py "$config" "$candidate"
 chmod 0600 "$candidate"
 sing-box check -c "$candidate"
+python3 - "$candidate" <<'PY'
+import json, sys
+d=json.load(open(sys.argv[1], encoding='utf-8'))
+rules=d.get('route',{}).get('rules',[])
+matches=[r for r in rules if 'google.com' in r.get('domain_suffix',[])]
+assert len(matches)==1 and matches[0].get('outbound')=='warp-balance'
+assert {'youtube.com','googlevideo.com'} <= set(matches[0]['domain_suffix'])
+PY
 
 if cmp -s "$config" "$candidate"; then
-    echo "Google service ranges unchanged"
+    echo "Google and YouTube WARP routes unchanged"
     exit 0
 fi
 
@@ -44,18 +61,16 @@ backup=/root/sing-box-google-auto-backup-$(date +%Y%m%d-%H%M%S).json
 cp -a "$config" "$backup"
 mv "$candidate" "$config"
 if ! systemctl restart sing-box || ! systemctl is-active --quiet sing-box; then
-    echo "Activation failed; restoring $backup" >&2
-    cp -a "$backup" "$config"
-    systemctl restart sing-box || true
-    exit 1
+    rollback
 fi
-echo "Google service routes updated. Backup: $backup"
+backup=
+echo "Google and YouTube WARP routes updated"
 EOF
 chmod 0755 /usr/local/sbin/smart-fec-update-google-route
 
 cat > /etc/systemd/system/smart-fec-google-route.service <<'EOF'
 [Unit]
-Description=Refresh stable Google egress routes from official ranges
+Description=Refresh stable Google and YouTube WARP routes
 After=network-online.target sing-box.service
 Wants=network-online.target
 
@@ -70,7 +85,7 @@ EOF
 
 cat > /etc/systemd/system/smart-fec-google-route.timer <<'EOF'
 [Unit]
-Description=Daily refresh of stable Google egress routes
+Description=Daily refresh of stable Google and YouTube WARP routes
 
 [Timer]
 OnBootSec=5min
@@ -88,4 +103,4 @@ systemctl daemon-reload
 systemctl enable --now smart-fec-google-route.timer
 systemctl start smart-fec-google-route.service
 systemctl is-active --quiet smart-fec-google-route.timer
-echo "Google route auto-updater installed"
+echo "Google/YouTube WARP route updater installed"

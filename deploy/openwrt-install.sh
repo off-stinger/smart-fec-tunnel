@@ -22,13 +22,31 @@ rate=${3:-30}
 case "$rate" in *[!0-9.]*|'') echo "Invalid rate: $rate" >&2; exit 1;; esac
 
 backup=/root/smart-fec-backup-$(date +%Y%m%d-%H%M%S)
-mkdir -p "$backup"
+mkdir -m 0700 "$backup"
+success=0
+was_active=0
+/etc/init.d/smart-fec-client status 2>/dev/null | grep -q running && was_active=1 || true
 [ ! -e /usr/bin/smart-fec-tunnel ] || cp -a /usr/bin/smart-fec-tunnel "$backup/"
 [ ! -e /etc/smart-fec.env ] || cp -a /etc/smart-fec.env "$backup/"
 [ ! -e /etc/init.d/smart-fec-client ] || cp -a /etc/init.d/smart-fec-client "$backup/"
 
-cp "$binary" /usr/bin/smart-fec-tunnel
-chmod 0755 /usr/bin/smart-fec-tunnel
+rollback() {
+    [ "$success" -eq 1 ] && return 0
+    echo "Installation failed; restoring previous OpenWrt Smart FEC files from $backup" >&2
+    rm -f /usr/bin/smart-fec-tunnel.new
+    for pair in "smart-fec-tunnel:/usr/bin/smart-fec-tunnel" "smart-fec.env:/etc/smart-fec.env" "smart-fec-client:/etc/init.d/smart-fec-client"; do
+        source=${pair%%:*}
+        target=${pair#*:}
+        if [ -e "$backup/$source" ]; then cp -a "$backup/$source" "$target"; else rm -f "$target"; fi
+    done
+    if [ "$was_active" -eq 1 ]; then /etc/init.d/smart-fec-client restart || true; else /etc/init.d/smart-fec-client stop || true; fi
+}
+trap rollback EXIT
+trap 'exit 1' HUP INT TERM
+
+cp "$binary" /usr/bin/smart-fec-tunnel.new
+chmod 0755 /usr/bin/smart-fec-tunnel.new
+mv -f /usr/bin/smart-fec-tunnel.new /usr/bin/smart-fec-tunnel
 umask 077
 {
     printf 'SMART_FEC_KEY=%s\n' "$SMART_FEC_KEY"
@@ -66,3 +84,4 @@ chmod 0755 /etc/init.d/smart-fec-client
 sleep 2
 /etc/init.d/smart-fec-client status | grep -q running
 echo "Installed successfully. Backup: $backup"
+success=1

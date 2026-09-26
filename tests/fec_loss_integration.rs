@@ -18,14 +18,6 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_smart-fec-tunnel")
 }
 
-fn reserve_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .expect("reserve port")
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// 确定性 LCG，避免给测试 crate 引入额外依赖。
 struct Lcg(u64);
 impl Lcg {
@@ -61,20 +53,17 @@ fn spawn_relay(stop: Arc<AtomicBool>, port: u16, server: SocketAddr, loss: f64, 
         let mut rng = Lcg(seed);
         let mut buf = [0u8; 65535];
         while !stop.load(Ordering::Relaxed) {
-            match sock.recv_from(&mut buf) {
-                Ok((n, peer)) => {
-                    let from_server = peer == server;
-                    if !from_server {
-                        client = Some(peer);
-                    }
-                    let target = if from_server { client } else { Some(server) };
-                    let Some(target) = target else { continue };
-                    if rng.next_f64() < loss {
-                        continue;
-                    }
-                    let _ = sock.send_to(&buf[..n], target);
+            if let Ok((n, peer)) = sock.recv_from(&mut buf) {
+                let from_server = peer == server;
+                if !from_server {
+                    client = Some(peer);
                 }
-                Err(_) => {}
+                let target = if from_server { client } else { Some(server) };
+                let Some(target) = target else { continue };
+                if rng.next_f64() < loss {
+                    continue;
+                }
+                let _ = sock.send_to(&buf[..n], target);
             }
         }
     });
@@ -97,7 +86,13 @@ impl Harness {
 
         let server_addr: SocketAddr = ([127, 0, 0, 1], server_port).into();
         spawn_echo(stop.clone(), echo_port);
-        spawn_relay(stop.clone(), relay_port, server_addr, loss, 0x9e37_79b9_7f4a_7c15);
+        spawn_relay(
+            stop.clone(),
+            relay_port,
+            server_addr,
+            loss,
+            0x9e37_79b9_7f4a_7c15,
+        );
 
         let mut env_base: Vec<(String, String)> = Vec::new();
         env_base.push(("SMART_FEC_KEY".to_string(), KEY.to_string()));
@@ -114,7 +109,8 @@ impl Harness {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&keyring_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&keyring_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
         }
 
         let spawn = |args: &[&str]| {
@@ -175,20 +171,28 @@ impl Harness {
         }
 
         let sock = UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
+        // Drain replies concurrently with the sender. Otherwise the host UDP
+        // receive queue can overflow while the test is still transmitting,
+        // which measures harness drops instead of tunnel behavior.
         sock.set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
-
-        for i in 0..count {
-            let mut payload = Vec::with_capacity(PAYLOAD_SIZE);
-            payload.extend_from_slice(&(i as u32).to_be_bytes());
-            payload.resize(PAYLOAD_SIZE, 0xab);
-            sock.send_to(&payload, ("127.0.0.1", self.client_port))
-                .unwrap();
-        }
+        let sender = sock.try_clone().expect("clone test socket");
+        let client_port = self.client_port;
+        let sending = thread::spawn(move || {
+            for i in 0..count {
+                let mut payload = Vec::with_capacity(PAYLOAD_SIZE);
+                payload.extend_from_slice(&(i as u32).to_be_bytes());
+                payload.resize(PAYLOAD_SIZE, 0xab);
+                sender
+                    .send_to(&payload, ("127.0.0.1", client_port))
+                    .unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
 
         let mut received = vec![false; count];
         let mut remaining = count;
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(12);
         let mut buf = [0u8; 65535];
         while remaining > 0 && Instant::now() < deadline {
             match sock.recv_from(&mut buf) {
@@ -203,6 +207,7 @@ impl Harness {
                 Err(_) => {}
             }
         }
+        sending.join().expect("sender thread");
         (count - remaining) as f64 / count as f64
     }
 }
@@ -227,7 +232,10 @@ fn force_parity_recovers_random_loss() {
     let with_fec = Harness::new(0.10, Some(2), 15555).measure(1000, 1.0, false);
 
     eprintln!("no-fec(parity=0)={no_fec:.3}  fec(parity=2)={with_fec:.3}");
-    assert!(no_fec > 0.75 && no_fec < 0.90, "unexpected no-fec arrival {no_fec}");
+    assert!(
+        no_fec > 0.75 && no_fec < 0.90,
+        "unexpected no-fec arrival {no_fec}"
+    );
     assert!(
         with_fec > no_fec + 0.08,
         "FEC should improve arrival substantially: no_fec={no_fec} fec={with_fec}"

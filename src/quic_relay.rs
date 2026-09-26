@@ -11,12 +11,13 @@ use crate::quic_auth::{
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use quinn::{
-    congestion::{Controller, ControllerFactory},
+    congestion::{Controller, ControllerFactory, NewReno, NewRenoConfig},
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     rustls::{self, pki_types::CertificateDer, pki_types::PrivateKeyDer},
     ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
 };
 use rand::RngCore;
+use rustls::pki_types::pem::PemObject;
 use std::{
     collections::HashMap,
     fs::File,
@@ -28,7 +29,7 @@ use std::{
 };
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Mutex, Semaphore},
     task::JoinSet,
     time,
 };
@@ -55,7 +56,6 @@ const STREAM_LANE_PREFACE: u8 = 0x53;
 // that the path is dead, so count any authenticated server datagram as evidence
 // that the carrier is alive while retaining fast failure detection.
 const CARRIER_DEAD_TIMEOUT: Duration = Duration::from_secs(6);
-const CARRIER_WINDOW: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CarrierStatsSnapshot {
@@ -120,51 +120,19 @@ fn parse_stream_lanes(value: Option<&str>) -> Result<usize> {
     Ok(lanes)
 }
 
-#[derive(Clone, Debug)]
-struct CarrierController {
-    window: u64,
-}
-
-impl Controller for CarrierController {
-    fn on_congestion_event(
-        &mut self,
-        _now: std::time::Instant,
-        _sent: std::time::Instant,
-        _is_persistent_congestion: bool,
-        _lost_bytes: u64,
-    ) {
-        // The encapsulated TUIC connection and SFT pacer already respond to
-        // congestion. Reducing this outer carrier window would punish the same
-        // loss twice and collapse throughput.
-    }
-
-    fn on_mtu_update(&mut self, _new_mtu: u16) {}
-
-    fn window(&self) -> u64 {
-        self.window
-    }
-
-    fn clone_box(&self) -> Box<dyn Controller> {
-        Box::new(self.clone())
-    }
-
-    fn initial_window(&self) -> u64 {
-        self.window
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
-        self
-    }
-}
-
 #[derive(Debug)]
 struct CarrierControllerFactory;
 
 impl ControllerFactory for CarrierControllerFactory {
-    fn build(self: Arc<Self>, _now: std::time::Instant, _current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(CarrierController {
-            window: CARRIER_WINDOW,
-        })
+    fn build(self: Arc<Self>, now: std::time::Instant, current_mtu: u16) -> Box<dyn Controller> {
+        // Use Quinn's maintained congestion controller. A fixed window that
+        // ignores losses can overload the path, even when the inner TUIC flow
+        // also has its own congestion controller.
+        let mtu = u64::from(current_mtu);
+        let initial_window = (10 * mtu).min((2 * mtu).max(14_720));
+        let mut config = NewRenoConfig::default();
+        config.initial_window(initial_window);
+        Box::new(NewReno::new(Arc::new(config), now, current_mtu))
     }
 }
 
@@ -321,10 +289,10 @@ fn exporter(connection: &Connection, nonce: &[u8; 16]) -> Result<[u8; 32]> {
 }
 
 fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(
+    let reader = BufReader::new(
         File::open(path).with_context(|| format!("open certificate {}", path.display()))?,
     );
-    let certificates: Vec<_> = rustls_pemfile::certs(&mut reader)
+    let certificates: Vec<_> = CertificateDer::pem_reader_iter(reader)
         .collect::<std::result::Result<_, _>>()
         .context("parse certificate PEM")?;
     if certificates.is_empty() {
@@ -334,12 +302,7 @@ fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| format!("open private key {}", path.display()))?,
-    );
-    rustls_pemfile::private_key(&mut reader)
-        .context("parse private key PEM")?
-        .context("private key file is empty")
+    PrivateKeyDer::from_pem_file(path).context("parse private key PEM")
 }
 
 fn server_endpoint(listen: SocketAddr, cert: &Path, private_key: &Path) -> Result<Endpoint> {
@@ -545,11 +508,20 @@ pub async fn run_server(
     let endpoint = server_endpoint(listen, cert, private_key)?;
     let keys = Arc::new(parse_keyring(keyring)?);
     let replays = Arc::new(Mutex::new(ReplayCache::new(DEFAULT_REPLAY_CAPACITY)?));
+    // Bound concurrent handshakes/relay tasks so unauthenticated connection
+    // floods cannot create an unbounded number of Tokio tasks and sockets.
+    let connection_slots = Arc::new(Semaphore::new(256));
     info!(%listen, %upstream, "SFT QUIC relay server started");
     while let Some(connecting) = endpoint.accept().await {
+        let permit = connection_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .context("QUIC connection semaphore closed")?;
         let keys = keys.clone();
         let replays = replays.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let result = async {
                 let connection = connecting.await?;
                 let device_id = authenticate_server(&connection, &keys, &replays).await?;
@@ -722,6 +694,15 @@ mod tests {
         for invalid in ["0", "2", "16", "invalid"] {
             assert!(parse_stream_lanes(Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn congestion_controller_uses_rfc_sized_initial_window() {
+        let factory = Arc::new(CarrierControllerFactory);
+        let controller = factory.clone().build(std::time::Instant::now(), 1472);
+        assert_eq!(controller.initial_window(), 14_720);
+        let controller = factory.build(std::time::Instant::now(), 1200);
+        assert_eq!(controller.initial_window(), 12_000);
     }
 
     #[test]
