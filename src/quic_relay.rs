@@ -541,18 +541,30 @@ const ADAPTIVE_PROBE_PPM: u64 = 50_000;
 /// which is the whole point, since the controller no longer decides whether a
 /// signal means congestion from the signal's size.
 const ADAPTIVE_TEST_DROP_PPM: u64 = 300_000;
-/// Intervals to observe at the reduced rate before concluding anything.
-const ADAPTIVE_TEST_INTERVALS: u32 = 4;
+/// Intervals observed at the reduced rate before concluding anything.
+///
+/// Six, not one. The previous version decided from a *single* post-drop
+/// interval, which on this link is a coin flip: measured loss jumps between
+/// 8 % and 35 % from one interval to the next, so "the next interval happened to
+/// be lower" was read as "the loss responded". The deployed log shows 12
+/// `test_confirm` against 14 `test_drop` -- congestion confirmed on noise -- and
+/// the controller ratcheted to the floor exactly like the bug it replaced.
+const ADAPTIVE_TEST_INTERVALS: u32 = 6;
 /// Intervals to hold after congestion is confirmed, before probing resumes.
 const ADAPTIVE_COOLDOWN_INTERVALS: u32 = 8;
-/// Loss below this is ignored outright (2 %): it is the noise floor of a path
-/// that is known to be lossy, and FEC is expected to repair it.
-const ADAPTIVE_MIN_SIGNIFICANT_LOSS_PPM: u64 = 20_000;
-/// How far loss must *fall* to count as having responded to the rate reduction
-/// (2 percentage points). This is the discriminator.
-const ADAPTIVE_LOSS_RESPONSE_MARGIN_PPM: u64 = 20_000;
+/// EWMA shift for the loss baseline: weight `1/2^shift` on the newest interval.
+/// Purely for the log line; loss does not steer the rate.
+const ADAPTIVE_BASELINE_SHIFT: u32 = 2;
 /// How far queueing must fall to count as having responded.
 const ADAPTIVE_QUEUE_RESPONSE_MARGIN: Duration = Duration::from_millis(10);
+/// Loss at or above this is treated as congestion regardless of whether it
+/// responds to slowing down (90 %).
+///
+/// Without this, "the loss did not respond so the path is merely lossy" taken to
+/// its logical end would hold the rate up on a path that is delivering almost
+/// nothing -- which is saturation or a dead path, not a lossy one. The learning
+/// path is for partial loss that is genuinely rate-independent.
+const ADAPTIVE_TOTAL_LOSS_PPM: u64 = 900_000;
 /// How far smoothed RTT may exceed the windowed minimum before it counts as
 /// queueing at all.
 const ADAPTIVE_QUEUE_TARGET: Duration = Duration::from_millis(25);
@@ -567,21 +579,20 @@ struct IntervalSample {
     app_limited: bool,
 }
 
-/// Which adverse signal opened the current test, so the right one is checked for
-/// a response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AdverseSignal {
-    Loss,
-    Queueing,
-}
-
 /// What the controller is currently doing.
+///
+/// There is no "loss" phase because loss does not drive the rate at all -- see
+/// [`AdaptiveRate`]. That is not a simplification for convenience: three
+/// deployed attempts to infer congestion from loss on this link failed (the
+/// size threshold collapsed to the floor, and the single-interval and
+/// window-averaged response tests both confirmed congestion on noise), because
+/// the signal being reasoned about is 20 % wide and does not respond to rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdaptPhase {
     /// Increasing gently.
     Steady,
-    /// Reduced the rate and is measuring whether the adverse signal responded.
-    Testing(AdverseSignal),
+    /// Reduced the rate and is measuring whether queueing responded.
+    Testing,
     /// Congestion confirmed; holding before probing again.
     Cooldown,
 }
@@ -590,41 +601,38 @@ enum AdaptPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AdaptState {
     target: u64,
-    /// Loss level this path has been **shown** not to respond to rate reduction.
+    /// Smoothed loss, maintained purely for logging and diagnosis.
     ///
-    /// This is the fix for the defect deployment exposed. The previous design
-    /// classified a signal as congestion by its *size* (a 5 % loss threshold),
-    /// which collapsed to the floor on this link's sustained 5-15 % random loss
-    /// and stayed there forever. A threshold cannot work here because the link
-    /// has at least three regimes and they overlap: 0.05-0.6 % (good WAN),
-    /// 5-15 % (bad WAN, still random), and 40-68 % (shaper).
-    ///
-    /// So the controller no longer asks "how big is this loss?" but "does this
-    /// loss go away when I slow down?". Only the second question distinguishes
-    /// congestion from a lossy path, it needs no per-link threshold, and it
-    /// makes RFC 9265's "path that is *known* to be lossy" an empirical finding
-    /// rather than an operator assertion.
-    unresponsive_loss_ppm: u64,
+    /// It deliberately does **not** influence the rate. Three deployed attempts
+    /// to infer congestion from loss on this link failed -- a size threshold
+    /// collapsed to the floor, and both a single-interval and a window-averaged
+    /// response test confirmed congestion on noise -- because the signal is
+    /// ~20 % wide, swings 8-35 % between adjacent intervals, and does not respond
+    /// to the sending rate at all. Reporting it is useful; steering on it is not.
+    baseline_loss_ppm: u64,
     phase: AdaptPhase,
     /// Intervals spent in the current phase.
     steps: u32,
-    /// Rate to restore if the test shows the signal was not congestion.
+    /// Rate to restore if the test shows queueing was not congestion.
     pre_test_rate: u64,
-    /// Signal levels measured just before the test drop.
-    pre_test_loss_ppm: u64,
+    /// Queueing measured when the test was opened: the reference the test
+    /// compares against.
     pre_test_queue: Duration,
+    /// Accumulated queueing over the test window, so the verdict rests on
+    /// `ADAPTIVE_TEST_INTERVALS` samples rather than one.
+    test_queue_sum_ms: u64,
 }
 
 impl AdaptState {
     fn new(target: u64) -> Self {
         Self {
             target,
-            unresponsive_loss_ppm: 0,
+            baseline_loss_ppm: 0,
             phase: AdaptPhase::Steady,
             steps: 0,
             pre_test_rate: target,
-            pre_test_loss_ppm: 0,
             pre_test_queue: Duration::ZERO,
+            test_queue_sum_ms: 0,
         }
     }
 }
@@ -632,13 +640,14 @@ impl AdaptState {
 /// Why the target moved. Kept as a value for logging and for tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdaptStep {
-    /// Adverse signal appeared: dropped the rate to test whether it responds.
+    /// Queueing appeared: dropped the rate to test whether it responds.
     TestDrop,
-    /// The signal fell after slowing down, so it was congestion: stay low.
+    /// Queueing fell after slowing down, so it was congestion: stay low.
     TestConfirm,
-    /// The signal did not fall, so it is not congestion: restore the rate and
-    /// remember this loss level so it stops triggering tests.
+    /// Queueing did not fall, so it was not congestion: restore the rate.
     TestRevert,
+    /// The path is delivering almost nothing: drop immediately, no test.
+    SaturationDrop,
     Probe,
     Hold,
 }
@@ -649,6 +658,7 @@ impl AdaptStep {
             AdaptStep::TestDrop => "test_drop",
             AdaptStep::TestConfirm => "test_confirm",
             AdaptStep::TestRevert => "test_revert",
+            AdaptStep::SaturationDrop => "saturation_drop",
             AdaptStep::Probe => "probe",
             AdaptStep::Hold => "hold",
         }
@@ -694,43 +704,47 @@ fn adapt_step(
     let loss = loss_ppm(sample.delivered_bytes, total);
     let queueing = sample.smoothed_rtt.saturating_sub(sample.base_rtt);
 
-    if let AdaptPhase::Testing(signal) = state.phase {
-        let responded = match signal {
-            AdverseSignal::Loss => {
-                loss.saturating_add(ADAPTIVE_LOSS_RESPONSE_MARGIN_PPM) < state.pre_test_loss_ppm
-            }
-            AdverseSignal::Queueing => {
-                queueing.saturating_add(ADAPTIVE_QUEUE_RESPONSE_MARGIN) < state.pre_test_queue
-            }
-        };
-        if responded {
-            // Congestion, confirmed by the only evidence that can confirm it:
-            // slowing down made the signal go away.
-            next.phase = AdaptPhase::Cooldown;
-            next.steps = 0;
-            // That loss was congestion, so it must not be recorded as a level
-            // this path tolerates.
-            next.unresponsive_loss_ppm = next.unresponsive_loss_ppm.min(loss);
-            return (next, AdaptStep::TestConfirm);
-        }
+    if state.phase == AdaptPhase::Testing {
+        next.test_queue_sum_ms = state
+            .test_queue_sum_ms
+            .saturating_add(queueing.as_millis() as u64);
         if state.steps.saturating_add(1) < ADAPTIVE_TEST_INTERVALS {
             next.steps = state.steps.saturating_add(1);
             return (next, AdaptStep::Hold);
         }
-        // The signal did not respond, so this is a lossy or jittery path rather
-        // than a congested one. Restore the rate and learn the level, so the
-        // same signal does not provoke another test. This is what prevents the
-        // collapse that deployment caught.
+        // Decide once, on the window's mean. Deciding early -- on the first
+        // post-drop interval -- is what made the earlier version confirm
+        // congestion on this link's interval-to-interval noise.
+        let window_queue =
+            Duration::from_millis(state.test_queue_sum_ms / u64::from(ADAPTIVE_TEST_INTERVALS));
+        next.test_queue_sum_ms = 0;
+        if window_queue.saturating_add(ADAPTIVE_QUEUE_RESPONSE_MARGIN) < state.pre_test_queue {
+            // Congestion, confirmed by the only evidence that can confirm it:
+            // slowing down made the queue drain.
+            next.phase = AdaptPhase::Cooldown;
+            next.steps = 0;
+            return (next, AdaptStep::TestConfirm);
+        }
+        // The queue did not drain, so it was not congestion. Restore the rate.
         next.phase = AdaptPhase::Steady;
         next.steps = 0;
         next.target = clamp(state.pre_test_rate);
-        next.unresponsive_loss_ppm = next.unresponsive_loss_ppm.max(state.pre_test_loss_ppm);
         return (next, AdaptStep::TestRevert);
     }
 
     if sample.app_limited {
         return (next, AdaptStep::Hold);
     }
+
+    // Loss is recorded but never steers: on this path it is ~20 % wide, swings
+    // 8-35 % between adjacent intervals, and does not respond to rate. See
+    // `AdaptState::baseline_loss_ppm`. The EWMA is seeded on first observation.
+    next.baseline_loss_ppm = if state.baseline_loss_ppm == 0 {
+        loss
+    } else {
+        let shift = u64::from(ADAPTIVE_BASELINE_SHIFT);
+        (state.baseline_loss_ppm * ((1 << shift) - 1) + loss) >> shift
+    };
 
     if state.phase == AdaptPhase::Cooldown {
         if state.steps.saturating_add(1) < ADAPTIVE_COOLDOWN_INTERVALS {
@@ -742,25 +756,22 @@ fn adapt_step(
         // Fall through to probing.
     }
 
-    // Judge the signal against what this path has *demonstrated* it tolerates,
-    // not against a fixed threshold.
-    let significant_loss = loss
-        > state
-            .unresponsive_loss_ppm
-            .max(ADAPTIVE_MIN_SIGNIFICANT_LOSS_PPM);
-    let signal = if significant_loss {
-        Some(AdverseSignal::Loss)
-    } else if queueing >= ADAPTIVE_QUEUE_TARGET {
-        Some(AdverseSignal::Queueing)
-    } else {
-        None
-    };
-    if let Some(signal) = signal {
-        next.phase = AdaptPhase::Testing(signal);
+    // Saturation guard. A path delivering almost nothing is not "merely lossy",
+    // and unlike partial loss it must not be reasoned about statistically --
+    // drop immediately rather than spending six intervals proving the obvious.
+    if loss >= ADAPTIVE_TOTAL_LOSS_PPM {
+        next.phase = AdaptPhase::Cooldown;
+        next.steps = 0;
+        next.target = clamp(scale_ppm(state.target, ADAPTIVE_TEST_DROP_PPM, false));
+        return (next, AdaptStep::SaturationDrop);
+    }
+
+    if queueing >= ADAPTIVE_QUEUE_TARGET {
+        next.phase = AdaptPhase::Testing;
         next.steps = 0;
         next.pre_test_rate = state.target;
-        next.pre_test_loss_ppm = loss;
         next.pre_test_queue = queueing;
+        next.test_queue_sum_ms = 0;
         next.target = clamp(scale_ppm(state.target, ADAPTIVE_TEST_DROP_PPM, false));
         return (next, AdaptStep::TestDrop);
     }
@@ -799,7 +810,7 @@ fn adaptive_window(
     bdp.max(FIXED_RATE_MIN_WINDOW_MTUS * mtu).max(1)
 }
 
-/// Budget-aware, delay-first adaptive carrier controller.
+/// Budget-aware, delay-only adaptive carrier controller.
 ///
 /// Deliberately **not** a capacity estimator. The server's egress is a known,
 /// hard 30.8 Mbps, so there is no capacity to discover; the only question is how
@@ -807,12 +818,25 @@ fn adaptive_window(
 /// "probe until something breaks", it is "probe toward the ceiling and retreat
 /// when the path pushes back".
 ///
-/// Signal choice is forced by the architecture, not by preference: RFC 9265
-/// section 5 says that with FEC below the transport, losses are hidden from the
-/// transport, which breaks *loss-based* detection but leaves *delay-based*
-/// detection intact. So delay is the primary signal and loss is only consulted
-/// for its *burstiness* -- the signature of a shaper rather than of the random
-/// corruption this link is known for.
+/// **Packet loss does not steer the rate at all**, and that conclusion was bought
+/// by measurement, not preference. Three loss-based designs were deployed on this
+/// link and all three collapsed to the 2 Mbps floor:
+///
+/// 1. a size threshold (5 % loss = congestion) -- the link has three overlapping
+///    regimes (0.05-0.6 %, 5-15 %, 40-68 %) so no threshold separates them;
+/// 2. a single-interval *response* test -- confirmed congestion on 12 of 14
+///    tests because loss swings 8-35 % between adjacent intervals;
+/// 3. a window-averaged response test against a smoothed baseline -- still
+///    collapsed, and the regression test using the real observed loss sequence
+///    reproduced it.
+///
+/// The signal simply does not carry the information: it is ~20 % wide, its
+/// interval-to-interval noise exceeds any response a 30 % rate change produces,
+/// and it is the ISP dropping packets rather than a queue filling. RFC 9265
+/// section 5 reaches the same place from the other direction -- with FEC below
+/// the transport, loss is the signal that gets hidden and delay is the one that
+/// survives. So delay is the *only* input, with a saturation guard for the one
+/// case where loss is unambiguous.
 #[derive(Debug, Clone)]
 struct AdaptiveRate {
     /// Hard ceiling on the effective send rate, bytes/s.
@@ -905,10 +929,10 @@ impl AdaptiveRate {
                     .smoothed_rtt
                     .saturating_sub(sample.base_rtt)
                     .as_millis() as u64,
-                // The learned "this path tolerates this much loss" level. Seeing
-                // it rise is how an operator knows the controller has stopped
-                // fighting non-congestion loss.
-                unresponsive_loss_ppm = next.unresponsive_loss_ppm,
+                // Recorded for diagnosis only; it never steers the rate. Seeing
+                // this track the path's actual loss is how an operator confirms
+                // the controller is not fighting non-congestion loss.
+                baseline_loss_ppm = next.baseline_loss_ppm,
                 "adaptive carrier target changed"
             );
         }
@@ -1310,9 +1334,11 @@ fn transport_config() -> Result<Arc<TransportConfig>> {
         CarrierController::Adaptive => info!(
             ?controller,
             max_rate_mbps = max_rate_mbps.unwrap_or(0),
-            "carrier congestion controller selected; delay-first with burst-loss backoff, \
+            "carrier congestion controller selected; delay-only with a response test, \
              hard-capped on the effective send rate so ACK-rate compensation cannot exceed \
-             the budget"
+             the budget. Packet loss does not steer the rate: measured on this path it is \
+             ~20 % wide, swings 8-35 % between adjacent intervals, and does not respond to \
+             rate, so all three loss-based designs tried here collapsed to the floor."
         ),
         _ => info!(?controller, "carrier congestion controller selected"),
     }
@@ -2273,44 +2299,129 @@ mod tests {
             state.target,
             floor
         );
-        // And it must have learned the level rather than re-testing forever.
+        // And loss must never open a test at all on this path: every step is a
+        // probe or a hold, never a test or a drop.
+        let mut state = AdaptState::new(ceiling / 2);
+        for _ in 0..200 {
+            let (next, step) = adapt_step(state, ceiling, floor, lossy);
+            assert!(
+                matches!(step, AdaptStep::Probe | AdaptStep::Hold),
+                "loss opened a rate test: {step:?}"
+            );
+            assert!(next.target >= state.target, "loss reduced the rate");
+            state = next;
+        }
+    }
+
+    /// Loss sequence captured from the live carrier, in ppm.
+    ///
+    /// Every value is a real observation from the interval in which `adaptive`
+    /// collapsed: 8.4 %-34.7 %, mean ~19.5 %. The essential property is not the
+    /// mean but the **spread** -- and that it does not respond to the sending
+    /// rate, because the loss is the ISP dropping packets.
+    const OBSERVED_NOISY_LOSS_PPM: [u64; 20] = [
+        123_546, 84_339, 209_666, 160_892, 201_767, 141_710, 227_758, 157_290, 210_766, 347_478,
+        253_313, 191_110, 160_820, 164_139, 281_574, 201_955, 172_140, 122_454, 263_727, 239_671,
+    ];
+
+    /// **The test the previous version needed and did not have.**
+    ///
+    /// Its regression test fed a *constant* 12 % loss, which the controller
+    /// handled correctly -- so the test passed while the deployed carrier failed.
+    /// The live link delivers loss that swings between 8 % and 35 % from one
+    /// interval to the next, and against that the single-interval response test
+    /// confirmed congestion on 12 of 14 tests and ratcheted to the floor, giving
+    /// 33 KB/s against `fixed@24`'s 602 KB/s.
+    ///
+    /// A fixture without the noise therefore tested the one property that was
+    /// never in doubt. This one is the measurement.
+    #[test]
+    fn adaptive_survives_the_loss_sequence_actually_observed() {
+        let (ceiling, floor) = adaptive_bounds();
+        let base_rtt = Duration::from_millis(84);
+        let mut state = AdaptState::new(ceiling);
+        let mut confirms = 0usize;
+        for _ in 0..40 {
+            for ppm in OBSERVED_NOISY_LOSS_PPM {
+                // ppm is already parts-per-million, so the sample's total is
+                // exactly this many bytes and the derived loss rate is `ppm`.
+                let sample = clean_sample(1_000_000 - ppm, ppm, base_rtt);
+                let (next, step) = adapt_step(state, ceiling, floor, sample);
+                if step == AdaptStep::TestConfirm {
+                    confirms += 1;
+                }
+                state = next;
+            }
+        }
         assert!(
-            state.unresponsive_loss_ppm >= 100_000,
-            "the tolerated loss level was not learned: {}",
-            state.unresponsive_loss_ppm
+            state.target > floor * 4,
+            "collapsed to {} under the loss sequence actually observed (floor {floor})",
+            state.target
+        );
+        assert!(
+            confirms <= 2,
+            "confirmed congestion {confirms} times on loss that does not respond to rate"
         );
     }
 
-    /// Loss that *does* fall after slowing down is congestion, and the reduced
-    /// rate must be held.
+    /// Queueing that *does* drain after slowing down is congestion, and the
+    /// reduced rate must be held. The verdict rests on the whole test window.
     #[test]
-    fn adaptive_confirms_congestion_when_the_signal_responds() {
+    fn adaptive_confirms_congestion_when_queueing_responds() {
         let (ceiling, floor) = adaptive_bounds();
         let base_rtt = Duration::from_millis(52);
-        let congested = clean_sample(600_000, 400_000, base_rtt);
-        let (dropped, step) = adapt_step(AdaptState::new(ceiling), ceiling, floor, congested);
+        let congested = IntervalSample {
+            smoothed_rtt: base_rtt + ADAPTIVE_QUEUE_TARGET,
+            ..clean_sample(1_000_000, 0, base_rtt)
+        };
+        let (mut state, step) = adapt_step(AdaptState::new(ceiling), ceiling, floor, congested);
         assert_eq!(step, AdaptStep::TestDrop);
-        assert!(dropped.target < ceiling);
+        assert!(state.target < ceiling);
 
-        // At the lower rate the loss disappears: that is congestion, confirmed.
-        let recovered = clean_sample(1_000_000, 0, base_rtt);
-        let (confirmed, step) = adapt_step(dropped, ceiling, floor, recovered);
+        // The queue drains over the whole window: congestion, confirmed, and the
+        // reduced rate is held rather than immediately undone.
+        let drained = clean_sample(1_000_000, 0, base_rtt);
+        let mut step = AdaptStep::Hold;
+        for _ in 0..ADAPTIVE_TEST_INTERVALS {
+            let (next, s) = adapt_step(state, ceiling, floor, drained);
+            state = next;
+            step = s;
+        }
         assert_eq!(step, AdaptStep::TestConfirm);
-        assert_eq!(
-            confirmed.target, dropped.target,
-            "a confirmed congestion drop must be held, not immediately undone"
-        );
-        assert_eq!(
-            confirmed.unresponsive_loss_ppm, 0,
-            "loss that responded was congestion and must not become a tolerated level"
+        assert_eq!(state.phase, AdaptPhase::Cooldown);
+    }
+
+    /// Queueing that persists at the lower rate is not congestion caused by us.
+    #[test]
+    fn adaptive_restores_the_rate_when_queueing_does_not_respond() {
+        let (ceiling, floor) = adaptive_bounds();
+        let base_rtt = Duration::from_millis(52);
+        let queueing = IntervalSample {
+            smoothed_rtt: base_rtt + ADAPTIVE_QUEUE_TARGET,
+            ..clean_sample(1_000_000, 0, base_rtt)
+        };
+        let (mut state, step) = adapt_step(AdaptState::new(ceiling), ceiling, floor, queueing);
+        assert_eq!(step, AdaptStep::TestDrop);
+        let reduced = state.target;
+
+        let mut step = AdaptStep::Hold;
+        for _ in 0..ADAPTIVE_TEST_INTERVALS {
+            let (next, s) = adapt_step(state, ceiling, floor, queueing);
+            state = next;
+            step = s;
+        }
+        assert_eq!(step, AdaptStep::TestRevert);
+        assert!(
+            state.target > reduced,
+            "the rate was not restored after queueing proved unresponsive"
         );
     }
 
-    /// Once a level is learned to be unresponsive, that same level must no
-    /// longer provoke a test -- otherwise the controller oscillates forever
-    /// between probing up and testing down on a permanently lossy path.
+    /// Sustained 10 % loss must leave the controller probing upward, not
+    /// testing downward. This is the property the whole delay-only design
+    /// exists to provide, and the one the three previous versions got wrong.
     #[test]
-    fn adaptive_stops_testing_a_learned_unresponsive_level() {
+    fn adaptive_ignores_sustained_loss_entirely() {
         let (ceiling, floor) = adaptive_bounds();
         let base_rtt = Duration::from_millis(52);
         let lossy = clean_sample(900_000, 100_000, base_rtt);
