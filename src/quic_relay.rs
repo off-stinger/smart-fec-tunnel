@@ -211,12 +211,28 @@ fn parse_stream_lanes(value: Option<&str>) -> Result<usize> {
 /// `Fixed` is the loss-tolerant option, for paths where the loss is **not**
 /// congestion (measured: ~20 % random loss from the ISP/GFW on the home↔SG
 /// path). See [`FixedRate`].
+///
+/// `Adaptive` is the default. It keeps `Fixed`'s defining property -- random
+/// loss must not collapse the window -- but replaces the hand-configured rate
+/// with a probe bounded by a hard budget ceiling. Both choices are driven by
+/// measurement rather than taste:
+///
+/// * the server's egress is a **known, hard 30.8 Mbps**, so there is no capacity
+///   to *discover*; the only question is how to stay inside the budget;
+/// * `fixed` had no absolute ceiling: its ACK-rate compensation can push the
+///   effective rate to 1.25x the configured value, so `fixed@30` asked for
+///   37.5 Mbps on a 30.8 Mbps pipe and the shaper answered with 40-68 % burst
+///   loss;
+/// * RFC 9265 section 5: with FEC below the transport, losses are hidden from
+///   the transport. That is a problem for *loss-based* detection but not for
+///   *delay-based* detection -- so this controller must be delay-first.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CarrierController {
     NewReno,
     Cubic,
     Bbr,
     Fixed,
+    Adaptive,
 }
 
 fn configured_congestion_controller() -> Result<CarrierController> {
@@ -225,17 +241,25 @@ fn configured_congestion_controller() -> Result<CarrierController> {
 }
 
 fn parse_congestion_controller(value: Option<&str>) -> Result<CarrierController> {
+    // Unset means `adaptive`. NewReno was the previous default, but it is
+    // measurably unusable on this project's target path: it collapsed to the
+    // RFC 9002 minimum window (2944 bytes) and delivered 4.5 KB/s, against
+    // 42-49 KB/s... per second for bbr/fixed under the same conditions (see
+    // PRODUCT-MANUAL section 10.6). The protocol's entire reason for existing is
+    // lossy long-haul links, so the default must be the controller that survives
+    // them.
     let Some(value) = value else {
-        return Ok(CarrierController::NewReno);
+        return Ok(CarrierController::Adaptive);
     };
     match value.trim().to_ascii_lowercase().as_str() {
         "new_reno" | "newreno" | "reno" => Ok(CarrierController::NewReno),
         "cubic" => Ok(CarrierController::Cubic),
         "bbr" => Ok(CarrierController::Bbr),
         "fixed" | "brutal" => Ok(CarrierController::Fixed),
-        other => {
-            bail!("SMART_QUIC_CONGESTION must be new_reno, cubic, bbr or fixed, got {other:?}")
-        }
+        "adaptive" | "auto" => Ok(CarrierController::Adaptive),
+        other => bail!(
+            "SMART_QUIC_CONGESTION must be new_reno, cubic, bbr, fixed or adaptive, got {other:?}"
+        ),
     }
 }
 
@@ -288,6 +312,32 @@ fn parse_fixed_rate_mbps(value: Option<&str>) -> Result<u64> {
         .context("SMART_QUIC_FIXED_RATE_MBPS must be an integer")?;
     if mbps == 0 || mbps > MAX_FIXED_RATE_MBPS {
         bail!("SMART_QUIC_FIXED_RATE_MBPS must be between 1 and {MAX_FIXED_RATE_MBPS}, got {mbps}")
+    }
+    Ok(mbps)
+}
+
+fn configured_max_rate() -> Result<u64> {
+    let value = std::env::var("SMART_QUIC_MAX_RATE_MBPS").ok();
+    parse_max_rate_mbps(value.as_deref())
+}
+
+/// Parses `SMART_QUIC_MAX_RATE_MBPS`: the hard ceiling on the carrier's
+/// **effective** send rate.
+///
+/// This is the metered egress budget, not a target. On the server that is the
+/// Tencent egress cap (measured 30.6-31.2 Mbps); on the router it is whatever the
+/// home uplink allows. Blank falls back to the default so an empty entry in an
+/// env file cannot abort startup.
+fn parse_max_rate_mbps(value: Option<&str>) -> Result<u64> {
+    let value = value.map(str::trim).filter(|value| !value.is_empty());
+    let Some(value) = value else {
+        return Ok(DEFAULT_MAX_RATE_MBPS);
+    };
+    let mbps: u64 = value
+        .parse()
+        .context("SMART_QUIC_MAX_RATE_MBPS must be an integer")?;
+    if mbps == 0 || mbps > MAX_ALLOWED_RATE_MBPS {
+        bail!("SMART_QUIC_MAX_RATE_MBPS must be between 1 and {MAX_ALLOWED_RATE_MBPS}, got {mbps}")
     }
     Ok(mbps)
 }
@@ -413,39 +463,418 @@ impl FixedRate {
     /// Record one second-bucketed observation of delivered vs lost packets and
     /// refresh [`Self::ack_rate`] from the last [`FIXED_RATE_ACK_SLOTS`] seconds.
     fn record(&mut self, now: Instant, acks: u64, losses: u64) {
-        let base = *self.base.get_or_insert(now);
-        let ts = now.saturating_duration_since(base).as_secs() as i64;
-        let slot = &mut self.slots[(ts as usize) % FIXED_RATE_ACK_SLOTS];
-        if slot.ts == ts {
-            slot.ack = slot.ack.saturating_add(acks);
-            slot.loss = slot.loss.saturating_add(losses);
-        } else {
-            slot.ts = ts;
-            slot.ack = acks;
-            slot.loss = losses;
-        }
+        self.ack_rate = refresh_ack_rate(&mut self.slots, &mut self.base, now, acks, losses);
+    }
+}
 
-        let min_ts = ts - FIXED_RATE_ACK_SLOTS as i64;
-        let (mut total_ack, mut total_loss) = (0u64, 0u64);
-        for slot in &self.slots {
-            if slot.ts < min_ts {
-                continue;
-            }
-            total_ack = total_ack.saturating_add(slot.ack);
-            total_loss = total_loss.saturating_add(slot.loss);
+/// Updates one second-bucketed ACK/loss slot and returns the ACK success rate
+/// over the retained window, clamped to the compensation floor.
+///
+/// Shared by [`FixedRate`] and [`AdaptiveRate`]: both need the same Brutal-style
+/// compensation (a 20 % loss path must send ~25 % faster to deliver the target
+/// rate), and duplicating this logic would duplicate its subtlety -- the
+/// sample-count gate exists so a quiet path is not amplified on noise, and that
+/// was worth keeping in exactly one place.
+fn refresh_ack_rate(
+    slots: &mut [AckSlot; FIXED_RATE_ACK_SLOTS],
+    base: &mut Option<Instant>,
+    now: Instant,
+    acks: u64,
+    losses: u64,
+) -> f64 {
+    let epoch = *base.get_or_insert(now);
+    let ts = now.saturating_duration_since(epoch).as_secs() as i64;
+    let slot = &mut slots[(ts as usize) % FIXED_RATE_ACK_SLOTS];
+    if slot.ts == ts {
+        slot.ack = slot.ack.saturating_add(acks);
+        slot.loss = slot.loss.saturating_add(losses);
+    } else {
+        slot.ts = ts;
+        slot.ack = acks;
+        slot.loss = losses;
+    }
+
+    let min_ts = ts - FIXED_RATE_ACK_SLOTS as i64;
+    let (mut total_ack, mut total_loss) = (0u64, 0u64);
+    for slot in slots.iter() {
+        if slot.ts < min_ts {
+            continue;
         }
-        let total = total_ack.saturating_add(total_loss);
-        if total < FIXED_RATE_MIN_ACK_SAMPLES {
-            // Not enough evidence yet: do not amplify on noise.
-            self.ack_rate = 1.0;
+        total_ack = total_ack.saturating_add(slot.ack);
+        total_loss = total_loss.saturating_add(slot.loss);
+    }
+    let total = total_ack.saturating_add(total_loss);
+    if total < FIXED_RATE_MIN_ACK_SAMPLES {
+        // Not enough evidence yet: do not amplify on noise.
+        return 1.0;
+    }
+    let rate = total_ack as f64 / total as f64;
+    if rate.is_finite() {
+        rate.clamp(FIXED_RATE_MIN_ACK_RATE, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Default hard ceiling on the **effective** carrier send rate, in Mbps.
+///
+/// Measured: this server's Tencent egress is 30.6-31.2 Mbps over three upload
+/// runs. Tencent meters egress only -- the "20-72 MB/s server egress" figure from
+/// an earlier round was actually *ingress*, which is unmetered, and reading it as
+/// egress was an analysis error. 30 is therefore the number the carrier must
+/// never exceed. The earlier advice to configure `fixed` at 24 was accidentally
+/// right: 24 x the 1.25 ACK-rate compensation = 30 exactly.
+const DEFAULT_MAX_RATE_MBPS: u64 = 30;
+const MAX_ALLOWED_RATE_MBPS: u64 = 10_000;
+/// Floor for the adaptive target: below this the link is unusable, so the
+/// controller stops probing downward.
+const ADAPTIVE_MIN_RATE_MBPS: u64 = 2;
+/// Control interval. Long enough to accumulate many ACKs at this link's measured
+/// 349 ms RTT, short enough to react within a few seconds.
+const ADAPTIVE_INTERVAL: Duration = Duration::from_millis(500);
+/// Per-interval increase while nothing adverse is observed (5 %).
+const ADAPTIVE_PROBE_PPM: u64 = 50_000;
+/// Per-interval decrease on bursty loss (20 %): deliberately 4x the probe step,
+/// so one bad interval is not undone by four good ones.
+const ADAPTIVE_BURST_BACKOFF_PPM: u64 = 200_000;
+/// Per-interval decrease on sustained queueing (10 %), gentler than the burst
+/// case because queueing is a softer signal than a policer dropping packets.
+const ADAPTIVE_QUEUE_BACKOFF_PPM: u64 = 100_000;
+/// Loss fraction within one interval that counts as *bursty* rather than random.
+///
+/// Measured on this link: spread random loss ran 0.05-0.6 % and FEC repaired it,
+/// while the intervals where the shaper bit showed 40-68 % in a single 5-second
+/// window. 5 % sits far above the former and far below the latter, so the two
+/// regimes separate cleanly without per-link tuning. This is the mechanism that
+/// lets the controller honour RFC 9265 Recommendation 1 (isolated loss on a
+/// known-lossy path must not reduce the sending rate) while still reacting to
+/// genuine capacity exhaustion.
+const ADAPTIVE_BURST_LOSS_PPM: u64 = 50_000;
+/// How far smoothed RTT may exceed the windowed minimum before it counts as
+/// queueing. This path's RTT sat flat at 349-350 ms under every offered rate
+/// tested, so real queueing will stand out immediately.
+const ADAPTIVE_QUEUE_TARGET: Duration = Duration::from_millis(25);
+/// Clean intervals required after a backoff before probing resumes.
+const ADAPTIVE_CLEAN_TO_RESUME: u32 = 4;
+
+/// One control interval's observations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IntervalSample {
+    delivered_bytes: u64,
+    lost_bytes: u64,
+    smoothed_rtt: Duration,
+    base_rtt: Duration,
+    app_limited: bool,
+}
+
+/// Why the target moved. Kept as a value for logging and for tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdaptStep {
+    BurstBackoff,
+    QueueBackoff,
+    Probe,
+    Hold,
+}
+
+impl AdaptStep {
+    fn as_str(self) -> &'static str {
+        match self {
+            AdaptStep::BurstBackoff => "burst_backoff",
+            AdaptStep::QueueBackoff => "queue_backoff",
+            AdaptStep::Probe => "probe",
+            AdaptStep::Hold => "hold",
+        }
+    }
+}
+
+fn scale_ppm(value: u64, ppm: u64, up: bool) -> u64 {
+    let delta = ((u128::from(value) * u128::from(ppm)) / 1_000_000) as u64;
+    if up {
+        value.saturating_add(delta)
+    } else {
+        value.saturating_sub(delta)
+    }
+}
+
+fn loss_ppm(received: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    ((u128::from(total.saturating_sub(received)) * 1_000_000) / u128::from(total)) as u64
+}
+
+/// Pure control step: current target plus one interval's observations in, next
+/// target and the reason out.
+///
+/// Pure so the whole decision table can be unit-tested without a QUIC
+/// connection -- `quinn_proto::RttEstimator` cannot be constructed outside
+/// quinn, so anything touching it is untestable by construction.
+fn adapt_step(
+    target: u64,
+    ceiling: u64,
+    floor: u64,
+    sample: IntervalSample,
+    clean_intervals: u32,
+) -> (u64, AdaptStep) {
+    let clamp = |value: u64| value.min(ceiling).max(floor);
+    let total = sample.delivered_bytes.saturating_add(sample.lost_bytes);
+    if total == 0 {
+        // No evidence either way. An idle interval must not ratchet the target
+        // up, and must not be read as 100 % loss either.
+        return (clamp(target), AdaptStep::Hold);
+    }
+    if loss_ppm(sample.delivered_bytes, total) >= ADAPTIVE_BURST_LOSS_PPM {
+        let next = scale_ppm(target, ADAPTIVE_BURST_BACKOFF_PPM, false);
+        return (clamp(next), AdaptStep::BurstBackoff);
+    }
+    if sample.smoothed_rtt.saturating_sub(sample.base_rtt) >= ADAPTIVE_QUEUE_TARGET {
+        let next = scale_ppm(target, ADAPTIVE_QUEUE_BACKOFF_PPM, false);
+        return (clamp(next), AdaptStep::QueueBackoff);
+    }
+    if sample.app_limited || clean_intervals < ADAPTIVE_CLEAN_TO_RESUME {
+        return (clamp(target), AdaptStep::Hold);
+    }
+    let next = scale_ppm(target, ADAPTIVE_PROBE_PPM, true);
+    (clamp(next), AdaptStep::Probe)
+}
+
+/// Window for a target rate, with the ceiling applied to the **effective** rate.
+///
+/// quinn's pacer produces `window / srtt`, and the ACK-rate compensation divides
+/// the target by `ack_rate`, so the rate actually sent can reach
+/// `target / 0.8` = 1.25x the target. Clamping the effective value -- not the
+/// target -- is what makes the budget ceiling absolute. `fixed` never did this,
+/// which is why `fixed@30` asked a 30.8 Mbps pipe for 37.5 Mbps and got 40-68 %
+/// burst loss back.
+fn adaptive_window(
+    target_bytes_per_sec: u64,
+    smoothed_rtt: Duration,
+    mtu: u64,
+    ack_rate: f64,
+    ceiling_bytes_per_sec: u64,
+) -> u64 {
+    let ack_rate = if ack_rate.is_finite() && ack_rate > 0.0 {
+        ack_rate.clamp(FIXED_RATE_MIN_ACK_RATE, 1.0)
+    } else {
+        1.0
+    };
+    let effective = (target_bytes_per_sec as f64 / ack_rate).min(ceiling_bytes_per_sec as f64);
+    let bdp = effective * smoothed_rtt.as_secs_f64();
+    let bdp = if bdp.is_finite() && bdp >= 1.0 {
+        bdp as u64
+    } else {
+        0
+    };
+    bdp.max(FIXED_RATE_MIN_WINDOW_MTUS * mtu).max(1)
+}
+
+/// Budget-aware, delay-first adaptive carrier controller.
+///
+/// Deliberately **not** a capacity estimator. The server's egress is a known,
+/// hard 30.8 Mbps, so there is no capacity to discover; the only question is how
+/// to stay usefully inside the budget. That inverts the usual design: instead of
+/// "probe until something breaks", it is "probe toward the ceiling and retreat
+/// when the path pushes back".
+///
+/// Signal choice is forced by the architecture, not by preference: RFC 9265
+/// section 5 says that with FEC below the transport, losses are hidden from the
+/// transport, which breaks *loss-based* detection but leaves *delay-based*
+/// detection intact. So delay is the primary signal and loss is only consulted
+/// for its *burstiness* -- the signature of a shaper rather than of the random
+/// corruption this link is known for.
+#[derive(Debug, Clone)]
+struct AdaptiveRate {
+    /// Hard ceiling on the effective send rate, bytes/s.
+    ceiling: u64,
+    floor: u64,
+    /// Current target send rate, bytes/s.
+    target: u64,
+    /// Smoothed RTT -- the same quantity the pacer divides by.
+    rtt: Duration,
+    /// Windowed minimum RTT, used as the no-queueing baseline. Taken from
+    /// `RttEstimator::min()` rather than tracked here, because quinn's is
+    /// windowed and therefore follows a path change; a global minimum would be
+    /// poisoned forever by whichever WAN happened to be in use at startup.
+    base_rtt: Duration,
+    mtu: u64,
+    ack_rate: f64,
+    base: Option<Instant>,
+    slots: [AckSlot; FIXED_RATE_ACK_SLOTS],
+    interval_started: Option<Instant>,
+    interval_delivered: u64,
+    interval_lost: u64,
+    interval_app_limited: bool,
+    clean_intervals: u32,
+    last_step: AdaptStep,
+    steps: u64,
+    persistent_congestion_events: u64,
+}
+
+impl AdaptiveRate {
+    fn new(ceiling_bytes_per_sec: u64, floor_bytes_per_sec: u64, current_mtu: u16) -> Self {
+        let ceiling = ceiling_bytes_per_sec.max(1);
+        let floor = floor_bytes_per_sec.max(1).min(ceiling);
+        // Start at half the ceiling. Probing up from the floor would take many
+        // intervals, and starting *at* the ceiling would immediately over-drive
+        // a path whose behaviour we have not observed yet.
+        let target = (ceiling / 2).max(floor);
+        Self {
+            ceiling,
+            floor,
+            target,
+            rtt: FIXED_RATE_BOOTSTRAP_RTT,
+            base_rtt: FIXED_RATE_BOOTSTRAP_RTT,
+            mtu: u64::from(current_mtu).max(1),
+            ack_rate: 1.0,
+            base: None,
+            slots: [AckSlot::default(); FIXED_RATE_ACK_SLOTS],
+            interval_started: None,
+            interval_delivered: 0,
+            interval_lost: 0,
+            interval_app_limited: false,
+            clean_intervals: ADAPTIVE_CLEAN_TO_RESUME,
+            last_step: AdaptStep::Hold,
+            steps: 0,
+            persistent_congestion_events: 0,
+        }
+    }
+
+    fn window_bytes(&self) -> u64 {
+        adaptive_window(self.target, self.rtt, self.mtu, self.ack_rate, self.ceiling)
+    }
+
+    /// Close the current control interval if it has elapsed, and act on it.
+    fn maybe_adapt(&mut self, now: Instant) {
+        let started = *self.interval_started.get_or_insert(now);
+        if now.saturating_duration_since(started) < ADAPTIVE_INTERVAL {
             return;
         }
-        let rate = total_ack as f64 / total as f64;
-        self.ack_rate = if rate.is_finite() {
-            rate.clamp(FIXED_RATE_MIN_ACK_RATE, 1.0)
-        } else {
-            1.0
+        self.interval_started = Some(now);
+        let sample = IntervalSample {
+            delivered_bytes: self.interval_delivered,
+            lost_bytes: self.interval_lost,
+            smoothed_rtt: self.rtt,
+            base_rtt: self.base_rtt,
+            app_limited: self.interval_app_limited,
         };
+        let (next, step) = adapt_step(
+            self.target,
+            self.ceiling,
+            self.floor,
+            sample,
+            self.clean_intervals,
+        );
+        // Hysteresis: a backoff resets the clean counter, and probing only
+        // resumes after ADAPTIVE_CLEAN_TO_RESUME clean intervals. Without this
+        // the 5 % probe would claw back a 20 % backoff in four intervals and the
+        // target would sit in a limit cycle around the shape point.
+        self.clean_intervals = match step {
+            AdaptStep::BurstBackoff | AdaptStep::QueueBackoff => 0,
+            AdaptStep::Probe | AdaptStep::Hold => self.clean_intervals.saturating_add(1),
+        };
+        if step != AdaptStep::Hold || next != self.target {
+            info!(
+                from_bytes_per_sec = self.target,
+                to_bytes_per_sec = next,
+                step = step.as_str(),
+                delivered_bytes = sample.delivered_bytes,
+                lost_bytes = sample.lost_bytes,
+                loss_ppm = loss_ppm(
+                    sample.delivered_bytes,
+                    sample.delivered_bytes + sample.lost_bytes
+                ),
+                queue_ms = sample
+                    .smoothed_rtt
+                    .saturating_sub(sample.base_rtt)
+                    .as_millis() as u64,
+                "adaptive carrier target changed"
+            );
+        }
+        self.target = next;
+        self.last_step = step;
+        self.steps = self.steps.saturating_add(1);
+        self.interval_delivered = 0;
+        self.interval_lost = 0;
+        self.interval_app_limited = false;
+    }
+}
+
+impl Controller for AdaptiveRate {
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        _sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        self.rtt = rtt.get().max(FIXED_RATE_MIN_RTT);
+        let observed_min = rtt.min();
+        if observed_min > Duration::ZERO {
+            self.base_rtt = observed_min.max(FIXED_RATE_MIN_RTT);
+        }
+        // `bytes.max(1)`: a zero-byte ACK still proves the path is alive, and
+        // dropping it would let an interval look idle when it was not.
+        self.interval_delivered = self.interval_delivered.saturating_add(bytes.max(1));
+        self.interval_app_limited |= app_limited;
+        self.ack_rate = refresh_ack_rate(&mut self.slots, &mut self.base, now, 1, 0);
+        self.maybe_adapt(now);
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        _sent: Instant,
+        is_persistent_congestion: bool,
+        lost_bytes: u64,
+    ) {
+        self.interval_lost = self.interval_lost.saturating_add(lost_bytes.max(1));
+        let lost_packets = (lost_bytes / self.mtu.max(1)).max(1);
+        self.ack_rate = refresh_ack_rate(&mut self.slots, &mut self.base, now, 0, lost_packets);
+        if is_persistent_congestion {
+            self.persistent_congestion_events = self.persistent_congestion_events.saturating_add(1);
+            // Persistent congestion means the path is dead, not merely lossy.
+            // Unlike `fixed` -- which deliberately kept sending -- a dead path
+            // is dropped straight to the floor so the carrier cannot hammer it.
+            warn!(
+                target_bytes_per_sec = self.target,
+                events = self.persistent_congestion_events,
+                "adaptive carrier hit persistent congestion; dropping to the floor"
+            );
+            self.target = self.floor;
+            self.clean_intervals = 0;
+        }
+        self.maybe_adapt(now);
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.mtu = u64::from(new_mtu).max(1);
+    }
+
+    fn window(&self) -> u64 {
+        self.window_bytes()
+    }
+
+    fn metrics(&self) -> ControllerMetrics {
+        let mut metrics = ControllerMetrics::default();
+        metrics.congestion_window = self.window_bytes();
+        metrics.ssthresh = None;
+        // Informational only: quinn's pacer uses `window() / RTT`, not this.
+        let effective = (self.target as f64 / self.ack_rate).min(self.ceiling as f64);
+        metrics.pacing_rate = Some((effective as u64).saturating_mul(8));
+        metrics
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.window_bytes()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
     }
 }
 
@@ -535,6 +964,10 @@ struct CarrierControllerFactory {
     kind: CarrierController,
     /// Only used by [`CarrierController::Fixed`]: target rate in bytes/second.
     fixed_rate_bytes_per_sec: u64,
+    /// Only used by [`CarrierController::Adaptive`]: absolute ceiling on the
+    /// *effective* send rate, and the floor it will not probe below.
+    adaptive_ceiling_bytes_per_sec: u64,
+    adaptive_floor_bytes_per_sec: u64,
 }
 
 impl ControllerFactory for CarrierControllerFactory {
@@ -572,6 +1005,11 @@ impl ControllerFactory for CarrierControllerFactory {
             CarrierController::Fixed => {
                 Box::new(FixedRate::new(self.fixed_rate_bytes_per_sec, current_mtu))
             }
+            CarrierController::Adaptive => Box::new(AdaptiveRate::new(
+                self.adaptive_ceiling_bytes_per_sec,
+                self.adaptive_floor_bytes_per_sec,
+                current_mtu,
+            )),
         }
     }
 }
@@ -724,6 +1162,10 @@ fn transport_config() -> Result<Arc<TransportConfig>> {
         CarrierController::Fixed => Some(configured_fixed_rate()?),
         _ => None,
     };
+    let max_rate_mbps = match controller {
+        CarrierController::Adaptive => Some(configured_max_rate()?),
+        _ => None,
+    };
     match controller {
         CarrierController::Bbr => warn!(
             ?controller,
@@ -737,13 +1179,24 @@ fn transport_config() -> Result<Arc<TransportConfig>> {
              whose loss is known not to be congestion. The configured rate must not exceed \
              the real link capacity, otherwise loss becomes permanent and FEC cannot cover it."
         ),
+        CarrierController::Adaptive => info!(
+            ?controller,
+            max_rate_mbps = max_rate_mbps.unwrap_or(0),
+            "carrier congestion controller selected; delay-first with burst-loss backoff, \
+             hard-capped on the effective send rate so ACK-rate compensation cannot exceed \
+             the budget"
+        ),
         _ => info!(?controller, "carrier congestion controller selected"),
     }
     let fixed_rate_bytes_per_sec =
         fixed_rate_mbps.map_or(0, |mbps| mbps.saturating_mul(1_000_000) / 8);
+    let adaptive_ceiling_bytes_per_sec =
+        max_rate_mbps.map_or(0, |mbps| mbps.saturating_mul(1_000_000) / 8);
     transport.congestion_controller_factory(Arc::new(CarrierControllerFactory {
         kind: controller,
         fixed_rate_bytes_per_sec,
+        adaptive_ceiling_bytes_per_sec,
+        adaptive_floor_bytes_per_sec: ADAPTIVE_MIN_RATE_MBPS.saturating_mul(1_000_000) / 8,
     }));
     // These are hard caps, not "unlimited": exceeding them makes Quinn drop the
     // oldest buffered datagram, and `None` for the receive buffer means "refuse
@@ -1243,6 +1696,8 @@ mod tests {
             let factory = Arc::new(CarrierControllerFactory {
                 kind,
                 fixed_rate_bytes_per_sec: 0,
+                adaptive_ceiling_bytes_per_sec: 0,
+                adaptive_floor_bytes_per_sec: 0,
             });
             let controller = factory.clone().build(std::time::Instant::now(), 1472);
             assert_eq!(controller.initial_window(), 14_720, "{kind:?} at mtu 1472");
@@ -1428,6 +1883,8 @@ mod tests {
         let factory = Arc::new(CarrierControllerFactory {
             kind: CarrierController::Fixed,
             fixed_rate_bytes_per_sec: rate,
+            adaptive_ceiling_bytes_per_sec: 0,
+            adaptive_floor_bytes_per_sec: 0,
         });
         let controller = factory.build(std::time::Instant::now(), 1472);
         // Bootstrap BDP from FIXED_RATE_BOOTSTRAP_RTT.
@@ -1437,10 +1894,212 @@ mod tests {
     }
 
     #[test]
+    fn max_rate_parsing_defaults_on_blank_and_rejects_zero() {
+        for unset in [None, Some(""), Some("   ")] {
+            assert_eq!(parse_max_rate_mbps(unset).unwrap(), DEFAULT_MAX_RATE_MBPS);
+        }
+        assert_eq!(parse_max_rate_mbps(Some(" 30 ")).unwrap(), 30);
+        assert_eq!(
+            parse_max_rate_mbps(Some(&MAX_ALLOWED_RATE_MBPS.to_string())).unwrap(),
+            MAX_ALLOWED_RATE_MBPS
+        );
+        for invalid in ["0", "abc", "-1", "10001", "1.5"] {
+            assert!(
+                parse_max_rate_mbps(Some(invalid)).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
+
+    /// The budget ceiling must bind the **effective** rate, not the target.
+    /// This is the concrete fix for `fixed`'s unbounded 1.25x ACK-rate
+    /// compensation: `fixed@30` asked a measured 30.8 Mbps pipe for 37.5 Mbps.
+    #[test]
+    fn adaptive_window_ceiling_survives_ack_rate_compensation() {
+        let ceiling = 30u64 * 1_000_000 / 8;
+        let srtt = Duration::from_millis(350);
+        let window = adaptive_window(ceiling, srtt, 1200, FIXED_RATE_MIN_ACK_RATE, ceiling);
+        let effective = window as f64 / srtt.as_secs_f64();
+        assert!(
+            effective <= ceiling as f64 + 1.0,
+            "effective rate {effective} exceeded the {ceiling} byte/s ceiling"
+        );
+
+        // And when compensation is not in play, the window must reproduce the
+        // requested rate exactly -- sizing on the wrong RTT silently throttles
+        // (the bug caught in T1).
+        let half = ceiling / 2;
+        let window = adaptive_window(half, srtt, 1200, 1.0, ceiling);
+        let effective = window as f64 / srtt.as_secs_f64();
+        assert!((effective - half as f64).abs() < half as f64 * 0.01);
+    }
+
+    fn adaptive_bounds() -> (u64, u64) {
+        (
+            30u64 * 1_000_000 / 8,
+            ADAPTIVE_MIN_RATE_MBPS * 1_000_000 / 8,
+        )
+    }
+
+    /// RFC 9265 Recommendation 1: on a path that is *known* to be lossy, a
+    /// recovered packet must not be treated as a congestion signal. Only bursty
+    /// loss -- the signature of a shaping policer -- may reduce the rate.
+    #[test]
+    fn adaptive_step_ignores_spread_loss_but_backs_off_on_bursts() {
+        let (ceiling, floor) = adaptive_bounds();
+        let target = ceiling / 2;
+        let base_rtt = Duration::from_millis(349);
+        let clean = ADAPTIVE_CLEAN_TO_RESUME;
+
+        // 0.5 % spread loss, matching the measured clean-regime range.
+        let sample = IntervalSample {
+            delivered_bytes: 1_000_000,
+            lost_bytes: 5_000,
+            smoothed_rtt: base_rtt,
+            base_rtt,
+            app_limited: false,
+        };
+        let (next, step) = adapt_step(target, ceiling, floor, sample, clean);
+        assert_eq!(step, AdaptStep::Probe, "spread loss must not back off");
+        assert!(next > target);
+
+        // 28 % in one interval, matching the measured shaper bursts.
+        let sample = IntervalSample {
+            lost_bytes: 400_000,
+            ..sample
+        };
+        let (next, step) = adapt_step(target, ceiling, floor, sample, clean);
+        assert_eq!(step, AdaptStep::BurstBackoff);
+        assert!(next < target);
+    }
+
+    /// Delay is the primary signal: RFC 9265 section 5 says FEC below the
+    /// transport hides loss but leaves delay intact.
+    #[test]
+    fn adaptive_step_backs_off_on_queueing_and_holds_when_app_limited() {
+        let (ceiling, floor) = adaptive_bounds();
+        let target = ceiling / 2;
+        let base_rtt = Duration::from_millis(349);
+        let clean = ADAPTIVE_CLEAN_TO_RESUME;
+
+        let queueing = IntervalSample {
+            delivered_bytes: 1_000_000,
+            lost_bytes: 0,
+            smoothed_rtt: base_rtt + ADAPTIVE_QUEUE_TARGET,
+            base_rtt,
+            app_limited: false,
+        };
+        let (next, step) = adapt_step(target, ceiling, floor, queueing, clean);
+        assert_eq!(step, AdaptStep::QueueBackoff);
+        assert!(next < target);
+
+        // App-limited: the interval says nothing about capacity, so it must not
+        // probe. Note this sample is otherwise clean -- with queueing present the
+        // queue backoff legitimately wins, because the queue is real either way.
+        let quiet = IntervalSample {
+            app_limited: true,
+            ..queueing
+        };
+        let quiet = IntervalSample {
+            smoothed_rtt: base_rtt,
+            ..quiet
+        };
+        let (next, step) = adapt_step(target, ceiling, floor, quiet, clean);
+        assert_eq!(step, AdaptStep::Hold);
+        assert_eq!(next, target);
+    }
+
+    #[test]
+    fn adaptive_step_cannot_leave_the_budget() {
+        let (ceiling, floor) = adaptive_bounds();
+        let base_rtt = Duration::from_millis(349);
+        let clean_sample = IntervalSample {
+            delivered_bytes: 1_000_000,
+            lost_bytes: 0,
+            smoothed_rtt: base_rtt,
+            base_rtt,
+            app_limited: false,
+        };
+        // Drive far past the ceiling: the target must saturate, not overflow.
+        let mut target = ceiling;
+        for _ in 0..500 {
+            let (next, step) = adapt_step(
+                target,
+                ceiling,
+                floor,
+                clean_sample,
+                ADAPTIVE_CLEAN_TO_RESUME,
+            );
+            assert_eq!(step, AdaptStep::Probe);
+            assert!(next <= ceiling, "{next} exceeded the ceiling {ceiling}");
+            target = next;
+        }
+        // And sustained burst loss must stop at the floor, never below it.
+        let lossy = IntervalSample {
+            delivered_bytes: 1,
+            lost_bytes: 1_000_000,
+            ..clean_sample
+        };
+        for _ in 0..500 {
+            let (next, _) = adapt_step(target, ceiling, floor, lossy, 0);
+            assert!(next >= floor, "{next} fell below the floor {floor}");
+            target = next;
+        }
+    }
+
+    /// An idle interval carries no evidence. It must neither ratchet the target
+    /// up nor be mistaken for total loss.
+    #[test]
+    fn adaptive_step_holds_without_evidence() {
+        let (ceiling, floor) = adaptive_bounds();
+        let target = ceiling / 2;
+        let (next, step) = adapt_step(
+            target,
+            ceiling,
+            floor,
+            IntervalSample::default(),
+            ADAPTIVE_CLEAN_TO_RESUME,
+        );
+        assert_eq!(step, AdaptStep::Hold);
+        assert_eq!(next, target);
+    }
+
+    #[test]
+    fn adaptive_factory_starts_inside_the_budget() {
+        let (ceiling, floor) = adaptive_bounds();
+        let factory = Arc::new(CarrierControllerFactory {
+            kind: CarrierController::Adaptive,
+            fixed_rate_bytes_per_sec: 0,
+            adaptive_ceiling_bytes_per_sec: ceiling,
+            adaptive_floor_bytes_per_sec: floor,
+        });
+        let controller = factory.build(std::time::Instant::now(), 1200);
+        let window = controller.initial_window();
+        let at_bootstrap = ceiling * FIXED_RATE_BOOTSTRAP_RTT.as_millis() as u64 / 1000;
+        assert!(
+            window <= at_bootstrap,
+            "bootstrap window {window} implies more than the {ceiling} byte/s ceiling"
+        );
+        assert!(window >= FIXED_RATE_MIN_WINDOW_MTUS * 1200);
+    }
+
+    #[test]
     fn congestion_controller_selection_is_explicit() {
+        // Unset now means `adaptive`, not `new_reno`. This is a deliberate
+        // default change: NewReno measured 4.5 KB/s on this project's target path
+        // (window pinned at the RFC 9002 minimum) against 42-49 KB/s for
+        // bbr/fixed, and the protocol exists precisely for lossy long-haul links.
         assert_eq!(
             parse_congestion_controller(None).unwrap(),
-            CarrierController::NewReno
+            CarrierController::Adaptive
+        );
+        assert_eq!(
+            parse_congestion_controller(Some("adaptive")).unwrap(),
+            CarrierController::Adaptive
+        );
+        assert_eq!(
+            parse_congestion_controller(Some("AUTO")).unwrap(),
+            CarrierController::Adaptive
         );
         assert_eq!(
             parse_congestion_controller(Some("reno")).unwrap(),
