@@ -545,10 +545,19 @@ impl Encoder {
         self.sequence += 1;
         f
     }
-    fn feedback_frame(&mut self, sample: Option<SequenceReport>) -> Frame {
+    /// Build the periodic FEC feedback frame.
+    ///
+    /// A peer predating feedback V2 only accepts a 4-byte payload: it decodes
+    /// with `try_into::<[u8; 4]>()`, so a 24-byte frame fails to parse and the
+    /// whole report is dropped. Sending V2 unconditionally therefore leaves such
+    /// a peer completely blind to loss rather than degrading it to the legacy
+    /// sample, freezing its parity at whatever it held when the other end was
+    /// upgraded. Until the peer proves it can produce a V2 sample itself, send
+    /// the legacy frame every version understands.
+    fn feedback_frame(&mut self, sample: Option<SequenceReport>, peer_supports_v2: bool) -> Frame {
         let mut frame = self
             .report_frame(sample.map_or(LOSS_SAMPLE_UNAVAILABLE, |sample| sample.sequence_gap_ppm));
-        if let Some(sample) = sample {
+        if let Some(sample) = sample.filter(|_| peer_supports_v2) {
             frame.payload = encode_fec_feedback(&sample);
         }
         frame
@@ -1098,6 +1107,9 @@ async fn client(
     tunnel.connect(server).await?;
     let encoder = Arc::new(Mutex::new(Encoder::with_identity(session, version, key_id)));
     let mut decoder = Decoder::new(session);
+    // 对端是否已证明能解析 feedback V2。未证明前只发 4 字节 legacy 帧，
+    // 否则旧版本对端会整帧丢弃并彻底失去丢包样本（详见 feedback_frame）。
+    let mut peer_feedback_v2 = false;
     let mut app_peer = None;
     let mut local_buf = vec![0u8; 65535];
     let mut net_buf = vec![0u8; 2048];
@@ -1121,6 +1133,9 @@ async fn client(
                     Ok(f) if f.kind == KIND_REPORT => {
                         if decoder.observe_seq(f.sequence) {
                             if let Some(feedback) = decode_fec_feedback(&f.payload) {
+                                if matches!(feedback, FecFeedback::Sample(_)) {
+                                    peer_feedback_v2 = true;
+                                }
                                 encoder.lock().await.adaptive.report_feedback(feedback);
                             } else {
                                 warn!(payload_len=f.payload.len(), "discard invalid FEC feedback");
@@ -1138,7 +1153,7 @@ async fn client(
                 let report = decoder.sequence_report();
                 let mut enc = encoder.lock().await;
                 let parity = enc.adaptive.parity;
-                let f = enc.feedback_frame(report);
+                let f = enc.feedback_frame(report, peer_feedback_v2);
                 drop(enc); send_frames(&tunnel, None, vec![f], &key, &mut pacer).await?;
                 if let Some(sample) = report {
                     info!(
@@ -1241,6 +1256,8 @@ async fn run_server_session(
     let mut decoder = Decoder::new(runtime.session);
     let mut encoder = Encoder::with_identity(runtime.session, runtime.version, runtime.key_id);
     let mut peer = None;
+    // 同客户端：未证明对端能解析 feedback V2 前只发 legacy 帧。
+    let mut peer_feedback_v2 = false;
     let mut upstream_buf = vec![0u8; 65535];
     let mut report = time::interval(Duration::from_secs(2));
     let mut flush = time::interval(Duration::from_millis(5));
@@ -1257,6 +1274,9 @@ async fn run_server_session(
                 if frame.kind == KIND_REPORT {
                     if decoder.observe_seq(frame.sequence) {
                         if let Some(feedback) = decode_fec_feedback(&frame.payload) {
+                            if matches!(feedback, FecFeedback::Sample(_)) {
+                                peer_feedback_v2 = true;
+                            }
                             encoder.adaptive.report_feedback(feedback);
                         } else {
                             warn!(payload_len=frame.payload.len(), "discard invalid FEC feedback");
@@ -1291,7 +1311,7 @@ async fn run_server_session(
                     info!(tx_parity = parity, "server FEC parity changed");
                     last_logged_parity = parity;
                 }
-                let frame = encoder.feedback_frame(report);
+                let frame = encoder.feedback_frame(report, peer_feedback_v2);
                 send_session_frames(&runtime.public, peer.unwrap(), vec![frame], &runtime.key, &runtime.pacer).await;
             }
             _ = flush.tick(), if peer.is_some() => {
@@ -1888,6 +1908,85 @@ mod tests {
         *tampered.last_mut().unwrap() ^= 1;
         assert!(decode_server_frame(&tampered, None, &HashMap::new(), &selectors).is_err());
     }
+    #[test]
+    fn feedback_frame_stays_legacy_until_the_peer_proves_v2() {
+        let sample = SequenceReport {
+            expected: 1000,
+            received: 990,
+            missing: 10,
+            sequence_gap_ppm: 10_000,
+            fec_recovered_symbols: 2,
+            fec_recovered_groups: 1,
+            late: 0,
+            duplicates: 0,
+        };
+        let mut encoder = Encoder::with_identity(1, VERSION_V3, 1);
+        // A peer that has not proved V2 support must always receive a 4-byte
+        // payload: its decoder cannot parse 24 bytes and would drop the report
+        // entirely, going blind to loss rather than falling back to legacy.
+        let legacy = encoder.feedback_frame(Some(sample), false);
+        assert_eq!(legacy.payload.len(), 4);
+        assert_eq!(
+            decode_fec_feedback(&legacy.payload),
+            Some(FecFeedback::Legacy(10_000))
+        );
+        // Once the peer has produced a V2 sample of its own, send the rich one.
+        let rich = encoder.feedback_frame(Some(sample), true);
+        assert_eq!(rich.payload.len(), FEEDBACK_V2_LEN);
+        assert_eq!(
+            decode_fec_feedback(&rich.payload),
+            Some(FecFeedback::Sample(FeedbackSample {
+                sequence_gap_ppm: 10_000,
+                expected: 1000,
+                missing: 10,
+                fec_recovered_symbols: 2,
+                fec_recovered_groups: 1,
+            }))
+        );
+        // With no usable sample there is nothing rich to send, so the sentinel
+        // must stay a legacy 4-byte frame even for a V2 peer.
+        let idle = encoder.feedback_frame(None, true);
+        assert_eq!(idle.payload.len(), 4);
+        assert_eq!(
+            decode_fec_feedback(&idle.payload),
+            Some(FecFeedback::Legacy(LOSS_SAMPLE_UNAVAILABLE))
+        );
+    }
+
+    #[test]
+    fn a_pre_v2_peer_needs_exactly_four_bytes_and_ignores_a_v2_frame() {
+        // 实测已部署版本（/root/sft-build，构建出当前运行中的二进制）的报告帧分支为：
+        //     Ok(f) if f.kind == KIND_REPORT && f.payload.len() == 4 => { ...report(loss)... }
+        //     Ok(f) => match decoder.frame(f) { ... }
+        // 而 Decoder::frame 对 KIND_REPORT 直接 `return Ok(vec![])`。因此 24 字节
+        // V2 载荷既不会被解析、也不会被误读：它先被长度等值判断挡下，再被解码器丢弃，
+        // 于是对端的自适应控制器**完全收不到丢包样本**（parity 永久冻结），但也不会
+        // 触发 bypass。这正是必须保留 legacy 帧、直到对端自证支持 V2 的原因。
+        let sample = SequenceReport {
+            expected: 1000,
+            received: 990,
+            missing: 10,
+            sequence_gap_ppm: 10_000,
+            fec_recovered_symbols: 2,
+            fec_recovered_groups: 1,
+            late: 0,
+            duplicates: 0,
+        };
+        let mut encoder = Encoder::with_identity(1, VERSION_V3, 1);
+        let rich = encoder.feedback_frame(Some(sample), true);
+        assert_eq!(rich.payload.len(), FEEDBACK_V2_LEN);
+        assert_ne!(
+            rich.payload.len(),
+            4,
+            "a pre-V2 peer matches report frames only when payload.len() == 4"
+        );
+        // 潜在危险：若旧版本改用 `payload[..4]` 无限读取（不带长度等值判断），
+        // 魔数会被当成约 139.8% 丢包并触发 bypass。当前已部署版本的长度判断挡住了它，
+        // 这个断言把这个隐含依赖固定下来。
+        assert_eq!(&rich.payload[..4], FEEDBACK_V2_MAGIC);
+        assert!(u32::from_be_bytes(FEEDBACK_V2_MAGIC) >= FEC_BYPASS_LOSS_PPM);
+    }
+
     #[test]
     fn fec_feedback_accepts_legacy_and_validates_v2_samples() {
         assert_eq!(
