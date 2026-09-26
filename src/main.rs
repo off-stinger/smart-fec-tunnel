@@ -1011,6 +1011,20 @@ struct SequenceReport {
     fec_recovered_groups: u64,
     late: u64,
     duplicates: u64,
+    /// Data shards that were never delivered in this window: groups that expired
+    /// with undelivered data.
+    ///
+    /// Unlike `missing` -- which counts wire-frame gaps and therefore includes
+    /// lost **parity** shards that need no repair -- this is exactly the loss a
+    /// user can see. Reporting it in the *same* window as `missing` is the point:
+    /// `missing` alone cannot distinguish "lost a lot but all repaired" from
+    /// "lost little but whole groups failed", and the ratio between the two is
+    /// what separates burst loss from independent loss. The existing recovery
+    /// signal had to approximate this from `missing` and `fec_recovered_symbols`
+    /// precisely because the accurate number was unavailable.
+    unrecovered_shards: u64,
+    /// Groups that expired with undelivered data, in the same window.
+    failed_groups: u64,
 }
 
 #[derive(Debug)]
@@ -1040,6 +1054,16 @@ struct Decoder {
     fec_recovery_events: BTreeMap<u64, (u64, u64)>,
     groups: BTreeMap<u64, Group>,
     packets: HashMap<u64, Reassembly>,
+    /// Unrecovered data shards / failed groups accumulated since the last
+    /// `sequence_report`.
+    ///
+    /// `prune` discovers these when a group expires, which is not the same moment
+    /// the report window closes, so they are buffered and drained into whichever
+    /// window is finalized next. Draining (rather than reporting the global
+    /// total) keeps them in the same window as `missing`, which is what makes the
+    /// two comparable.
+    pending_unrecovered_shards: u64,
+    pending_failed_groups: u64,
 }
 
 /// Counts FEC groups that have outlived [`GROUP_TTL`] while still holding
@@ -1084,6 +1108,8 @@ impl Decoder {
             fec_recovery_events: BTreeMap::new(),
             groups: BTreeMap::new(),
             packets: HashMap::new(),
+            pending_unrecovered_shards: 0,
+            pending_failed_groups: 0,
         }
     }
     fn observe_seq(&mut self, seq: u64) -> bool {
@@ -1147,6 +1173,8 @@ impl Decoder {
             fec_recovered_groups,
             late: std::mem::take(&mut self.late_sequences),
             duplicates: std::mem::take(&mut self.duplicate_sequences),
+            unrecovered_shards: std::mem::take(&mut self.pending_unrecovered_shards),
+            failed_groups: std::mem::take(&mut self.pending_failed_groups),
         };
         Some(report)
     }
@@ -1301,6 +1329,12 @@ impl Decoder {
             COUNTERS
                 .unrecovered_shards
                 .fetch_add(unrecovered_shards, Ordering::Relaxed);
+            // Also buffer them for the next `sequence_report`, so the report
+            // carries the accurate loss alongside `missing` in the same window.
+            self.pending_failed_groups = self.pending_failed_groups.saturating_add(failed_groups);
+            self.pending_unrecovered_shards = self
+                .pending_unrecovered_shards
+                .saturating_add(unrecovered_shards);
         }
         // Keep completed groups as short-lived tombstones. Otherwise a late second
         // parity shard recreates the group, reconstructs it again, and duplicates
@@ -1580,6 +1614,13 @@ async fn client(
                         fec_counter_scope="finalized_sequence_window",
                         late=sample.late,
                         duplicates=sample.duplicates,
+                        // The accurate loss, in the same window as `missing`.
+                        // Comparing the two is what distinguishes burst loss from
+                        // independent loss: under independent loss at these rates
+                        // a group should almost never fail, so a group failure
+                        // count that scales with `missing` means bursts.
+                        unrecovered_shards=sample.unrecovered_shards,
+                        failed_groups=sample.failed_groups,
                         tx_parity=parity,
                         "sequence report"
                     );
@@ -2369,6 +2410,8 @@ mod tests {
             fec_recovered_groups: 1,
             late: 0,
             duplicates: 0,
+            unrecovered_shards: 0,
+            failed_groups: 0,
         };
         let mut encoder = Encoder::with_identity(1, VERSION_V3, 1);
         // A peer that has not proved V2 support must always receive a 4-byte
@@ -2421,6 +2464,8 @@ mod tests {
             fec_recovered_groups: 1,
             late: 0,
             duplicates: 0,
+            unrecovered_shards: 0,
+            failed_groups: 0,
         };
         let mut encoder = Encoder::with_identity(1, VERSION_V3, 1);
         let rich = encoder.feedback_frame(Some(sample), true);
@@ -2452,6 +2497,8 @@ mod tests {
             fec_recovered_groups: 1,
             late: 0,
             duplicates: 0,
+            unrecovered_shards: 0,
+            failed_groups: 0,
         };
         let payload = encode_fec_feedback(&sample);
         assert_eq!(payload.len(), FEEDBACK_V2_LEN);
@@ -2481,6 +2528,8 @@ mod tests {
             fec_recovered_groups: 1,
             late: 0,
             duplicates: 0,
+            unrecovered_shards: 0,
+            failed_groups: 0,
         };
         assert!(matches!(
             decode_fec_feedback(&encode_fec_feedback(&reordered)),
