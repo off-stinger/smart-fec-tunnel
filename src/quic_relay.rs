@@ -1528,6 +1528,70 @@ fn env_flag(name: &str, default: bool) -> bool {
     }
 }
 
+/// 地址验证（Retry）的触发策略。
+///
+/// **为什么需要第三种策略**：Retry 是 RFC 9000 §8.1.3 的放大防护，但"**每个**新连接都
+/// Retry"本身就是一处**握手顺序指纹**——主流 QUIC 部署（CDN、浏览器可达的服务端）
+/// 在轻载时直接回 ServerHello，只在高负载/可疑时发 Retry。原实现是 `address_validation &&
+/// incoming.may_retry()`，即对新连接一律 Retry，于是握手的第一步就与常规部署不同。
+///
+/// 默认改为 [`AddressValidation::UnderLoad`]：**轻载不做地址验证、接近并发上限时才做**。
+/// 防护没有削弱——它恰好在我们真正需要它的负载区间生效——但握手顺序在常态下与常规一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressValidation {
+    /// 从不 Retry。
+    Off,
+    /// 每次新连接都 Retry（旧默认行为，保留以便复现与回退）。
+    Always,
+    /// 只在并发连接接近上限时 Retry。
+    UnderLoad,
+}
+
+/// 并发连接（含握手中的）硬上限。见 `connection_slots` 的语义：它不是一个"软"限制，
+/// 达到它就拒绝服务，所以地址验证的触发阈值必须**由它推导**，而不是另写一个字面量。
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+
+/// `UnderLoad` 的触发阈值：可用 permit 降到这个数及以下时开始 Retry。
+///
+/// **由上限定**（1/4）：因此"阈值严格小于上限"是构造性成立的，不需要额外断言；同时它也
+/// 不可能被悄悄改成等于上限——那会让 `UnderLoad` 退化成 `Always`。
+const ADDRESS_VALIDATION_LOAD_SLOTS: usize = MAX_CONCURRENT_CONNECTIONS / 4;
+
+/// 该策略在给定可用 permit 数下是否应当 Retry。
+///
+/// 抽成纯函数是为了可测：accept 循环里的真实负载无法在单测中构造。
+fn should_retry_address_validation(policy: AddressValidation, available_slots: usize) -> bool {
+    match policy {
+        AddressValidation::Off => false,
+        AddressValidation::Always => true,
+        AddressValidation::UnderLoad => available_slots <= ADDRESS_VALIDATION_LOAD_SLOTS,
+    }
+}
+
+/// 解析 `SMART_QUIC_ADDRESS_VALIDATION`。
+///
+/// 未设/空白 → `UnderLoad`（新默认）。`0`/`off`/`false` → `Off`；`1`/`on`/`true` →
+/// `Always`（与旧文档兼容）；`auto`/`load` → `UnderLoad`。**无法识别的值不静默回落**，
+/// 而是打 WARN 后按默认走——与 `SMART_FEC_MAX_PARITY` 同一约定：配置被无声忽略比报错更危险。
+fn parse_address_validation(value: Option<&str>) -> AddressValidation {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return AddressValidation::UnderLoad;
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "0" | "off" | "false" | "no" => AddressValidation::Off,
+        "1" | "on" | "true" => AddressValidation::Always,
+        "auto" | "load" | "under_load" => AddressValidation::UnderLoad,
+        _ => {
+            warn!(
+                value = %raw,
+                "SMART_QUIC_ADDRESS_VALIDATION is not a recognised value \
+                 (expected 0/1/auto); falling back to the default 'auto'"
+            );
+            AddressValidation::UnderLoad
+        }
+    }
+}
+
 /// Audits the certificate the QUIC server is about to present.
 ///
 /// Why this exists: the deployed server presents a **self-signed** certificate
@@ -1776,23 +1840,29 @@ pub async fn run_server(
     let replays = Arc::new(Mutex::new(ReplayCache::new(DEFAULT_REPLAY_CAPACITY)?));
     // Bound concurrent handshakes/relay tasks so unauthenticated connection
     // floods cannot create an unbounded number of Tokio tasks and sockets.
-    let connection_slots = Arc::new(Semaphore::new(256));
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     // RFC 9000 section 8.1 requires address validation before a server commits
     // state to an unvalidated address; section 8.1.3 is the Retry packet
-    // mechanism itself. Validating bounds amplification and makes the server's
-    // first response identical to any other QUIC deployment's. This is
-    // hardening, not camouflage -- it does not change the certificate the
-    // endpoint presents, which is the actual fingerprint (see
-    // `audit_server_certificate`).
-    let address_validation = env_flag(ADDRESS_VALIDATION_ENV, true);
+    // mechanism itself. Validating bounds amplification.
+    //
+    // 但"每个新连接都 Retry"是**握手顺序指纹**：常规 QUIC 部署在轻载时直接回
+    // ServerHello。默认策略因此改为 `UnderLoad` —— 防护在逼近并发上限时才生效。
+    // 注意发射顺序：先取 permit 用量，再决定是否 Retry。
+    let address_validation =
+        parse_address_validation(std::env::var(ADDRESS_VALIDATION_ENV).ok().as_deref());
     info!(
         %listen,
         %upstream,
-        address_validation,
+        policy = ?address_validation,
+        load_threshold = ADDRESS_VALIDATION_LOAD_SLOTS,
         "SFT QUIC relay server started"
     );
     while let Some(incoming) = endpoint.accept().await {
-        if address_validation && incoming.may_retry() {
+        let retry = should_retry_address_validation(
+            address_validation,
+            connection_slots.available_permits(),
+        );
+        if retry && incoming.may_retry() {
             if let Err(error) = incoming.retry() {
                 // `may_retry()` said yes, so this should not happen. The client
                 // simply retries with a token; nothing is lost by moving on.
@@ -1973,6 +2043,82 @@ pub async fn run_client(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// 地址验证策略：默认必须**轻载不 Retry、接近上限才 Retry**。
+    ///
+    /// "每个新连接都 Retry"是握手顺序指纹（常规 QUIC 部署轻载直接回 ServerHello）。
+    /// 本用例同时钉住**防护仍然存在**：逼近并发上限时必须开始 Retry，否则这次改动就
+    /// 变成了"为了伪装而拆掉防护"。
+    #[test]
+    fn address_validation_is_load_gated_by_default_and_still_protects_under_load() {
+        // 未设 / 空白 = 默认策略
+        assert_eq!(parse_address_validation(None), AddressValidation::UnderLoad);
+        assert_eq!(
+            parse_address_validation(Some("   ")),
+            AddressValidation::UnderLoad
+        );
+        // 兼容旧写法
+        assert_eq!(parse_address_validation(Some("0")), AddressValidation::Off);
+        assert_eq!(
+            parse_address_validation(Some("off")),
+            AddressValidation::Off
+        );
+        assert_eq!(
+            parse_address_validation(Some("1")),
+            AddressValidation::Always
+        );
+        assert_eq!(
+            parse_address_validation(Some("on")),
+            AddressValidation::Always
+        );
+        assert_eq!(
+            parse_address_validation(Some("auto")),
+            AddressValidation::UnderLoad
+        );
+        assert_eq!(
+            parse_address_validation(Some("load")),
+            AddressValidation::UnderLoad
+        );
+        // 无法识别不静默回落到 Off（那会削弱防护），而是按默认 UnderLoad
+        assert_eq!(
+            parse_address_validation(Some("yes-please")),
+            AddressValidation::UnderLoad,
+            "an unrecognised value must fall back to the default, never to Off"
+        );
+
+        // 轻载：不 Retry —— 这才是与常规部署一致的握手顺序
+        assert!(
+            !should_retry_address_validation(AddressValidation::UnderLoad, 256),
+            "an idle server must NOT send Retry; that is the fingerprint"
+        );
+        assert!(!should_retry_address_validation(
+            AddressValidation::UnderLoad,
+            ADDRESS_VALIDATION_LOAD_SLOTS + 1
+        ));
+        // 逼近上限：必须开始 Retry —— 防护不能被这次改动拿掉
+        assert!(
+            should_retry_address_validation(
+                AddressValidation::UnderLoad,
+                ADDRESS_VALIDATION_LOAD_SLOTS
+            ),
+            "under load the amplification guard MUST engage"
+        );
+        assert!(should_retry_address_validation(
+            AddressValidation::UnderLoad,
+            0
+        ));
+        // 显式策略不看负载
+        assert!(should_retry_address_validation(
+            AddressValidation::Always,
+            256
+        ));
+        assert!(!should_retry_address_validation(AddressValidation::Off, 0));
+        // 阈值由上限推导（1/4），因此"严格小于上限"是构造性成立的。
+        assert_eq!(
+            ADDRESS_VALIDATION_LOAD_SLOTS,
+            MAX_CONCURRENT_CONNECTIONS / 4
+        );
+    }
 
     /// 传输参数是在**明文可读**的 Initial 包里公布的（QUIC Initial 用公开 salt 派生的
     /// 密钥，RFC 9001 §5.2），所以"公布的双向流上限"是指纹，不是内部常量。
