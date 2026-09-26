@@ -1579,12 +1579,33 @@ async fn send_frames(
     Ok(())
 }
 
+/// 帧间节流器：**虚拟时钟**（GCRA），而不是"睡到桶满"。
+///
+/// 为什么换掉旧实现：旧的是一个 token bucket，配额不足时执行
+/// `sleep((capacity - tokens) / bps)` —— 睡到**桶满** —— 然后无条件
+/// `tokens = capacity`。也就是说，无论实际睡了多久，都只换回"一桶"配额：
+/// **睡眠超时的那部分是净损失**。
+///
+/// 在 28 Mbps 上 `capacity = rate × 4 ms = 14 KB`。一次标称 4 ms 的 sleep 若实际
+/// 耗时 6 ms，长期速率就是 `14 KB / 6 ms = 2.33 MB/s = 18.7 Mbps`——**只有目标的 67%**。
+///
+/// 这与线上实测吻合：服务端 `--rate-mbps 28`（3.5 MB/s），而同一次 40 MB 下载的
+/// FEC 层 `wire_tx_bytes` 只有 `81.14 MB / 34 s = 2.386 MB/s = 19.1 Mbps`
+/// （§10.15 那次测量）。**载体那一层没有限速**——`FixedRate` 在丢包时不缩窗，目标是
+/// `24 / 0.79 ≈ 30 Mbps`——所以瓶颈就在这个 pacer 上，而不在拥塞控制。
+///
+/// 虚拟时钟把超时**记在账上**：每次 `wait` 只把虚拟时钟向前推 `bytes / bps`，发送
+/// 不早于虚拟时钟；睡眠超时使虚拟时钟落后于真实时钟，于是后续调用立即发送，直到
+/// 追平。长期速率因此精确等于 `bytes_per_second`，与调度器抖动无关。
+///
+/// [`Pacer::max_debt`] 限制虚拟时钟能落后多少，否则一段空闲之后会攒出一长串突发。
 #[derive(Debug)]
 struct Pacer {
     bytes_per_second: f64,
-    capacity: f64,
-    tokens: f64,
-    updated: Instant,
+    /// 虚拟时钟：下一个字节最早可以发出的时刻。
+    next_send: Instant,
+    /// 虚拟时钟允许落后真实时钟的上限，即允许的最大追赶突发。
+    max_debt: Duration,
 }
 
 impl Pacer {
@@ -1593,37 +1614,55 @@ impl Pacer {
             bail!("rate-mbps must be between 1 and 1000")
         }
         let bytes_per_second = rate_mbps * 1_000_000.0 / 8.0;
-        // Refill in batches matching the deployed OpenWrt kernel's ~4 ms
-        // scheduling granularity. At 30 Mbps this permits about 15 KB per
-        // batch, avoiding both sub-tick sleeps and 10 ms / 37.5 KB bursts.
-        // The floor guarantees that one maximum-size frame always fits.
-        let capacity = (bytes_per_second * 0.004).max((HEADER + SHARD + TAG) as f64);
         Ok(Self {
             bytes_per_second,
-            capacity,
-            tokens: capacity,
-            updated: Instant::now(),
+            next_send: Instant::now(),
+            // 40 ms 的信用额度：足以吸收 OpenWrt 与 Linux 两端的调度抖动（一次
+            // sleep 超时通常 ≤10 ms），又不至于把一段空闲变成大突发。
+            // 上限 40 ms × 3.5 MB/s = 140 KB。
+            max_debt: Duration::from_millis(40),
         })
     }
 
     async fn wait(&mut self, bytes: usize) {
         let now = Instant::now();
-        self.tokens = (self.tokens
-            + now.duration_since(self.updated).as_secs_f64() * self.bytes_per_second)
-            .min(self.capacity);
-        self.updated = now;
-        let needed = bytes as f64;
-        if self.tokens < needed {
-            // Refill in scheduler-sized batches. OpenWrt cannot reliably wake
-            // for the sub-millisecond per-frame deficit at 30+ Mbit/s; doing so
-            // collapses throughput because each nominal 0.3 ms wait rounds up.
-            let delay = (self.capacity - self.tokens) / self.bytes_per_second;
-            time::sleep(Duration::from_secs_f64(delay)).await;
-            self.updated = Instant::now();
-            self.tokens = self.capacity;
+        let (next_send, delay) = pace_step(
+            self.next_send,
+            now,
+            bytes,
+            self.bytes_per_second,
+            self.max_debt,
+        );
+        self.next_send = next_send;
+        if !delay.is_zero() {
+            time::sleep(delay).await;
         }
-        self.tokens -= needed;
     }
+}
+
+/// [`Pacer::wait`] 的纯决策部分：由虚拟时钟、当前时刻与本次字节数算出
+/// **新的虚拟时钟**与**应等待的时长**。
+///
+/// 抽成自由函数是为了可测：真实 `sleep` 的超时行为在单测里无法复现，但"超时如何
+/// 记账"正是这里唯一的逻辑。`tests::pacer_repays_sleep_overshoot` 用注入的时钟与
+/// 人为的超时驱动它，把新旧两种记账放在同一超时下对比。
+fn pace_step(
+    next_send: Instant,
+    now: Instant,
+    bytes: usize,
+    bytes_per_second: f64,
+    max_debt: Duration,
+) -> (Instant, Duration) {
+    if !bytes_per_second.is_finite() || bytes_per_second <= 0.0 {
+        return (now, Duration::ZERO);
+    }
+    // 空闲太久之后不允许无限追赶：虚拟时钟最多落后真实时钟 `max_debt`。
+    let earliest = now.checked_sub(max_debt).unwrap_or(now);
+    let base = next_send.max(earliest);
+    let cost = Duration::from_secs_f64(bytes as f64 / bytes_per_second);
+    let deadline = base + cost;
+    let delay = deadline.saturating_duration_since(now);
+    (deadline, delay)
 }
 
 async fn client(
@@ -2869,6 +2908,104 @@ mod tests {
                 "parse_max_parity({raw:?}) = {parity} is outside [{MIN_PARITY}, {MAX_PARITY}]"
             );
         }
+    }
+
+    #[test]
+    fn pacer_repays_sleep_overshoot() {
+        // 同一组参数与同一个"睡眠超时"下，比较两种记账方式的长期速率。
+        // 参数取线上实测值：--rate-mbps 28，单帧约 1392 字节。
+        const BPS: f64 = 28.0 * 1_000_000.0 / 8.0; // 3,500,000 B/s
+        const FRAME: usize = HEADER + SHARD + TAG; // 1392
+        const RUNTIME: f64 = 2.0; // 模拟 2 秒
+                                  // 调度器抖动：标称 4 ms 的 sleep 实际睡 6 ms（超时 2 ms）。
+        let overshoot = Duration::from_millis(2);
+
+        let new_rate = simulated_virtual_clock_rate(BPS, FRAME, RUNTIME, overshoot);
+        let old_rate = simulated_token_bucket_rate(BPS, FRAME, RUNTIME, overshoot);
+
+        eprintln!(
+            "pacer: target={:.3} MB/s  virtual-clock={:.3} ({:.1}%)  token-bucket={:.3} ({:.1}%)",
+            BPS / 1e6,
+            new_rate / 1e6,
+            100.0 * new_rate / BPS,
+            old_rate / 1e6,
+            100.0 * old_rate / BPS
+        );
+
+        // 虚拟时钟必须基本达到目标——超时被记在账上并补回来。
+        assert!(
+            new_rate >= 0.97 * BPS,
+            "the virtual-clock pacer must reach the configured rate despite sleep overshoot, got {:.1}%",
+            100.0 * new_rate / BPS
+        );
+        // 旧实现"睡到桶满且不记超时"，因此丢掉超时那一份。这里把它作为**对照**
+        // 断言其确实达不到目标，以防有人把记账方式改回去。
+        assert!(
+            old_rate < 0.80 * BPS,
+            "the old token-bucket accounting should be shown to lose the overshoot, got {:.1}%",
+            100.0 * old_rate / BPS
+        );
+    }
+
+    /// 虚拟时钟模型：`pace_step` 的长期速率。
+    fn simulated_virtual_clock_rate(
+        bytes_per_second: f64,
+        frame: usize,
+        runtime_secs: f64,
+        overshoot: Duration,
+    ) -> f64 {
+        let epoch = Instant::now();
+        let mut now = epoch;
+        let mut next_send = epoch;
+        let end = epoch + Duration::from_secs_f64(runtime_secs);
+        let mut delivered = 0usize;
+        while now < end {
+            let (next, delay) = pace_step(
+                next_send,
+                now,
+                frame,
+                bytes_per_second,
+                Duration::from_millis(40),
+            );
+            next_send = next;
+            // 只有真的睡了才可能有超时。
+            now += delay;
+            if !delay.is_zero() {
+                now += overshoot;
+            }
+            delivered += frame;
+        }
+        delivered as f64 / runtime_secs
+    }
+
+    /// 旧实现模型：睡到桶满、然后无条件把 tokens 设回 capacity（超时被丢弃）。
+    fn simulated_token_bucket_rate(
+        bytes_per_second: f64,
+        frame: usize,
+        runtime_secs: f64,
+        overshoot: Duration,
+    ) -> f64 {
+        let capacity = (bytes_per_second * 0.004).max((HEADER + SHARD + TAG) as f64);
+        let mut tokens = capacity;
+        let mut now = Instant::now();
+        let mut updated = now;
+        let end = now + Duration::from_secs_f64(runtime_secs);
+        let mut delivered = 0usize;
+        while now < end {
+            tokens = (tokens + now.duration_since(updated).as_secs_f64() * bytes_per_second)
+                .min(capacity);
+            updated = now;
+            let needed = frame as f64;
+            if tokens < needed {
+                let delay = (capacity - tokens) / bytes_per_second;
+                now += Duration::from_secs_f64(delay) + overshoot;
+                updated = now;
+                tokens = capacity;
+            }
+            tokens -= needed;
+            delivered += frame;
+        }
+        delivered as f64 / runtime_secs
     }
 
     /// 这条用例钉住的正是线上观测到的那个缺陷：**第一个 session 结束后，
