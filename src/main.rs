@@ -773,12 +773,17 @@ impl Drop for TrafficLoggerClaim {
 // frames_rejected -- malformed frames, or frames for another identity/session.
 //   A spike means the two ends disagree about configuration, which would
 //   otherwise look exactly like packet loss.
+// inner_peer_conflicts -- datagrams from a *second* inner peer, which the tunnel
+//   refuses (see `classify_inner_peer`). Non-zero means something other than the
+//   intended single inner client is using the local SOCKS port; its traffic is
+//   dropped rather than allowed to hijack the return path.
 traffic_counters! {
     inner_rx_bytes,
     inner_rx_datagrams,
     inner_tx_bytes,
     inner_tx_datagrams,
     inner_tx_failures,
+    inner_peer_conflicts,
     wire_tx_bytes,
     wire_rx_bytes,
     wire_tx_data_frames,
@@ -1665,6 +1670,45 @@ fn pace_step(
     (deadline, delay)
 }
 
+/// 内层对端的归属判定。
+///
+/// **背景（实测事故）**：`client()` 原先用 `app_peer: Option<SocketAddr>` 记住"最近一个
+/// 收到数据的内层对端"，回程数据全部投给它。第二个内层对端一出现，`app_peer` 就被接管，
+/// **原对端的回程流量被静默投递给新对端**。
+///
+/// 现场表现（2026-09-27，为验证"多连接叠加"而起第二个 sing-box 实例）：
+///
+/// | 观察 | 值 |
+/// | --- | --- |
+/// | 第二连接的小请求（`/cdn-cgi/trace`） | 正常，HTTP **200** |
+/// | 第二连接的大文件下载 | HTTP 200 但只有 **21 B/s** |
+/// | 同时跑两条 | 连接1 1.36 MB/s，连接2 **http=000（无响应）** |
+///
+/// 小请求能过、批量下载归零，正是"回程被投递到另一个 socket"的特征——不是链路问题：
+/// 同一次实验里连接1 始终健康，而且预检确认目标返回 200（当时 `speed.cloudflare.com`
+/// 确实一度对本机返回 403+1 字节，那是另一回事，见 §10.18 的更正）。
+///
+/// 因此本函数把"谁是内层对端"变成**一次性决定**：第一个对端被接受并锁定，后续来自
+/// 其它地址的数据报一律拒绝并计数。这样既不会错投，也不会让本机任意进程通过往
+/// `127.0.0.1:3333` 发一个包就劫持代理的回程路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerVerdict {
+    /// 第一个内层对端：接受并锁定。
+    Accept,
+    /// 与已锁定的对端相同：正常。
+    Same,
+    /// 第二个对端：拒绝，且**不**接管回程路径。
+    Conflict,
+}
+
+fn classify_inner_peer(current: Option<SocketAddr>, incoming: SocketAddr) -> PeerVerdict {
+    match current {
+        None => PeerVerdict::Accept,
+        Some(peer) if peer == incoming => PeerVerdict::Same,
+        Some(_) => PeerVerdict::Conflict,
+    }
+}
+
 async fn client(
     listen: SocketAddr,
     server: SocketAddr,
@@ -1702,7 +1746,26 @@ async fn client(
     loop {
         tokio::select! {
             r = local.recv_from(&mut local_buf) => {
-                let (n, peer) = r?; app_peer = Some(peer);
+                let (n, peer) = r?;
+                match classify_inner_peer(app_peer, peer) {
+                    PeerVerdict::Accept => app_peer = Some(peer),
+                    PeerVerdict::Same => {}
+                    PeerVerdict::Conflict => {
+                        // 拒绝而不是接管：接管会把已锁定对端的回程流量错投给新对端。
+                        COUNTERS.inner_peer_conflicts.fetch_add(1, Ordering::Relaxed);
+                        // 只在第一次冲突时告警，避免刷日志。
+                        if COUNTERS.inner_peer_conflicts.load(Ordering::Relaxed) == 1 {
+                            warn!(
+                                locked = ?app_peer,
+                                rejected = %peer,
+                                "second inner peer rejected: this tunnel serves exactly one \
+                                 inner client; its datagrams are dropped rather than allowed \
+                                 to take over the return path"
+                            );
+                        }
+                        continue;
+                    }
+                }
                 COUNTERS.inner_rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 COUNTERS.inner_rx_datagrams.fetch_add(1, Ordering::Relaxed);
                 let frames = encoder.lock().await.encode_datagram(&local_buf[..n])?;
@@ -3006,6 +3069,37 @@ mod tests {
             delivered += frame;
         }
         delivered as f64 / runtime_secs
+    }
+
+    /// 钉住实测事故：第二个内层对端**不能**接管回程路径。
+    ///
+    /// 现场：第二连接小请求 HTTP 200，大文件 21 B/s，而第一条始终健康——即回程被投递
+    /// 到了另一个 socket。修复前 `app_peer = Some(peer)` 无条件覆盖，本用例会失败。
+    #[test]
+    fn a_second_inner_peer_must_not_take_over_the_return_path() {
+        let first: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+
+        // 第一个对端被接受
+        assert_eq!(classify_inner_peer(None, first), PeerVerdict::Accept);
+        // 同一个对端继续正常
+        assert_eq!(classify_inner_peer(Some(first), first), PeerVerdict::Same);
+        // 第二个对端必须被拒绝——无论它多"新"
+        assert_eq!(
+            classify_inner_peer(Some(first), second),
+            PeerVerdict::Conflict,
+            "a second inner peer must be rejected, not allowed to take over the return path"
+        );
+        // 而且反复出现也仍然是 Conflict（不会被"重新接受"）
+        assert_eq!(
+            classify_inner_peer(Some(first), second),
+            PeerVerdict::Conflict
+        );
+        // 反向亦然：锁定的是谁就锁死谁
+        assert_eq!(
+            classify_inner_peer(Some(second), first),
+            PeerVerdict::Conflict
+        );
     }
 
     /// 这条用例钉住的正是线上观测到的那个缺陷：**第一个 session 结束后，
