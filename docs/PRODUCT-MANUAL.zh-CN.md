@@ -387,6 +387,18 @@ SMARTFEC 节点路径。
 凡是有风控的 Google 服务（搜索、账号）优先走 `direct`（自有机房 IP）；视频 CDN
 （googlevideo / ytimg）走 WARP 没有问题。
 
+**位置判定的最终验证**（服务端直连取回的 Google 页面里有两处独立证据）：
+
+```html
+<div class="O3yKUb">Singapore</div>      <!-- Google 渲染的位置元素 -->
+<a href=".../preferences?hl=en-SG&fg=1"> <!-- Google 把区域判定为 en-SG -->
+```
+
+即 Google 对 `direct`（腾讯云新加坡）出口的判定是 **Singapore**；而对 WARP 出口判定为广东省。
+**注意**：Google 会把推断出的位置写进 `NID` cookie（有效期数月），切换出口后浏览器仍会沿用
+旧值。若页脚仍显示旧位置，点页脚的"更新位置信息"，或清除 google.com 的 cookie / 用无痕窗口，
+即可看到新判定。
+
 ## 11. 内核感知优化阶段
 
 内核优化按能力和验证结果分级，不以固定 `sysctl` 大全作为产品功能。
