@@ -72,13 +72,33 @@ echo 'SMART_QUIC_CONGESTION=cubic' >> /etc/smart-fec-quic.env
 `wire_loss_ppm`、`mtu`、`black_holes`，判读方法见产品说明书 §10.1。
 **对照结束后不要改回 `new_reno`**：本链路实测 `new_reno` 的窗口会被压到
 RFC 9002 下限（2944 字节）、吞吐 4.5 KB/s，而 `bbr` 与 `fixed` 都在 42–49 万 B/s。
-丢包率明确（链路专线或已知随机丢包）时用 `fixed` 并配 `SMART_QUIC_FIXED_RATE_MBPS`，
-否则用 `bbr`。完整对照见产品说明书 §10.6。
 
-**不要用 `fixed` 超过链路真实容量**：`fixed` 是按配置速率发送、对丢包不做退让，
-配高了丢包会变成永久性丢包，FEC 也补不回来（代码启动时会打印同样的告警）。
-另外实际发送速率上限是配置值的 **1.25 倍**（ACK 速率补偿），且 FEC 开销出自同一
-预算，因此 30 Mbps 链路应填 24 而不是 30（§10.5）。
+**默认控制器是 `adaptive`**（未设置 `SMART_QUIC_CONGESTION` 时）。它保留
+`fixed` 的"随机丢包不退让"特性，但把人工配置的固定速率换成**受硬预算约束的探测**：
+时延优先（RFC 9265 §5 说 FEC 置于传输层之下时丢包被屏蔽，对时延型无害、对丢包型
+有害），只对**突发**丢包退让（分散丢包在已知有损路径上按 RFC 9265 建议 1 不应降速），
+并且硬顶夹在**有效**速率上——所以 `SMART_QUIC_MAX_RATE_MBPS=30` 就是 30，
+不会被 1.25 倍 ACK 补偿放大越界（产品说明书 §10.11）。
+
+**`fixed` 仍然保留**，用于链路容量已知且丢包确定不是拥塞的场合。但要清楚
+`fixed` **没有绝对上限**：有效速率可达配置值的 1.25 倍，且 FEC 开销出自同一预算，
+因此 30 Mbps 链路应填 24 而不是 30（§10.5）。
+
+### 3.1.1 环境变量一览
+
+| 变量 | 作用域 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `SMART_QUIC_CONGESTION` | 两端 | `adaptive` | `adaptive`/`new_reno`/`cubic`/`bbr`/`fixed` |
+| `SMART_QUIC_MAX_RATE_MBPS` | 两端 | `30` | 仅 `adaptive`：**有效**发送速率硬顶 |
+| `SMART_QUIC_FIXED_RATE_MBPS` | 两端 | `28` | 仅 `fixed`：目标速率（有效速率可到 1.25 倍） |
+| `SMART_QUIC_ADDRESS_VALIDATION` | 服务端 | 开 | QUIC Retry 地址验证（RFC 9000 §8.1.3）；设 `0` 关闭 |
+| `SMART_QUIC_REQUIRE_TRUSTED_CERT` | 服务端 | 关 | 设 `1` 时，自签证书直接拒绝启动 |
+| `SMART_FEC_TRAFFIC_LOG` | 两端 | 开 | T1 流量账目，每 5 秒一条；设 `0` 关闭 |
+| `SMART_QUIC_STREAM_LANES` | 客户端 | 不传 | 仅 `1` 有意义（不传 = DATAGRAM） |
+
+`tests/deploy_env_coverage.rs` 会检查路由器 init 是否转发了客户端侧读的每个
+`SMART_QUIC_*`：**新增客户端环境变量时必须同时更新 init**，否则在
+`/etc/smart-fec-quic.env` 里设置会被静默忽略（T3 引入 `MAX_RATE` 时就是这样漏掉的）。
 
 ### 3.2 旁路由 init 脚本的两条硬约束
 

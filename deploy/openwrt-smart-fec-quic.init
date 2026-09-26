@@ -8,18 +8,29 @@ start_service() {
     . /etc/smart-fec-quic.env
     [ -n "${SMART_FEC_KEY_ID:-}" ] || return 1
     local_port="${SMART_QUIC_LOCAL_PORT:-8444}"
-    # 载体拥塞控制器：new_reno（默认）| cubic | bbr | fixed。可在 /etc/smart-fec-quic.env
-    # 中只改这一端，用于单侧 A/B；拥塞控制是发送端本地行为，不需要两端一致。
-    congestion="${SMART_QUIC_CONGESTION:-new_reno}"
-    # fixed（丢包容忍的固定速率控制器）的目标速率，单位 Mbps。仅当 congestion=fixed
-    # 时生效；实际发送速率上限为 1.25x 该值（ACK 速率补偿），且 FEC 开销出自同一预算
-    # —— 见 PRODUCT-MANUAL §10.5，因此 30 Mbps 链路应填 24 而不是 30。
+    # 载体拥塞控制器：adaptive（默认）| new_reno | cubic | bbr | fixed。
+    # 可在 /etc/smart-fec-quic.env 中只改这一端，用于单侧 A/B；拥塞控制是发送端
+    # 本地行为，不需要两端一致。
+    congestion="${SMART_QUIC_CONGESTION:-adaptive}"
+    # 仅 congestion=fixed 时生效：丢包容忍的固定速率目标，单位 Mbps。
+    # 注意它的**有效**发送速率上限是 1.25x 该值（ACK 速率补偿），且 FEC 开销出自
+    # 同一预算，因此 30 Mbps 链路应填 24 而不是 30（PRODUCT-MANUAL §10.5）。
     fixed_rate_mbps="${SMART_QUIC_FIXED_RATE_MBPS:-}"
+    # 仅 congestion=adaptive 时生效：**有效**发送速率的硬顶，单位 Mbps。
+    # 这是出方向预算（服务器侧是腾讯云出方向实测 30.6-31.2 Mbps；路由器侧是家宽
+    # 上行）。与 FIXED_RATE 的区别：这里是钳住补偿后的有效速率，所以填 30 就是
+    # 30，不会被 1.25 倍放大越界（PRODUCT-MANUAL §10.11）。
+    max_rate_mbps="${SMART_QUIC_MAX_RATE_MBPS:-}"
+    # T1 的流量账目默认开启，每 5 秒一条。路由器 syslog 环形缓冲只有 128KB，
+    # 需要时可用 SMART_FEC_TRAFFIC_LOG=0 关掉。
+    traffic_log="${SMART_FEC_TRAFFIC_LOG:-}"
     # 注意：procd 的 env 参数走 _procd_add_table -> json_add_object("env")，多次调用
     # procd_set_param env 会生成重复的 "env" 键，JSON 解析后只有最后一次生效，前面几组
     # 环境变量会被静默丢弃（表现为二进制报缺少 --key）。必须只调用一次、合并传入。
     envs="SMART_FEC_KEY=$SMART_FEC_KEY SMART_QUIC_CONGESTION=$congestion RUST_LOG=info"
     [ -z "$fixed_rate_mbps" ] || envs="$envs SMART_QUIC_FIXED_RATE_MBPS=$fixed_rate_mbps"
+    [ -z "$max_rate_mbps" ] || envs="$envs SMART_QUIC_MAX_RATE_MBPS=$max_rate_mbps"
+    [ -z "$traffic_log" ] || envs="$envs SMART_FEC_TRAFFIC_LOG=$traffic_log"
     # 只有显式配置为 1 时才传这一项：不传即 datagram 模式（默认，配合 FEC 纠错）。
     # 不传 "0" 是为了兼容旧二进制对 "0" 的拒绝（见 parse_stream_lanes）。
     [ "${SMART_QUIC_STREAM_LANES:-}" != "1" ] || envs="$envs SMART_QUIC_STREAM_LANES=1"
