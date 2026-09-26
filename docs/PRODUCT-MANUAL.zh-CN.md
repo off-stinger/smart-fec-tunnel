@@ -1196,6 +1196,85 @@ SOCKS5 UDP 口），服务端 sing-box 用 `tuic` inbound 监听 `127.0.0.1:4443
 原因——**iKuai 侧的 WAN 固定应先于任何内层 CC 实验完成**。同时要先确定钉哪一条：§10.17
 上表显示 52 ms/丢包那条并不劣于 335 ms/干净那条。
 
+### 10.18 真正的天花板：内层 TUIC 的**连接级**流控窗口（约 1.9 MB/s，与 FEC 无关）
+
+§10.17 排除了 FEC pacer 与载体 pacer。本节继续用**单变量探针**排除内层 CC，然后用**并发
+流实验**把剩下的候选收敛到一个：**内层 TUIC 单条 QUIC 连接的接收窗口**。
+
+#### 已排除的候选（每个都是一次只改一个变量的实测）
+
+| 探针 | 改动 | 端到端下载 | 结论 |
+| --- | --- | --- | --- |
+| FEC pacer | `--rate-mbps` 28 → **200**（7.1×） | 1.686 → 1.768 MB/s（**+4.9%**） | 不是 pacer |
+| 载体速率 | `fixed@24`/上限30 → `fixed@90`/上限90（3.75×） | payload **+0%**，线上字节 +45% | 不是载体；多出的容量**全被 FEC 冗余吃掉**（`parity/data` 0.124 → 0.450），零收益 |
+| 内层 TUIC CC | 服务端 inbound `bbr` → `cubic` | 1.861 → **1.610 MB/s**（更慢） | 不是 CC 算法选择 |
+| 路由器 CPU | 逐进程画像 | 整机 **37%**（0.74/2 核）；quic-client 26%、FEC client 21%、sing-box 12% | 没有单进程跑满一核 |
+| 路由器 socket 丢包 | `/proc/net/udp` drops | 前后均为 **0** | 无缓冲溢出 |
+| 上限与出口 | 服务器本机直连/WARP | **16.9 MB/s**（§10.16） | 不是计费带宽、不是上游 |
+
+**注意第二行的方法论价值**：把载体速率提高 3.75 倍，多出来的线上容量被 FEC 冗余**全部**
+吸收而载荷零增长——这正是 §10.13"由丢包驱动的冗余模型会自己制造丢包信号"的现场证据：
+速率越高，序列报告里的 `missing` 越多，控制器就越买冗余。
+
+#### 联网核验：quic-go 的窗口默认值是 512 KB，且自动调优是**有条件的**
+
+sing-box 的 TUIC **没有**任何窗口配置项（已核对 v1.9 的 outbound schema：字段只有
+`server/server_port/uuid/password/congestion_control/udp_relay_mode/udp_over_stream/
+zero_rtt_handshake/heartbeat/network/tls`，**无 `receive_window`/`stream_receive_window`**）。
+窗口因此是底层 quic-go 的默认值。quic-go 的 `Config` 文档（
+<https://pkg.go.dev/github.com/quic-go/quic-go> ）原文：
+
+> `InitialStreamReceiveWindow` … **If this value is zero, it will default to 512 KB.**
+> If the application is consuming data quickly enough, the flow control **auto-tuning**
+> algorithm will increase the window up to `MaxStreamReceiveWindow`.
+>
+> `MaxStreamReceiveWindow` … If this value is zero, it will default to **6 MB**.
+>
+> `InitialConnectionReceiveWindow` … default **512 KB**.
+
+**算术对上了**：`512 KB / 340 ms = 1.51 MB/s = 12.1 Mbps`，而实测内层交付恒定在
+**1.41–1.64 MB/s（11.3–13.1 Mbps）**——即**初始窗口值、且自动调优没有把它抬起来**。
+
+#### 判决实验：并发流**不叠加** → 瓶颈在**连接级**而非流级
+
+若瓶颈是"每流 512 KB 窗口 / RTT"，则 N 条并发 TCP 流应近似线性叠加。实测（同一 WAN）：
+
+| 并发流数 | 单流均值 | **合计** |
+| --- | --- | --- |
+| 1 | 1,879,622 B/s | **1.79 MB/s** |
+| 2 | 956,324 B/s | **1.82 MB/s** |
+| 4 | 513,115 B/s | **1.96 MB/s** |
+| 8 | 252,250 B/s | **1.92 MB/s** |
+
+**合计完全不变（~1.9 MB/s），单流精确地按 1/N 摊薄。** 这是**共享的、连接级**约束的特征
+签名，而不是流级窗口。它与"连接级 512 KB 窗口 / RTT"吻合，也解释了为什么前面所有
+FEC/载体层面的改动都毫无作用——**瓶颈根本不在我们这一层**。
+
+（排除了"源站按 IP 限速"：服务器本机从同一 URL 拉到 16.9 MB/s。）
+
+#### 对目标与结论的影响
+
+- T5 的"效率 22%→40%+"早已达成（**78.5%**，§10.16）。
+- "交付 20+ Mbps"**在当前架构下不可达**：它要求单条 TUIC 连接在 340 ms RTT 上传
+  20 Mbps，即窗口 ≥ 850 KB，而实测有效窗口是初始值 512 KB 量级、且**不随并发流扩展**。
+- 本项目原先的假设——"79–86% 在隧道内被吃掉、所以要改 FEC"——**被证伪**：被吃掉的部分
+  在内层 TUIC 的连接窗口上，与 FEC 的冗余、载体控制器、pacer 都无关。
+
+#### 可动的杠杆（按可行性排序，均需先固定 WAN）
+
+1. **降低 RTT**：`窗口 / RTT`，所以把隧道钉到 52 ms 那条 WAN 理论上给出 ~9.8 MB/s。实测该
+   WAN 只有 1.34 MB/s（18–23% 丢包），说明那条 WAN 上**另一个约束**（丢包）先绑定——所以
+   这不是"钉哪条"就能解决，而要看两条 WAN 上各自的绑定约束。
+2. **多连接而非多流**：sing-box 把一个 outbound 的所有流复用进**一条** QUIC 连接，所以
+   §10.18 的并发实验无法突破连接窗口。要突破必须让流量分布在**多条 TUIC 连接**上
+   （多个 outbound 实例 / 多进程），使连接窗口可叠加。这是唯一不动 sing-box 源码的路。
+3. **换/改内层协议**：给 sing-box 打补丁调大 `InitialConnectionReceiveWindow`/开启更激进的
+   自动调优，或改用窗口可配的内层协议。改动最大，但直接命中根因。
+
+**下一步的第一件事**：验证第 2 条——用两个独立 sing-box outbound（各自一条 TUIC 连接）
+分别承载并发下载，若合计接近 2×1.9 MB/s，则连接窗口假设被独立证实，同时给出立即可用的
+吞吐解法。
+
 ## 11. 内核感知优化阶段
 
 内核优化按能力和验证结果分级，不以固定 `sysctl` 大全作为产品功能。
