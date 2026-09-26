@@ -54,6 +54,28 @@ logread -e smart-fec
 
 确认无误后，再把 Passwall 的 TUIC 服务端改为本机 FEC 监听地址；脚本不会替你切换主链路。
 
+### 3.1 单端 A/B 与升级顺序
+
+载体的拥塞控制是发送端本地行为、不参与协商，因此可以只改一端做对照：
+
+```sh
+# 服务端（Debian）：写入既有 EnvironmentFile，不需要改 unit
+echo 'SMART_QUIC_CONGESTION=cubic' >> /etc/smart-fec/quic.env
+systemctl restart smart-fec-quic
+
+# 旁路由（ImmortalWrt）：写入既有 env 文件，init 已转发该变量
+echo 'SMART_QUIC_CONGESTION=cubic' >> /etc/smart-fec-quic.env
+/etc/init.d/smart-fec-quic restart
+```
+
+对照时观察 `QUIC carrier stats`（5 秒一条）中的 `cwnd_bytes`、`congestion_events`、
+`wire_loss_ppm`、`mtu`、`black_holes`，判读方法见产品说明书 §10.1。
+对照结束后改回 `new_reno` 并重启。
+
+FEC 反馈帧自本版本起带能力协商（先发 4 字节，确认对端支持后才发 24 字节），
+因此两端**不再需要同时升级**，可以任意顺序滚动；若想绝对保守，升级一端后观察 5 分钟
+再动另一端。详见产品说明书 §10.2。
+
 Google/YouTube 稳定出口维护器每天刷新显式域名规则，将 Google 网页、API、静态资源以及 YouTube 页面/视频 CDN 的 TCP 请求统一交给 `warp-balance`；不再依据 Google 公布的云网段生成直连规则，也不依赖不断变动的 Google IP 列表。只有规则变化时才备份、校验并重启 sing-box；查看状态：
 
 ```sh

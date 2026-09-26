@@ -247,6 +247,60 @@ Windows 第一版目标是提供常驻 Agent/Service，而不是让用户维护�
 
 默认收集性能计数，不记录 URL、业务内容或完整域名历史。诊断包必须脱敏，并明确列出包含的字段。
 
+### 10.1 载体拥塞控制器调优与 A/B 实测
+
+载体的拥塞控制是**发送端本地行为，不参与握手协商**，因此可以只改一端做单侧对照。
+可选值由 `SMART_QUIC_CONGESTION` 控制：
+
+| 值 | 说明 |
+| --- | --- |
+| `new_reno`（默认） | quinn 默认控制器。每次丢包事件把窗口砍半，持续拥塞时降到 `2 × MTU` |
+| `cubic` | RFC 8312 控制器 |
+| `bbr` | 带宽-时延积模型。quinn 官方标注为实验性，选中时进程以 warn 级别记录 |
+
+设置位置：服务端写 `/etc/smart-fec/quic.env`，旁路由写 `/etc/smart-fec-quic.env`；
+两者都已被既有的 unit / init 读取，不需要改单元文件。非法取值会让进程在启动时直接失败，
+不会静默回退到操作者没有选择的控制器。
+
+三种控制器统一按 RFC 9002 §7.2 计算初始窗口
+（`min(10 × MTU, max(2 × MTU, 14720))`，取连接实际协商到的 MTU），
+而不是 quinn `Default` 里那个忽略 MTU 的编译期常量 12000。
+
+对照实验时只看 `QUIC carrier stats` 这一行（默认 5 秒一条）：
+
+```text
+wire_loss_ppm / sent_packets / lost_packets / lost_bytes / congestion_events /
+black_holes / lost_plpmtud_probes / datagram_tx / datagram_rx /
+udp_tx_datagrams / udp_rx_datagrams / tx_bytes / rx_bytes / rtt_ms /
+cwnd_bytes / mtu
+```
+
+判读要点：
+
+- `cwnd_bytes` 长期贴近 `2 × mtu`：控制器已被丢包打到下限，瓶颈在载体而不是 FEC；
+- `congestion_events` 的增速直接反映控制器对丢包的反应频率；
+- `wire_loss_ppm` 与 FEC 层的 `sequence_gap_ppm` 对比，可判断丢包发生在载体之内还是之上；
+- `black_holes` / `lost_plpmtud_probes` / `mtu` 三者一起解释路径 MTU 的波动；
+- `datagram_tx` / `datagram_rx` 是 FEC 之下的真实投递量，`udp_*_datagrams` 用于对照每个
+  UDP 报文承载了几个数据报。
+
+一个容易被忽略的因果：RFC 9221 §5.4 允许发送端在拥塞控制不允许时**直接丢弃** DATAGRAM
+而不发送。这类丢弃发生时数据报已经占用 FEC 序号却从未上线，FEC 无法重建从未发出的分片。
+所以拥塞控制器不只影响吞吐，也会影响 FEC 的实际有效性。
+
+### 10.2 FEC 反馈协商与升级顺序
+
+V2 反馈帧（24 字节）比旧版 4 字节帧多携带"重建符号数 / 组数"。已部署的旧版本只在
+`payload.len() == 4` 时解析报告帧，其他长度会被解码器丢弃，因此：
+
+- 若无条件只发 24 字节帧，**未升级那一端会完全收不到丢包样本**，其自适应 parity 永久
+  冻结——既不因丢包上升，也不因空闲衰减；
+- 现在发送端先发 4 字节帧，直到对端自证能产生 V2 样本后才切换为 24 字节帧。
+
+结果是两端可以任意顺序升级，不再需要"同时升级"。混合版本期间唯一的代价是：未升级那一端
+不贡献"重建符号数 / 组数"这两个富字段，但仍然正常收到丢包率并照常自适应。
+若要绝对保守，升级一端后观察 5 分钟再升级另一端。
+
 ## 11. 内核感知优化阶段
 
 内核优化按能力和验证结果分级，不以固定 `sysctl` 大全作为产品功能。
