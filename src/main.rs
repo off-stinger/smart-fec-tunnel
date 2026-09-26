@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -586,6 +586,192 @@ fn encode_fec_feedback(sample: &SequenceReport) -> Vec<u8> {
     payload
 }
 
+/// Interval length for the traffic-accounting record, in seconds.
+const TRAFFIC_INTERVAL_SECS: u64 = 5;
+
+/// Declares the process-wide traffic counters once, then derives the snapshot
+/// struct plus its `read`/`delta` implementation from the same field list.
+///
+/// The single list matters: a hand-written snapshot that silently omits a field
+/// is exactly the kind of instrumentation bug that makes the accounting fail to
+/// close, which is the one thing this whole exercise exists to detect.
+macro_rules! traffic_counters {
+    ($($field:ident),* $(,)?) => {
+        /// Process-wide FEC-layer traffic accounting.
+        ///
+        /// These counters exist to answer one question the existing telemetry
+        /// cannot: the carrier reports ~zero packet loss and the FEC layer
+        /// reports `missing=0`, yet the application receives only a fraction of
+        /// what the server puts on the wire. One hypothesis -- that the inner
+        /// UDP socket silently drops because its consumer (TUIC) is slow -- was
+        /// falsified before writing this: `/proc/net/snmp` `RcvbufErrors` did
+        /// not move at all under a sustained load. So the accounting has to
+        /// happen in-process, at every boundary a byte crosses.
+        ///
+        /// Deliberately global rather than threaded through every send/receive
+        /// path: a handle would touch far more code than a diagnostic is worth.
+        /// Every field is monotonic; records emit deltas.
+        struct Counters {
+            $( $field: AtomicU64, )*
+        }
+        impl Counters {
+            const fn new() -> Self {
+                Self { $( $field: AtomicU64::new(0), )* }
+            }
+        }
+        static COUNTERS: Counters = Counters::new();
+
+/// Claims the single traffic-logging role on the server.
+///
+/// [`COUNTERS`] is process-wide but `run_server_session` runs once per device
+/// session, so without this every concurrent session would emit its own record
+/// of the *same* global totals -- overlapping deltas that look like duplicated
+/// traffic. Exactly one session logs; the totals it reports are still complete.
+static TRAFFIC_LOGGER_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Clone, Copy, Default)]
+        struct CounterSnapshot {
+            $( $field: u64, )*
+        }
+        impl CounterSnapshot {
+            fn read() -> Self {
+                Self { $( $field: COUNTERS.$field.load(Ordering::Relaxed), )* }
+            }
+            fn delta(&self, previous: &Self) -> Self {
+                Self { $( $field: self.$field.saturating_sub(previous.$field), )* }
+            }
+        }
+    };
+}
+
+// Field list for `traffic_counters!`. Attributes cannot be attached to an
+// `ident` fragment, so the explanations live here rather than as doc comments.
+//
+// inner_rx_bytes / inner_rx_datagrams -- bytes the inner side (TUIC) handed to
+//   the tunnel, i.e. what the inner protocol actually offered.
+// inner_tx_bytes / inner_tx_datagrams -- bytes the tunnel handed to the inner
+//   side, i.e. what the application should have received.
+// inner_tx_failures -- inner-side send failures. A silent drop here would
+//   otherwise be indistinguishable from data that was never sent at all.
+// wire_tx_bytes / wire_rx_bytes -- encrypted bytes handed to / received from
+//   the carrier.
+// wire_{tx,rx}_{data,parity,report}_frames -- frame mix, so FEC overhead can be
+//   separated from payload without guessing the parity in force.
+// groups_recovered -- FEC groups reconstructed successfully.
+// groups_failed / unrecovered_shards -- groups that expired with data shards
+//   still undelivered: the application data FEC failed to recover, and the only
+//   loss number that matters to a user.
+// frames_rejected -- malformed frames, or frames for another identity/session.
+//   A spike means the two ends disagree about configuration, which would
+//   otherwise look exactly like packet loss.
+traffic_counters! {
+    inner_rx_bytes,
+    inner_rx_datagrams,
+    inner_tx_bytes,
+    inner_tx_datagrams,
+    inner_tx_failures,
+    wire_tx_bytes,
+    wire_rx_bytes,
+    wire_tx_data_frames,
+    wire_tx_parity_frames,
+    wire_tx_report_frames,
+    wire_rx_data_frames,
+    wire_rx_parity_frames,
+    wire_rx_report_frames,
+    groups_recovered,
+    groups_failed,
+    unrecovered_shards,
+    frames_rejected,
+}
+
+/// Wall-clock aligned interval id, derived independently by both ends.
+///
+/// This is what makes the client's and the server's records comparable at all:
+/// with NTP-synced clocks both land in the same 5-second bucket, so no
+/// coordination protocol is needed to line the two sides up.
+fn traffic_interval_id() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() / TRAFFIC_INTERVAL_SECS)
+        .unwrap_or(0)
+}
+
+fn ratio_ppm(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    ((u128::from(numerator) * 1_000_000) / u128::from(denominator)) as u64
+}
+
+fn count_wire_tx(kind: u8) {
+    match kind {
+        KIND_DATA => COUNTERS.wire_tx_data_frames.fetch_add(1, Ordering::Relaxed),
+        KIND_PARITY => COUNTERS
+            .wire_tx_parity_frames
+            .fetch_add(1, Ordering::Relaxed),
+        KIND_REPORT => COUNTERS
+            .wire_tx_report_frames
+            .fetch_add(1, Ordering::Relaxed),
+        _ => 0,
+    };
+}
+
+fn count_wire_rx(kind: u8) {
+    match kind {
+        KIND_DATA => COUNTERS.wire_rx_data_frames.fetch_add(1, Ordering::Relaxed),
+        KIND_PARITY => COUNTERS
+            .wire_rx_parity_frames
+            .fetch_add(1, Ordering::Relaxed),
+        KIND_REPORT => COUNTERS
+            .wire_rx_report_frames
+            .fetch_add(1, Ordering::Relaxed),
+        _ => 0,
+    };
+}
+
+/// Emit one traffic-accounting record and return the counters it covered.
+///
+/// The derived ratios are logged next to the raw counters so a reader does not
+/// have to recompute them and get it wrong:
+/// * `fec_overhead_ppm` -- wire bytes spent per inner byte offered;
+/// * `delivery_ppm` -- how much of the received wire actually reached the inner
+///   side. This is the number that was previously inferred from `curl` and got
+///   attributed to the wrong layer.
+fn log_traffic(role: &str, previous: &mut CounterSnapshot) {
+    // Opt-out rather than opt-in: the whole point of these counters is to be
+    // present when something goes wrong, and one record per 5 seconds is small
+    // next to the existing 2-second sequence reports. Read live so it can be
+    // toggled without a restart.
+    if std::env::var("SMART_FEC_TRAFFIC_LOG").as_deref() == Ok("0") {
+        return;
+    }
+    let current = CounterSnapshot::read();
+    let delta = current.delta(previous);
+    *previous = current;
+    info!(
+        role,
+        interval = traffic_interval_id(),
+        inner_rx_bytes = delta.inner_rx_bytes,
+        inner_rx_datagrams = delta.inner_rx_datagrams,
+        inner_tx_bytes = delta.inner_tx_bytes,
+        inner_tx_datagrams = delta.inner_tx_datagrams,
+        inner_tx_failures = delta.inner_tx_failures,
+        wire_tx_bytes = delta.wire_tx_bytes,
+        wire_rx_bytes = delta.wire_rx_bytes,
+        wire_tx_data_frames = delta.wire_tx_data_frames,
+        wire_tx_parity_frames = delta.wire_tx_parity_frames,
+        wire_rx_data_frames = delta.wire_rx_data_frames,
+        wire_rx_parity_frames = delta.wire_rx_parity_frames,
+        groups_recovered = delta.groups_recovered,
+        groups_failed = delta.groups_failed,
+        unrecovered_shards = delta.unrecovered_shards,
+        frames_rejected = delta.frames_rejected,
+        fec_overhead_ppm = ratio_ppm(delta.wire_tx_bytes, delta.inner_rx_bytes),
+        delivery_ppm = ratio_ppm(delta.inner_tx_bytes, delta.wire_rx_bytes),
+        "FEC traffic accounting"
+    );
+}
+
 #[derive(Debug)]
 struct Encoder {
     version: u8,
@@ -821,6 +1007,36 @@ struct Decoder {
     packets: HashMap<u64, Reassembly>,
 }
 
+/// Counts FEC groups that have outlived [`GROUP_TTL`] while still holding
+/// undelivered data shards, returning `(failed_groups, unrecovered_shards)`.
+///
+/// This is the *unrecovered application data* signal: the frames arrived at the
+/// carrier (and were usually ACKed), and `sequence_report` counts wire-frame
+/// arrival, so neither existing counter attributes a single one of them. An
+/// unrecovered shard is an inner datagram the application never got.
+///
+/// Extracted as a pure function so the loss accounting can be unit-tested
+/// without racing the process-wide counters, which are global by design.
+fn expired_group_loss(groups: &BTreeMap<u64, Group>, now: Instant) -> (u64, u64) {
+    let mut failed_groups = 0u64;
+    let mut unrecovered_shards = 0u64;
+    for group in groups.values() {
+        if now.duration_since(group.created) < GROUP_TTL {
+            continue;
+        }
+        let missing = group
+            .delivered
+            .iter()
+            .filter(|delivered| !**delivered)
+            .count();
+        if missing > 0 {
+            failed_groups = failed_groups.saturating_add(1);
+            unrecovered_shards = unrecovered_shards.saturating_add(missing as u64);
+        }
+    }
+    (failed_groups, unrecovered_shards)
+}
+
 impl Decoder {
     fn new(session: u64) -> Self {
         Self {
@@ -999,6 +1215,7 @@ impl Decoder {
                     .collect::<Vec<_>>();
                 let rs = ReedSolomon::new(data, parity)?;
                 rs.reconstruct(&mut g.shards)?;
+                COUNTERS.groups_recovered.fetch_add(1, Ordering::Relaxed);
                 recovered = (0..data)
                     .filter(|i| !g.delivered[*i])
                     .filter_map(|i| g.shards[i].clone())
@@ -1035,6 +1252,21 @@ impl Decoder {
     }
     fn prune(&mut self) {
         let now = Instant::now();
+        // Count groups that are about to expire while still holding undelivered
+        // data shards. Those are the inner datagrams FEC failed to recover --
+        // the only loss that is visible to a user, and the number that was
+        // missing from every existing counter: the carrier reports these frames
+        // as sent (and often ACKed), and `sequence_report` counts wire-frame
+        // arrival, so neither attributes them.
+        let (failed_groups, unrecovered_shards) = expired_group_loss(&self.groups, now);
+        if failed_groups > 0 {
+            COUNTERS
+                .groups_failed
+                .fetch_add(failed_groups, Ordering::Relaxed);
+            COUNTERS
+                .unrecovered_shards
+                .fetch_add(unrecovered_shards, Ordering::Relaxed);
+        }
         // Keep completed groups as short-lived tombstones. Otherwise a late second
         // parity shard recreates the group, reconstructs it again, and duplicates
         // the inner UDP datagram (especially visible for one-data-shard groups).
@@ -1132,6 +1364,7 @@ async fn send_frames(
     pacer: &mut Pacer,
 ) -> Result<()> {
     for frame in frames {
+        let kind = frame.kind;
         let bytes = match frame.encode_wire(key) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -1139,6 +1372,10 @@ async fn send_frames(
                 continue;
             }
         };
+        COUNTERS
+            .wire_tx_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        count_wire_tx(kind);
         pacer.wait(bytes.len()).await;
         let sent = if let Some(peer) = peer {
             socket.send_to(&bytes, peer).await
@@ -1229,22 +1466,29 @@ async fn client(
     let mut net_buf = vec![0u8; 2048];
     let mut report = time::interval(Duration::from_secs(2));
     let mut flush = time::interval(Duration::from_millis(5));
+    let mut traffic = time::interval(Duration::from_secs(TRAFFIC_INTERVAL_SECS));
+    let mut traffic_previous = CounterSnapshot::default();
     let mut pacer = Pacer::new(rate_mbps)?;
     info!(%listen, %server, session, "client started");
     loop {
         tokio::select! {
             r = local.recv_from(&mut local_buf) => {
                 let (n, peer) = r?; app_peer = Some(peer);
+                COUNTERS.inner_rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                COUNTERS.inner_rx_datagrams.fetch_add(1, Ordering::Relaxed);
                 let frames = encoder.lock().await.encode_datagram(&local_buf[..n])?;
                 send_frames(&tunnel, None, frames, &key, &mut pacer).await?;
             }
             r = tunnel.recv(&mut net_buf) => {
                 let n = match r { Ok(n) => n, Err(e) => { warn!(error=%e, "tunnel receive failed"); continue; } };
+                COUNTERS.wire_rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 match decode_client_frame(&net_buf[..n], key_id, &key) {
                     Ok(f) if f.version != version || f.key_id != key_id || f.session != session => {
+                        COUNTERS.frames_rejected.fetch_add(1, Ordering::Relaxed);
                         warn!("discard frame for different identity or session");
                     }
                     Ok(f) if f.kind == KIND_REPORT => {
+                        count_wire_rx(f.kind);
                         if decoder.observe_seq(f.sequence) {
                             if let Some(feedback) = decode_fec_feedback(&f.payload) {
                                 if matches!(feedback, FecFeedback::Sample(_)) {
@@ -1256,11 +1500,32 @@ async fn client(
                             }
                         }
                     }
-                    Ok(f) => match decoder.frame(f) {
-                        Ok(datagrams) => for d in datagrams { if let Some(peer) = app_peer { if let Err(e) = local.send_to(&d, peer).await { warn!(error=%e, "local send failed"); } } },
-                        Err(e) => warn!(error=%e, "discard invalid fec frame"),
-                    },
-                    Err(e) => warn!(error=%e, "discard frame"),
+                    Ok(f) => {
+                        count_wire_rx(f.kind);
+                        match decoder.frame(f) {
+                            Ok(datagrams) => for d in datagrams {
+                                let Some(peer) = app_peer else { continue };
+                                match local.send_to(&d, peer).await {
+                                    Ok(_) => {
+                                        COUNTERS.inner_tx_bytes.fetch_add(d.len() as u64, Ordering::Relaxed);
+                                        COUNTERS.inner_tx_datagrams.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(e) => {
+                                        COUNTERS.inner_tx_failures.fetch_add(1, Ordering::Relaxed);
+                                        warn!(error=%e, "local send failed");
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                COUNTERS.frames_rejected.fetch_add(1, Ordering::Relaxed);
+                                warn!(error=%e, "discard invalid fec frame");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        COUNTERS.frames_rejected.fetch_add(1, Ordering::Relaxed);
+                        warn!(error=%e, "discard frame");
+                    }
                 }
             }
             _ = report.tick() => {
@@ -1290,6 +1555,9 @@ async fn client(
             _ = flush.tick() => {
                 let frames = encoder.lock().await.flush()?;
                 send_frames(&tunnel, None, frames, &key, &mut pacer).await?;
+            }
+            _ = traffic.tick() => {
+                log_traffic("client", &mut traffic_previous);
             }
         }
     }
@@ -1345,6 +1613,7 @@ async fn send_session_frames(
     pacer: &Mutex<Pacer>,
 ) {
     for frame in frames {
+        let kind = frame.kind;
         let bytes = match frame.encode_wire(key) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -1352,6 +1621,10 @@ async fn send_session_frames(
                 continue;
             }
         };
+        COUNTERS
+            .wire_tx_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        count_wire_tx(kind);
         let mut limiter = pacer.lock().await;
         limiter.wait(bytes.len()).await;
         drop(limiter);
@@ -1375,6 +1648,11 @@ async fn run_server_session(
     let mut upstream_buf = vec![0u8; 65535];
     let mut report = time::interval(Duration::from_secs(2));
     let mut flush = time::interval(Duration::from_millis(5));
+    let mut traffic = time::interval(Duration::from_secs(TRAFFIC_INTERVAL_SECS));
+    let mut traffic_previous = CounterSnapshot::default();
+    let logs_traffic = TRAFFIC_LOGGER_CLAIMED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok();
     let mut last_logged_parity = 0usize;
     loop {
         tokio::select! {
@@ -1383,8 +1661,10 @@ async fn run_server_session(
                 peer = Some(packet.peer);
                 let frame = packet.frame;
                 if frame.session != runtime.session || frame.version != runtime.version || frame.key_id != runtime.key_id {
+                    COUNTERS.frames_rejected.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                count_wire_rx(frame.kind);
                 if frame.kind == KIND_REPORT {
                     if decoder.observe_seq(frame.sequence) {
                         if let Some(feedback) = decode_fec_feedback(&frame.payload) {
@@ -1399,16 +1679,28 @@ async fn run_server_session(
                 } else {
                     match decoder.frame(frame) {
                         Ok(datagrams) => for datagram in datagrams {
-                            if let Err(error) = upstream_socket.send(&datagram).await {
-                                warn!(%error, "session upstream send failed");
+                            match upstream_socket.send(&datagram).await {
+                                Ok(_) => {
+                                    COUNTERS.inner_tx_bytes.fetch_add(datagram.len() as u64, Ordering::Relaxed);
+                                    COUNTERS.inner_tx_datagrams.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(error) => {
+                                    COUNTERS.inner_tx_failures.fetch_add(1, Ordering::Relaxed);
+                                    warn!(%error, "session upstream send failed");
+                                }
                             }
                         },
-                        Err(error) => warn!(%error, "discard invalid session frame"),
+                        Err(error) => {
+                            COUNTERS.frames_rejected.fetch_add(1, Ordering::Relaxed);
+                            warn!(%error, "discard invalid session frame");
+                        }
                     }
                 }
             }
             received = upstream_socket.recv(&mut upstream_buf), if peer.is_some() => {
                 let n = match received { Ok(n) => n, Err(error) => { warn!(%error, "session upstream receive failed"); continue; } };
+                COUNTERS.inner_rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                COUNTERS.inner_rx_datagrams.fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut last_seen) = runtime.last_seen.lock() {
                     *last_seen = Instant::now();
                 }
@@ -1432,6 +1724,11 @@ async fn run_server_session(
                 match encoder.flush() {
                     Ok(frames) => send_session_frames(&runtime.public, peer.unwrap(), frames, &runtime.key, &runtime.pacer).await,
                     Err(error) => warn!(%error, "session flush failed"),
+                }
+            }
+            _ = traffic.tick() => {
+                if logs_traffic {
+                    log_traffic("server-session", &mut traffic_previous);
                 }
             }
         }
@@ -1485,9 +1782,13 @@ async fn server(
         tokio::select! {
             received = public.recv_from(&mut net_buf) => {
                 let (n, peer) = match received { Ok(v) => v, Err(error) => { warn!(%error, "public receive failed"); continue; } };
+                COUNTERS.wire_rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 let (frame, device_key) = match decode_server_frame(&net_buf[..n], legacy_key.as_ref(), &keyring, &selectors) {
                     Ok(value) => value,
-                    Err(_) => continue,
+                    Err(_) => {
+                        COUNTERS.frames_rejected.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 };
                 let session_key = (frame.key_id, frame.session);
                 if !sessions.contains_key(&session_key) {
@@ -2589,6 +2890,69 @@ mod tests {
         };
         assert!(decoder.frame(frame).is_err());
     }
+    /// An expired group that still holds undelivered data shards is the only
+    /// counter that represents loss a *user* can see: the carrier reports those
+    /// frames as sent, and `sequence_report` counts wire-frame arrival.
+    #[test]
+    fn expired_incomplete_groups_are_counted_as_unrecovered_loss() {
+        let stale = Instant::now() - GROUP_TTL - Duration::from_secs(1);
+        let mut groups = BTreeMap::new();
+        // Two data shards delivered, two never arrived and parity could not repair.
+        groups.insert(
+            7u64,
+            Group {
+                created: stale,
+                start_sequence: 1,
+                data: 4,
+                parity: 1,
+                shards: vec![None; 5],
+                delivered: vec![true, false, false, true],
+            },
+        );
+        assert_eq!(expired_group_loss(&groups, Instant::now()), (1, 2));
+    }
+
+    #[test]
+    fn fresh_and_complete_groups_are_not_reported_as_loss() {
+        let now = Instant::now();
+        let mut groups = BTreeMap::new();
+        // Fresh, still incomplete: within GROUP_TTL, so still recoverable.
+        groups.insert(
+            1u64,
+            Group {
+                created: now,
+                start_sequence: 1,
+                data: 2,
+                parity: 1,
+                shards: vec![None; 3],
+                delivered: vec![true, false],
+            },
+        );
+        // Expired but fully delivered: a tombstone, not a loss.
+        groups.insert(
+            2u64,
+            Group {
+                created: now - GROUP_TTL - Duration::from_secs(1),
+                start_sequence: 10,
+                data: 2,
+                parity: 1,
+                shards: vec![None; 3],
+                delivered: vec![true, true],
+            },
+        );
+        assert_eq!(expired_group_loss(&groups, now), (0, 0));
+    }
+
+    #[test]
+    fn traffic_ratio_ppm_handles_a_zero_denominator() {
+        // An idle interval must report 0, not divide by zero or emit a bogus
+        // ratio that would look like catastrophic overhead.
+        assert_eq!(ratio_ppm(0, 0), 0);
+        assert_eq!(ratio_ppm(5, 0), 0);
+        assert_eq!(ratio_ppm(1, 4), 250_000);
+        assert_eq!(ratio_ppm(4, 1), 4_000_000);
+    }
+
     #[test]
     fn reorder_window_does_not_report_loss() {
         let mut d = Decoder::new(1);
