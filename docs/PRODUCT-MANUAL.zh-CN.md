@@ -399,6 +399,46 @@ SMARTFEC 节点路径。
 旧值。若页脚仍显示旧位置，点页脚的"更新位置信息"，或清除 google.com 的 cookie / 用无痕窗口，
 即可看到新判定。
 
+#### 10.4.1 真正的坑：域名规则匹配不到"以 IP 到达"的连接
+
+只把 `google.com` 改成 `direct` 之后，位置仍显示中国城市。原因在服务端 sing-box 的日志里：
+
+```text
+107 www.google.com        direct   ← 带域名的连接，规则命中
+ 15 142.250.109.94        socks    ← Google IP，规则无法匹配 → 落到兜底 network:tcp
+  8 192.178.211.84        socks    ← 同上
+  6 209.85.165.198        socks    ← 同上
+```
+
+浏览器先解析域名再连接，Passwall 传给服务端的往往是**目的 IP**；而 sing-box 的
+`domain_suffix` 规则只能匹配域名，匹配不到 IP，于是这些连接全部落到兜底的
+`{"network":"tcp" → warp-balance}` —— 也就是走了被 Google 判成中国且被 302 拦截的 WARP。
+
+三处修复：
+
+1. **开启域名嗅探**：在 `route.rules` 最前面加 `{"action":"sniff"}`，从 TLS SNI 恢复域名，
+   使既有域名规则对 IP 连接也生效。
+   **超时必须放大**：`timeout` 设 300ms 时仍有一半连接嗅探失败（本链路 RTT ≈ 430ms，
+   ClientHello 还没到就超时），改成 `1500ms` 后命中率明显提升。
+2. **按 Google 官方 IP 段做确定性路由**：从 `https://www.gstatic.com/ipranges/goog.json`
+   取 130 个 IPv4 + 15 个 IPv6 段，作为 `ip_cidr` 规则路由到 `direct`。这条不依赖嗅探，
+   是兜底保障。
+3. **把所有 Google 服务挪到 `direct`**：`google.com / googleapis.com / gstatic.com /
+   googleusercontent.com / ggpht.com / youtube.com / youtube-nocookie.com /
+   youtubei.googleapis.com` 全部走机房 IP；只保留视频 CDN（`googlevideo.com` / `ytimg.com`）
+   走 WARP。**位置/遥测接口就在 gstatic/googleapis 上**，之前把它们留在 WARP 是位置一直
+   显示中国的原因之一。
+
+修复后实测（服务端 sing-box 决策统计）：
+
+| 目标 | direct | 仍走 WARP |
+| --- | --- | --- |
+| Google 域名 | **9 / 9** | 0 |
+| Google IP 段 | **22 / 25** | 3 |
+
+走 WARP 的剩余目标为 Cloudflare（`172.64.x` / `104.18.x`）与 Akamai（`2.18.67.211`），
+这些本来就不属于 Google，保持 WARP 是预期的。
+
 ## 11. 内核感知优化阶段
 
 内核优化按能力和验证结果分级，不以固定 `sysctl` 大全作为产品功能。
