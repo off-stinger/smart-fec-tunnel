@@ -166,15 +166,34 @@ fn configured_stream_lanes() -> Result<usize> {
     parse_stream_lanes(value.as_deref())
 }
 
+/// Parses `SMART_QUIC_STREAM_LANES`.
+///
+/// Unset, blank, and an explicit `0` all mean DATAGRAM mode, which is the
+/// default: Quinn must not retransmit, so the inner FEC layer repairs loss
+/// instead (RFC 9221 §5.2). `1` switches to a single reliable stream lane.
+///
+/// An explicit `0` must be accepted -- `deploy/openwrt-smart-fec-quic.init`
+/// and the manual both document `0` as DATAGRAM mode, so rejecting it turned a
+/// documented default into a permanent reconnect loop (`quic_relay` logs
+/// "QUIC relay reconnecting" every few seconds while the handshake itself
+/// succeeds). Anything other than 0 or 1 is still rejected because parallel
+/// lanes are not implemented.
 fn parse_stream_lanes(value: Option<&str>) -> Result<usize> {
     let Some(value) = value else {
         return Ok(0);
     };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(0);
+    }
     let lanes: usize = value
         .parse()
         .context("SMART_QUIC_STREAM_LANES must be an integer")?;
+    if lanes == 0 {
+        return Ok(0);
+    }
     if lanes != MAX_STREAM_LANES {
-        bail!("SMART_QUIC_STREAM_LANES currently supports only 1")
+        bail!("SMART_QUIC_STREAM_LANES must be 0 (DATAGRAM) or {MAX_STREAM_LANES}")
     }
     Ok(lanes)
 }
@@ -257,11 +276,14 @@ fn configured_fixed_rate() -> Result<u64> {
 }
 
 fn parse_fixed_rate_mbps(value: Option<&str>) -> Result<u64> {
+    // A blank value means "not configured". `SMART_QUIC_FIXED_RATE_MBPS=` in an
+    // env file, or an env var that the init script passes through as empty,
+    // must fall back to the default rather than abort startup.
+    let value = value.map(str::trim).filter(|value| !value.is_empty());
     let Some(value) = value else {
         return Ok(DEFAULT_FIXED_RATE_MBPS);
     };
     let mbps: u64 = value
-        .trim()
         .parse()
         .context("SMART_QUIC_FIXED_RATE_MBPS must be an integer")?;
     if mbps == 0 || mbps > MAX_FIXED_RATE_MBPS {
@@ -1143,9 +1165,18 @@ mod tests {
 
     #[test]
     fn stream_lane_mode_is_explicit_and_rejects_unvalidated_parallel_lanes() {
-        assert_eq!(parse_stream_lanes(None).unwrap(), 0);
+        // Unset, blank, and an explicit "0" all mean DATAGRAM mode. The init
+        // script shipped in deploy/ passes "0" by default, so this must not be
+        // an error; doing so previously produced an endless reconnect loop.
+        for datagram in [None, Some(""), Some("  "), Some("0"), Some(" 0 ")] {
+            assert_eq!(
+                parse_stream_lanes(datagram).unwrap(),
+                0,
+                "{datagram:?} must mean DATAGRAM mode"
+            );
+        }
         assert_eq!(parse_stream_lanes(Some("1")).unwrap(), 1);
-        for invalid in ["0", "2", "16", "invalid"] {
+        for invalid in ["2", "16", "invalid", "-1"] {
             assert!(parse_stream_lanes(Some(invalid)).is_err());
         }
     }
@@ -1368,13 +1399,22 @@ mod tests {
 
     #[test]
     fn fixed_rate_parsing_rejects_zero_and_garbage() {
-        assert_eq!(
-            parse_fixed_rate_mbps(None).unwrap(),
-            DEFAULT_FIXED_RATE_MBPS
-        );
+        // Unset or blank means "not configured" and falls back to the default;
+        // an empty env var must never abort startup.
+        for unset in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                parse_fixed_rate_mbps(unset).unwrap(),
+                DEFAULT_FIXED_RATE_MBPS,
+                "{unset:?} must fall back to the default"
+            );
+        }
         assert_eq!(parse_fixed_rate_mbps(Some(" 100 ")).unwrap(), 100);
         assert_eq!(parse_fixed_rate_mbps(Some("1")).unwrap(), 1);
-        for invalid in ["", "0", "abc", "-5", "10001", "1.5"] {
+        assert_eq!(
+            parse_fixed_rate_mbps(Some(&MAX_FIXED_RATE_MBPS.to_string())).unwrap(),
+            MAX_FIXED_RATE_MBPS
+        );
+        for invalid in ["0", "abc", "-5", "10001", "1.5"] {
             assert!(
                 parse_fixed_rate_mbps(Some(invalid)).is_err(),
                 "{invalid:?} must be rejected"

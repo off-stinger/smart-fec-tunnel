@@ -8,10 +8,21 @@ start_service() {
     . /etc/smart-fec-quic.env
     [ -n "${SMART_FEC_KEY_ID:-}" ] || return 1
     local_port="${SMART_QUIC_LOCAL_PORT:-8444}"
-    stream_lanes="${SMART_QUIC_STREAM_LANES:-0}"
-    # 载体拥塞控制器：new_reno（默认）| cubic | bbr。可在 /etc/smart-fec-quic.env 中
-    # 只改这一端，用于单侧 A/B；拥塞控制是发送端本地行为，不需要两端一致。
+    # 载体拥塞控制器：new_reno（默认）| cubic | bbr | fixed。可在 /etc/smart-fec-quic.env
+    # 中只改这一端，用于单侧 A/B；拥塞控制是发送端本地行为，不需要两端一致。
     congestion="${SMART_QUIC_CONGESTION:-new_reno}"
+    # fixed（丢包容忍的固定速率控制器）的目标速率，单位 Mbps。仅当 congestion=fixed
+    # 时生效；实际发送速率上限为 1.25x 该值（ACK 速率补偿），且 FEC 开销出自同一预算
+    # —— 见 PRODUCT-MANUAL §10.5，因此 30 Mbps 链路应填 24 而不是 30。
+    fixed_rate_mbps="${SMART_QUIC_FIXED_RATE_MBPS:-}"
+    # 注意：procd 的 env 参数走 _procd_add_table -> json_add_object("env")，多次调用
+    # procd_set_param env 会生成重复的 "env" 键，JSON 解析后只有最后一次生效，前面几组
+    # 环境变量会被静默丢弃（表现为二进制报缺少 --key）。必须只调用一次、合并传入。
+    envs="SMART_FEC_KEY=$SMART_FEC_KEY SMART_QUIC_CONGESTION=$congestion RUST_LOG=info"
+    [ -z "$fixed_rate_mbps" ] || envs="$envs SMART_QUIC_FIXED_RATE_MBPS=$fixed_rate_mbps"
+    # 只有显式配置为 1 时才传这一项：不传即 datagram 模式（默认，配合 FEC 纠错）。
+    # 不传 "0" 是为了兼容旧二进制对 "0" 的拒绝（见 parse_stream_lanes）。
+    [ "${SMART_QUIC_STREAM_LANES:-}" != "1" ] || envs="$envs SMART_QUIC_STREAM_LANES=1"
     procd_open_instance
     procd_set_param command /usr/bin/smart-fec-tunnel-alpha9 quic-client \
         --listen "127.0.0.1:$local_port" \
@@ -19,9 +30,7 @@ start_service() {
         --server-name "$SMART_QUIC_SERVER_NAME" \
         --ca-cert /etc/smart-fec-quic-cert.pem \
         --key-id "$SMART_FEC_KEY_ID"
-    procd_set_param env SMART_FEC_KEY="$SMART_FEC_KEY" \
-        SMART_QUIC_STREAM_LANES="$stream_lanes" \
-        SMART_QUIC_CONGESTION="$congestion" RUST_LOG=info
+    procd_set_param env $envs
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
     procd_set_param stderr 1
