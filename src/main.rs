@@ -2953,6 +2953,52 @@ mod tests {
         assert_eq!(ratio_ppm(4, 1), 4_000_000);
     }
 
+    /// 生产报文尺寸下，编解码器自身的往返是否无损。
+    ///
+    /// 动机：集成测试显示 1200 字节报文在**零丢包环回**上到达率只有 ~23%，
+    /// 与生产链路观测到的 ~22% 交付效率吻合，说明缺口在 FEC 层内部。但那个
+    /// 测试跑的是两个真进程 + 一个 relay，无法区分"编解码器丢了"与"进程转发
+    /// 环节丢了"。本用例把编解码器摘出来单独跑：无进程、无 socket、无时序依赖，
+    /// 因此结果非黑即白。
+    #[test]
+    fn codec_round_trips_production_sized_datagrams_without_loss() {
+        let key = [7u8; 32];
+        let session = 0x5e55_10a0u64;
+        let key_id = 1u64;
+        let mut encoder = Encoder::with_identity(session, VERSION_V3, key_id);
+        let mut decoder = Decoder::new(session);
+        let total = 2000usize;
+        let mut delivered = 0usize;
+        for i in 0..total {
+            let mut payload = vec![0xab; 1200];
+            payload[..4].copy_from_slice(&(i as u32).to_be_bytes());
+            let frames = encoder.encode_datagram(&payload).unwrap();
+            for frame in frames {
+                let wire = frame.encode_wire(&key).unwrap();
+                let decoded = decode_client_frame(&wire, key_id, &key).unwrap();
+                for datagram in decoder.frame(decoded).unwrap() {
+                    assert_eq!(
+                        datagram.len(),
+                        1200,
+                        "datagram {i} came back the wrong size"
+                    );
+                    delivered += 1;
+                }
+            }
+        }
+        // 尾组必须显式冲刷，否则最后不足 10 个分片的数据报永远不会发出——
+        // 这与生产一致（生产由 5ms 定时器负责）。
+        for frame in encoder.flush().unwrap() {
+            let wire = frame.encode_wire(&key).unwrap();
+            let decoded = decode_client_frame(&wire, key_id, &key).unwrap();
+            delivered += decoder.frame(decoded).unwrap().len();
+        }
+        assert_eq!(
+            delivered, total,
+            "the codec itself lost datagrams on a lossless path"
+        );
+    }
+
     #[test]
     fn reorder_window_does_not_report_loss() {
         let mut d = Decoder::new(1);

@@ -97,7 +97,11 @@ impl Harness {
         let mut env_base: Vec<(String, String)> = Vec::new();
         env_base.push(("SMART_FEC_KEY".to_string(), KEY.to_string()));
         env_base.push(("SMART_FEC_KEY_ID".to_string(), "1".to_string()));
-        env_base.push(("RUST_LOG".to_string(), "warn".to_string()));
+        // 默认静默；设 SFT_TEST_LOG=info 可让被测二进制把 T1 的
+        // `FEC traffic accounting` 记录打到测试输出（配合 --nocapture），
+        // 用于定位"字节在哪一层消失"。
+        let log = std::env::var("SFT_TEST_LOG").unwrap_or_else(|_| "warn".to_string());
+        env_base.push(("RUST_LOG".to_string(), log));
         if let Some(p) = force_parity {
             env_base.push(("SMART_FEC_FORCE_PARITY".to_string(), p.to_string()));
         }
@@ -113,17 +117,30 @@ impl Harness {
                 .unwrap();
         }
 
+        // 在闭包内构造 Stdio：`Stdio` 不是 Copy，若在闭包外捕获会把它变成
+        // FnOnce，而这里需要为 server/client 两个子进程各调用一次。
+        let inherit_logs = std::env::var("SFT_TEST_LOG").is_ok();
         let spawn = |args: &[&str]| {
             Command::new(bin())
                 .args(args)
                 .envs(env_base.iter().cloned())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(if inherit_logs {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
                 .spawn()
                 .expect("spawn smart-fec-tunnel")
         };
 
+        // 必须显式给 pacer 速率。`--rate-mbps` 默认只有 10 Mbps：本用例以
+        // 1200 字节 / 1ms（约 9.6 Mbps 载荷）双向灌入，加上 FEC 开销就超过
+        // 10 Mbps，pacer 一阻塞，被测进程就停止读取前置 socket，内核随即丢弃
+        // ——量到的是"测试台把 pacer 饿死了"，不是 FEC 层丢数据。
+        // 这里给足余量，让 pacer 永远不是瓶颈；pacer 本身另有单元测试覆盖。
+        let rate = std::env::var("SFT_TEST_RATE_MBPS").unwrap_or_else(|_| "200".to_string());
         let server = spawn(&[
             "server",
             "--listen",
@@ -132,6 +149,8 @@ impl Harness {
             &format!("127.0.0.1:{echo_port}"),
             "--keyring",
             keyring_path.to_str().unwrap(),
+            "--rate-mbps",
+            &rate,
         ]);
         let client = spawn(&[
             "client",
@@ -141,6 +160,8 @@ impl Harness {
             &format!("127.0.0.1:{relay_port}"),
             "--key-id",
             "1",
+            "--rate-mbps",
+            &rate,
         ]);
 
         Self {
@@ -155,12 +176,35 @@ impl Harness {
     /// `pump` 为 true 时，预热阶段持续发送数据以驱动 report 闭环、让自适应
     /// parity 先升上去（模拟持续流量），再开始统计。
     fn measure(&self, count: usize, warmup_secs: f64, pump: bool) -> f64 {
+        self.measure_with(
+            count,
+            PAYLOAD_SIZE,
+            Duration::from_millis(1),
+            warmup_secs,
+            pump,
+        )
+    }
+
+    /// 同 [`Harness::measure`]，但可指定报文尺寸与发送间隔。
+    ///
+    /// 存在的理由：原有用例用 100 字节 / 1ms（约 10 KB/s），而生产链路是
+    /// 1200 字节 / 20+ Mbps 量级——差三个数量级。分片、分组、RS 填充、pacer
+    /// 批量的行为在小报文低速下都测不出来，所以必须在接近生产的尺寸与速率下
+    /// 单独量一次，才能判断"线上字节去哪了"到底是不是 FEC 层的责任。
+    fn measure_with(
+        &self,
+        count: usize,
+        payload_size: usize,
+        gap: Duration,
+        warmup_secs: f64,
+        pump: bool,
+    ) -> f64 {
         if pump {
             let wsock = UdpSocket::bind("127.0.0.1:0").expect("bind warmup");
             let end = Instant::now() + Duration::from_secs_f64(warmup_secs);
             let mut i = 0u32;
             while Instant::now() < end {
-                let mut p = [0xab; PAYLOAD_SIZE];
+                let mut p = vec![0xab; payload_size];
                 p[..4].copy_from_slice(&i.to_be_bytes());
                 let _ = wsock.send_to(&p, ("127.0.0.1", self.client_port));
                 i = i.wrapping_add(1);
@@ -180,13 +224,13 @@ impl Harness {
         let client_port = self.client_port;
         let sending = thread::spawn(move || {
             for i in 0..count {
-                let mut payload = Vec::with_capacity(PAYLOAD_SIZE);
+                let mut payload = Vec::with_capacity(payload_size);
                 payload.extend_from_slice(&(i as u32).to_be_bytes());
-                payload.resize(PAYLOAD_SIZE, 0xab);
+                payload.resize(payload_size, 0xab);
                 sender
                     .send_to(&payload, ("127.0.0.1", client_port))
                     .unwrap();
-                thread::sleep(Duration::from_millis(1));
+                thread::sleep(gap);
             }
         });
 
@@ -256,4 +300,42 @@ fn adaptive_parity_rises_without_force() {
     let arrival = h.measure(2000, 12.0, true);
     eprintln!("adaptive arrival={arrival:.3}");
     assert!(arrival > 0.83, "adaptive arrival too low: {arrival}");
+}
+
+/// 生产报文尺寸下的零丢包到达率。
+///
+/// 这是"线上字节去哪了"的**责任划分实验**：生产链路上交付效率恒定在
+/// 19–27%（8 倍速率范围内无拐点），而载体两端都报零丢包、FEC 序号报
+/// `missing=0`。如果本用例在 1200 字节 / 无丢包下到达率接近 1，则 FEC 层
+/// 洗清了嫌疑，缺口在载体或上层 TUIC；如果显著低于 1，则问题就在 FEC 层，
+/// 且此处可本地复现、可二分。
+///
+/// 用 1200 字节而不是默认的 100 字节，是因为分片（CHUNK=1326）、成组
+/// （DATA_SHARDS=10）、RS 等长填充与 pacer 批量的行为都只在接近 MTU 的
+/// 报文尺寸下才显现；100 字节的用例把这些路径全绕开了。
+#[test]
+fn production_sized_datagrams_survive_zero_loss() {
+    let h = Harness::new(0.0, None, 35555);
+    let arrival = h.measure_with(1000, 1200, Duration::from_millis(1), 1.0, false);
+    eprintln!("1200B/zero-loss arrival={arrival:.4}");
+    assert!(
+        arrival > 0.99,
+        "the FEC layer itself must not drop datagrams on a clean link: {arrival}"
+    );
+}
+
+/// 生产报文尺寸 + 10% 双向丢包 + 自适应 parity。
+///
+/// 阈值比小报文用例（0.83）更宽松：1200 字节报文的分组更大，突发丢包更容易
+/// 打穿一个整组，而分块 RS 对组内连续丢包无能为力（RFC 9265 §2.5 指出可解码
+/// 概率取决于"编码窗口大小、编码率与**信道删余的分布**"）。
+#[test]
+fn production_sized_datagrams_survive_ten_percent_loss() {
+    let h = Harness::new(0.10, None, 45555);
+    let arrival = h.measure_with(1000, 1200, Duration::from_millis(1), 12.0, true);
+    eprintln!("1200B/10%-loss adaptive arrival={arrival:.4}");
+    assert!(
+        arrival > 0.80,
+        "adaptive FEC should keep most 1200-byte datagrams across 10% loss: {arrival}"
+    );
 }
