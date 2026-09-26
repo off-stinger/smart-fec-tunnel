@@ -854,10 +854,34 @@ impl Encoder {
             bail!("datagram too large")
         }
         let mut frames = Vec::new();
+        // Split into **balanced** fragments, not greedy `CHUNK`-sized ones.
+        //
+        // This is a throughput fix with no wire-format change, and it was worth
+        // ~2x on the downlink. `flush()` pads every source shard in a group up to
+        // the group's longest shard, because Reed-Solomon needs equal-length
+        // symbols. With greedy splitting, a payload of `CHUNK + 27` bytes -- which
+        // is exactly what the inner TUIC flow produces (measured: 1353-byte
+        // datagrams against CHUNK = 1326) -- becomes one full 1326-byte fragment
+        // plus a 27-byte fragment, and that 27-byte fragment is then padded to a
+        // full 1340-byte shard. Cost: 2680 wire bytes to carry 1353.
+        //
+        // Measured on the live carrier before the fix: 5327 data shards for 2694
+        // inner datagrams (1.977 shards each) and `delivery_ppm` = 29 %. The
+        // arithmetic closes exactly -- 1.98 (padding) x 1.67 (parity) = 3.30, and
+        // 1/3.30 = 30 %.
+        //
+        // Balancing the split makes both fragments ~677 bytes instead, so the
+        // padding has almost nothing to do. The receiver needs no change: it
+        // already reads a per-fragment length from the header.
+        let per = if payload.is_empty() {
+            1
+        } else {
+            payload.len().div_ceil(count).max(1)
+        };
         let chunks: Vec<&[u8]> = if payload.is_empty() {
             vec![&[]]
         } else {
-            payload.chunks(CHUNK).collect()
+            payload.chunks(per).collect()
         };
         for (idx, chunk) in chunks.into_iter().enumerate() {
             let mut shard = vec![0u8; FRAGMENT_HEADER + chunk.len()];
@@ -2996,6 +3020,51 @@ mod tests {
         assert_eq!(
             delivered, total,
             "the codec itself lost datagrams on a lossless path"
+        );
+    }
+
+    /// Regression for the padding waste that T1's accounting found on the live
+    /// carrier.
+    ///
+    /// `CHUNK + 27` bytes is not an arbitrary choice: the measured average inner
+    /// datagram on the production downlink was **1353** bytes against
+    /// `CHUNK = 1326`. With greedy fragmentation that becomes a full 1326-byte
+    /// fragment plus a 27-byte one, and `flush()` then pads every source shard up
+    /// to the group's longest -- so the 27-byte fragment is transmitted as a full
+    /// 1340-byte shard.
+    ///
+    /// Live measurement before the fix: 5327 data shards for 2694 inner datagrams
+    /// (1.977 shards each) and `delivery_ppm` = 29 %. The arithmetic closes --
+    /// 1.98 (padding) x 1.67 (parity) = 3.30, and 1/3.30 = 30 %.
+    #[test]
+    fn near_chunk_sized_datagrams_do_not_pay_reed_solomon_padding() {
+        let mut encoder = Encoder::with_identity(1, VERSION_V3, 1);
+        // Padding only happens when parity is generated, so parity must be on for
+        // this to measure anything.
+        encoder.force_parity = Some(2);
+        let payload = vec![0xab; CHUNK + 27];
+        let mut wire = 0usize;
+        let mut datagrams = 0usize;
+        // Five datagrams fill exactly one ten-shard group.
+        for _ in 0..20 {
+            for frame in encoder.encode_datagram(&payload).unwrap() {
+                wire += frame.payload.len();
+            }
+            datagrams += 1;
+        }
+        for frame in encoder.flush().unwrap() {
+            wire += frame.payload.len();
+        }
+        let inner = payload.len() * datagrams;
+        let ratio = wire as f64 / inner as f64;
+        // Balanced split: ~1.23 (1.2 parity + ~2 % residual padding).
+        // Greedy split:   ~2.38. The gap is wide enough that the threshold does
+        // not need tuning.
+        assert!(
+            ratio < 1.5,
+            "wire/payload ratio {ratio:.3} for {}-byte datagrams -- greedy \
+             fragmentation is padding them up to full shards again",
+            payload.len()
         );
     }
 
