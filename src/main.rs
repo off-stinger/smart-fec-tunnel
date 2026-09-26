@@ -387,9 +387,39 @@ struct Adaptive {
     last_loss_ppm: u32,
     smoothed_loss_ppm: u32,
     unavailable_reports: u8,
+    /// 连续"有丢失但一个都没修回来"的报告次数（恢复驱动输入）。
+    shortfall_reports: u8,
 }
 
+/// 连续多少次"有丢失但一个都没修回来"就立刻抬一档冗余。
+const FEC_SHORTFALL_REPORTS_TO_RAISE: u8 = 2;
+
 impl Adaptive {
+    /// 恢复驱动输入：把接收端的**修复结果**作为第二个、基于结果的控制信号。
+    ///
+    /// 与速率信号（`report()` 依据"丢了多少"）的分工：本方法依据"修回来没有"直接
+    /// 纠偏。实测的失效模式正是速率信号看不见的那种 —— 丢包率均值尚可，但突发时
+    /// 整组修不回来（18.3% 突发、`fec_recovered_symbols=0`）。只看丢包率无法区分
+    /// "丢得多但都修好了"与"丢得不多但一组都没修好"。
+    ///
+    /// 已知局限（诚实记录）：丢失的**冗余分片**同样计入 `missing`，但它本来就不需要
+    /// 修复，所以 `recovered == 0` 也可能是"只丢了冗余分片"。此时会多抬一档，随后由
+    /// 速率信号正常衰减回来 —— 代价是一次轻微过冲，换来实现上零协议改动（准确定义
+    /// 需要新增"丢失的数据分片数"字段，属于线格式变更）。
+    fn note_repair_outcome(&mut self, missing: u32, recovered: u32) {
+        if missing == 0 || recovered > 0 {
+            // 没丢，或冗余确实修回来了：这次的档位是有效的。
+            self.shortfall_reports = 0;
+            return;
+        }
+        self.shortfall_reports = self.shortfall_reports.saturating_add(1);
+        if self.shortfall_reports >= FEC_SHORTFALL_REPORTS_TO_RAISE {
+            self.parity = (self.parity + 1).min(MAX_PARITY);
+            self.good = 0;
+            self.bad = 0;
+            self.shortfall_reports = 0;
+        }
+    }
     /// Redundancy level that maximises expected goodput at this loss rate.
     ///
     /// `MIN_PARITY` is the lower bound of the search, which is how the
@@ -474,6 +504,8 @@ impl Adaptive {
                     self.parity = parity_before;
                     self.good = 0;
                 }
+                // 第二个控制信号：不看丢了多少，看修回来没有。
+                self.note_repair_outcome(sample.missing, sample.fec_recovered_symbols);
             }
         }
     }
@@ -2304,6 +2336,52 @@ mod tests {
     }
 
     #[test]
+    fn recovery_driven_input_raises_parity_when_losses_go_unrepaired() {
+        // 速率信号看不见的失效模式：丢包率不高，但一组都没修回来。
+        let mut a = Adaptive {
+            parity: 1,
+            ..Adaptive::default()
+        };
+        // 第一次"丢了没修回"只计数，不立刻抬档（避免单次抖动）。
+        a.note_repair_outcome(8, 0);
+        assert_eq!(a.parity, 1);
+        assert_eq!(a.shortfall_reports, 1);
+        // 连续第二次 → 立刻抬一档，不等速率信号。
+        a.note_repair_outcome(6, 0);
+        assert_eq!(a.parity, 2);
+        assert_eq!(a.shortfall_reports, 0);
+    }
+
+    #[test]
+    fn recovery_driven_input_holds_when_repairs_succeed() {
+        let mut a = Adaptive {
+            parity: 3,
+            ..Adaptive::default()
+        };
+        // 丢了但修回来了 → 当前档位有效，不动 parity，并清空短欠计数。
+        a.note_repair_outcome(20, 20);
+        assert_eq!(a.parity, 3);
+        assert_eq!(a.shortfall_reports, 0);
+        // 没丢 → 同样不动。
+        a.shortfall_reports = 1;
+        a.note_repair_outcome(0, 0);
+        assert_eq!(a.parity, 3);
+        assert_eq!(a.shortfall_reports, 0);
+    }
+
+    #[test]
+    fn recovery_driven_input_is_bounded_by_max_parity() {
+        let mut a = Adaptive {
+            parity: MAX_PARITY,
+            ..Adaptive::default()
+        };
+        for _ in 0..20 {
+            a.note_repair_outcome(50, 0);
+        }
+        assert_eq!(a.parity, MAX_PARITY, "must not exceed the parity ceiling");
+    }
+
+    #[test]
     fn adaptive_ignores_unavailable_loss_samples() {
         let mut a = Adaptive {
             parity: 2,
@@ -2312,6 +2390,7 @@ mod tests {
             last_loss_ppm: 80_000,
             smoothed_loss_ppm: 70_000,
             unavailable_reports: 0,
+            shortfall_reports: 0,
         };
         a.report(LOSS_SAMPLE_UNAVAILABLE);
         assert_eq!(a.parity, 2);
