@@ -640,6 +640,8 @@ T3b 还有一个独立的纯逻辑缺陷：`BurstBackoff` 把 `clean_intervals` 
 - `SMART_QUIC_REQUIRE_TRUSTED_CERT=1` 会让自签证书直接拒绝启动。当前 UDP/443 载体出示的
   就是自签证书（§10.7 同批审计），**该指纹问题尚未修复**，需要一张指向自有域名的公开
   信任证书。
+- `SMART_FEC_FORCE_PARITY=<n>` 固定 FEC parity、**关闭自适应冗余**。release 亦生效，
+  启用时打 WARN。仅用于诊断/受控实验，不要长期留在生产上。
 
 ### 10.12 长期"效率恒定 22–29%"缺口的真正根因（已修复）
 
@@ -734,6 +736,65 @@ T1 的统一账目对齐两端同一 interval 后，一个典型下行区间给�
 导致我在 T3 期间把 29% 误读为丢包。它的分母是**线上字节**（含 parity），所以数值由
 校验开销主导而非丢包。已更名为 `wire_to_inner_ppm` 并单列 `parity_frame_ppm`，
 使开销与丢包可以分开读。
+
+### 10.13 冗余的目标函数：RFC 9265 直接预测了一个反直觉的结果
+
+#### 观测
+
+同窗口埋点显示 `missing` 与真实数据损失 `unrecovered_shards` **解耦甚至反相关**：
+
+| 时刻 | `missing` | `unrecovered_shards` | `failed_groups` |
+| --- | --- | --- | --- |
+| 03:49:04 | 274 | 0 | 0 |
+| 03:49:06 | **0** | **213** | **62** |
+| 03:49:12 | **0** | **315** | **81** |
+| 03:49:14 | 373 | 0 | 0 |
+
+而 parity 控制器正是由 `missing` 派生的 `smoothed_loss_ppm` 驱动的。
+
+#### 规范核验：RFC 9265 §3/§4 预测"对可靠传输，冗余主要是降低有效吞吐"
+
+原文（<https://www.rfc-editor.org/rfc/rfc9265.txt>）：
+
+> §3："For reliable transfers, **coding usage does not guarantee better performance;
+> instead, it would mainly reduce goodput**."
+>
+> §4："For reliable transfers, **including redundancy reduces goodput for long
+> transfers** … There is a trade-off between 1) the capacity that could have been
+> exploited by application data instead of transmitting source packets and 2) the
+> benefits derived from transmitting repair symbols."
+
+**适用条件由本项目自己的架构决定**：RFC 9265 §5（FEC 置于传输层之下）说这种摆放
+"Including redundancy adds traffic **without reducing goodput**"——但那成立的前提是冗余
+**在传输层速率之外额外增加**。而本项目里 **FEC pacer 与载体速率出自同一份预算**
+（§10.5 的耦合；实测 FEC pacer 28 Mbps 与载体上限 30 Mbps 抢同一根管子），所以冗余是
+**从载荷里扣**的，落在 §3/§4 的情形。
+
+内层又是 TUIC（可靠传输），**失败的数据会被重传**——所以一次组失败的真实代价远低于
+`target()` 模型假设的"完全丢失"：
+
+    模型：(1 − P(组失败)) / (1 + parity/10)     隐含"组失败 = 数据彻底丢失"
+    真实： 组失败 → TUIC 重传一次              代价 ≈ 一个额外往返，不是丢一份数据
+
+若重传 20% 的代价低于用 50% 开销（parity=5）去避免它，则模型给出的最优 parity **偏高**。
+这与 T2/T3 三轮工作的方向相反——那三轮都在让 parity 更及时地升上去。
+
+#### 受控 A/B：**因双 WAN 漂移而失败**
+
+同一时段固定 parity = 1 / 3 / 5 各测一轮，结果载体**中途翻了 WAN**：
+
+| 轮次 | 载体 `rtt_ms` | 载体丢包 | 路径 |
+| --- | --- | --- | --- |
+| parity=1 | **67** | 4.5% | 快/丢包那条 |
+| parity=3 | **386** | 0% | **干净那条** |
+| parity=5 | **350** | 0% | **干净那条** |
+
+parity 1 与 parity 3/5 测的不是同一条路径，**比较无效**。另有一处测量设计错误：脚本读取的
+`tx_parity` 是**客户端自己上行**的 parity，不是服务端被固定的下行 parity。
+
+**方法论结论（比这一轮的数字更有价值）**：**双 WAN 漂移的翻转尺度是分钟级，因此任何长于
+一分钟的 A/B 都不可靠。** 这与 §10.8 的吞吐结论同根，只不过这次它毁掉的是**实验能力**
+而不只是吞吐。**受控 A/B 在 iKuai 钉住单条 WAN 之前无法进行。**
 
 ## 11. 内核感知优化阶段
 
