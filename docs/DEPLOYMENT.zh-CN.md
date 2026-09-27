@@ -98,6 +98,7 @@ RFC 9002 下限（2944 字节）、吞吐 4.5 KB/s，而 `bbr` 与 `fixed` 都�
 | `SMART_QUIC_REQUIRE_TRUSTED_CERT` | 服务端 | 关 | 设 `1` 时，自签证书直接拒绝启动 |
 | `SMART_FEC_TRAFFIC_LOG` | 两端 | 开 | T1 流量账目，每 5 秒一条；设 `0` 关闭 |
 | `SMART_FEC_MAX_PARITY` | 两端（**服务端有效**） | `8` | FEC parity 的有效上限，夹在 `[1, 8]`；见 §10.14 |
+| `SMART_FEC_INTERLEAVE` | **两端** | `1`（关闭） | FEC 交织深度，夹在 `[1, 4]`。`>1` 时把已完成组的帧**按列**发出，使线上连续包属于不同组，用于对抗**突发**丢包。**两端应设相同值**。上限由 `REORDER_WINDOW` 约束（见 §10.26）。注意：它按常量名读取，`deploy_env_coverage.rs` 扫不到，init 里的转发是人工维护的 |
 | `SMART_QUIC_STREAM_LANES` | **两端** | 不传 | 仅 `1` 有意义（不传 = DATAGRAM）。`run_server` 与 `run_client` **都**读它，两端必须一致 |
 
 **作用域写法说明**：前三行是 clap 的 `#[arg(env = "...")]`，其余是 `std::env::var` 字面量。

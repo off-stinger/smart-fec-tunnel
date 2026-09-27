@@ -798,6 +798,59 @@ traffic_counters! {
     frames_rejected,
 }
 
+/// 交织深度上限。
+///
+/// 交织把"连续发出的包"变成"属于不同组的包"，代价是**发送顺序与序号顺序分离**：一个组的
+/// 序号仍然连续（在 `flush()` 里按组分配），但线上顺序变成 column-wise。
+///
+/// 解码端对此的容忍度是 `REORDER_WINDOW`：`observe_seq` 以
+/// `cutoff = highest_sequence - REORDER_WINDOW` 判定缺失，早于 cutoff 的帧会被当作
+/// "late" 丢弃。column-wise 发送造成的**最大序号回退**是 `(I-1) * 单组最长帧数`，而单组
+/// 最长是 `DATA_SHARDS + MAX_PARITY`。所以深度必须满足下面的断言，否则交织会把正常到达
+/// 的帧判成迟到并丢弃——那会让交织比不做还糟。
+const MAX_INTERLEAVE: usize = 4;
+
+/// `SMART_FEC_INTERLEAVE`：FEC 交织深度。`1`（默认）= 关闭，行为与改动前逐位一致。
+const INTERLEAVE_ENV: &str = "SMART_FEC_INTERLEAVE";
+
+/// 交织深度是否在安全范围内。
+///
+/// 抽成函数是为了可测：这是"交织不会把帧推进 reorder window 之外"的唯一依据。
+fn interleave_is_safe(interleave: usize) -> bool {
+    let longest_group = DATA_SHARDS + MAX_PARITY;
+    (1..=MAX_INTERLEAVE).contains(&interleave)
+        && (interleave - 1) * longest_group < REORDER_WINDOW as usize
+}
+
+fn configured_interleave() -> usize {
+    let Some(raw) = std::env::var(INTERLEAVE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return 1;
+    };
+    match raw.parse::<usize>() {
+        Ok(depth) if interleave_is_safe(depth) => depth,
+        Ok(depth) => {
+            warn!(
+                requested = depth,
+                max = MAX_INTERLEAVE,
+                "SMART_FEC_INTERLEAVE out of range; interleaving stays OFF"
+            );
+            1
+        }
+        Err(_) => {
+            warn!(
+                value = %raw,
+                effective = 1,
+                "SMART_FEC_INTERLEAVE is not an integer; interleaving stays OFF"
+            );
+            1
+        }
+    }
+}
+
 /// Wall-clock aligned interval id, derived independently by both ends.
 ///
 /// This is what makes the client's and the server's records comparable at all:
@@ -906,6 +959,10 @@ struct Encoder {
     packet: u64,
     group: u64,
     shards: Vec<Vec<u8>>,
+    /// 已完成、待交织发送的组（FIFO）。深度为 1 时每组一完成就立刻发送，与改动前一致。
+    pending: std::collections::VecDeque<Vec<Frame>>,
+    /// 交织深度。`1` = 关闭。
+    interleave: usize,
     adaptive: Adaptive,
     /// 诊断/实验用：固定 parity，绕过自适应。
     ///
@@ -946,6 +1003,8 @@ impl Encoder {
             packet: 1,
             group: 1,
             shards: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            interleave: configured_interleave(),
             adaptive: Adaptive::default(),
             force_parity,
         }
@@ -1034,9 +1093,61 @@ impl Encoder {
         }
         Ok(frames)
     }
+    /// 交织发送：把若干已完成组的帧**按列**发出，使线上连续包属于不同组。
+    ///
+    /// 为什么这能治突发丢包：改动前一个组的 10 个数据分片 + ~5 个校验分片是**背靠背**
+    /// 发出的，于是一段突发丢包会整段落在同一个组上，把该组的 parity 预算一次打光。实测
+    /// （联通那条高丢包 WAN）单个 5 秒窗口：477 个组里 **72 个失败（15.1%）**，而同丢包率
+    /// 下按独立丢包算只有 3–5%——即突发被证实，且块状 RS 对突发无能为力
+    /// （PRODUCT-MANUAL §10.13 测到 21.3% vs 预期 2.0–8.7%，同一结论）。
+    ///
+    /// 列式发送把一段长度为 B 的突发摊到约 `min(B, I)` 个组上，每组只丢约 `B/I` 个分片，
+    /// 于是 parity 就有余量了。
+    ///
+    /// **`force`**：定时器路径必须强制冲掉，否则低速率下（一个网页请求只有一两个数据报、
+    /// 组永远填不满）这些帧会一直压在 `pending` 里。强制冲掉把额外延迟限制在一个 flush
+    /// 周期（5 ms）以内。
+    fn drain_pending(&mut self, force: bool) -> Vec<Frame> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        // 未攒够交织深度且不强制时，先留着——这正是交织生效的方式。
+        if !force && self.pending.len() < self.interleave.max(1) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut column = 0usize;
+        loop {
+            let mut emitted_any = false;
+            for group in self.pending.iter() {
+                if let Some(frame) = group.get(column) {
+                    out.push(frame.clone());
+                    emitted_any = true;
+                }
+            }
+            if !emitted_any {
+                break;
+            }
+            column += 1;
+        }
+        self.pending.clear();
+        out
+    }
+
+    /// 定时器路径：先把当前未满的组按现状收尾，再强制冲掉所有待发组。
+    fn flush_all(&mut self) -> Result<Vec<Frame>> {
+        self.flush_into_pending()?;
+        Ok(self.drain_pending(true))
+    }
+
     fn flush(&mut self) -> Result<Vec<Frame>> {
+        self.flush_into_pending()?;
+        Ok(self.drain_pending(false))
+    }
+
+    fn flush_into_pending(&mut self) -> Result<()> {
         if self.shards.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let data = self.shards.len();
         let parity = if let Some(p) = self.force_parity {
@@ -1105,7 +1216,10 @@ impl Encoder {
         }
         self.shards.clear();
         self.group += 1;
-        Ok(frames)
+        // 不再直接返回：交给 `pending`，由 `drain_pending` 决定发送顺序。深度为 1 时
+        // 紧接着就会被 drain 掉，行为与改动前一致。
+        self.pending.push_back(frames);
+        Ok(())
     }
 }
 
@@ -1885,7 +1999,8 @@ async fn client(
                 }
             }
             _ = flush.tick() => {
-                let frames = encoder.lock().await.flush()?;
+                // 定时器路径必须强制冲掉待发组（低速率下组填不满）。
+                let frames = encoder.lock().await.flush_all()?;
                 send_frames(&tunnel, None, frames, &key, &mut pacer).await?;
             }
             _ = traffic.tick() => {
@@ -2054,7 +2169,7 @@ async fn run_server_session(
                 send_session_frames(&runtime.public, peer.unwrap(), vec![frame], &runtime.key, &runtime.pacer).await;
             }
             _ = flush.tick(), if peer.is_some() => {
-                match encoder.flush() {
+                match encoder.flush_all() {
                     Ok(frames) => send_session_frames(&runtime.public, peer.unwrap(), frames, &runtime.key, &runtime.pacer).await,
                     Err(error) => warn!(%error, "session flush failed"),
                 }
@@ -2804,6 +2919,119 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.len(), 2);
     }
+    /// 交织深度必须留在 reorder window 之内——这是"交织不会把正常到达的帧判成迟到"
+    /// 的唯一依据，也是这个特性的安全边界。
+    #[test]
+    fn interleave_depth_is_bounded_by_the_reorder_window() {
+        // 关闭与深度 1 都是合法（且等价）
+        assert!(interleave_is_safe(1));
+        // 上限本身合法
+        assert!(interleave_is_safe(MAX_INTERLEAVE));
+        // 超过上限非法
+        assert!(!interleave_is_safe(MAX_INTERLEAVE + 1));
+        assert!(!interleave_is_safe(0));
+        // 关键不变式：最大序号回退严格小于 REORDER_WINDOW
+        let worst = (MAX_INTERLEAVE - 1) * (DATA_SHARDS + MAX_PARITY);
+        assert!(
+            worst < REORDER_WINDOW as usize,
+            "column-major emission may push a frame {worst} sequences behind the highest seen, \
+             which is at or beyond the {REORDER_WINDOW} reorder window; such frames are dropped \
+             as late and interleaving would be worse than not interleaving"
+        );
+    }
+
+    /// 交织必须做到两件事：**线上连续包属于不同组**，且**解码端仍能逐字节还原**。
+    ///
+    /// 第二件是本次改动的真正风险点：交织让"发送顺序"与"序号顺序"分离，而解码端用
+    /// `start_sequence = sequence - index` 校验组、用 `highest_sequence - REORDER_WINDOW`
+    /// 判定迟到。本用例把编码→解码整条路走一遍。
+    #[test]
+    fn interleaved_groups_are_column_major_and_still_round_trip() {
+        const N: usize = MAX_INTERLEAVE;
+        let mut enc = Encoder::with_identity(99, VERSION_V3, 1);
+        enc.adaptive.parity = 0; // 每组 = DATA_SHARDS 个数据帧，便于断言
+        enc.interleave = N;
+
+        let total = DATA_SHARDS * N;
+        let payloads: Vec<Vec<u8>> = (0..total)
+            .map(|i| {
+                let mut p = vec![0u8; 64];
+                p[0..4].copy_from_slice(&(i as u32).to_be_bytes());
+                p
+            })
+            .collect();
+
+        let mut frames = Vec::new();
+        for p in &payloads {
+            frames.extend(enc.encode_datagram(p).unwrap());
+        }
+        // 定时器路径强制冲掉剩余
+        frames.extend(enc.flush_all().unwrap());
+
+        assert_eq!(
+            frames.len(),
+            total,
+            "every data frame must be emitted exactly once"
+        );
+        // 列优先：第 k 列的 N 帧必须分属 N 个**不同**的组
+        for column in 0..DATA_SHARDS {
+            let row: Vec<u64> = frames[column * N..column * N + N]
+                .iter()
+                .map(|f| f.group)
+                .collect();
+            let unique: std::collections::BTreeSet<u64> = row.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                N,
+                "column {column} must interleave {N} distinct groups, got {row:?}"
+            );
+            for f in &frames[column * N..column * N + N] {
+                assert_eq!(
+                    f.index as usize, column,
+                    "column order must follow shard index"
+                );
+            }
+        }
+
+        // 解码：顺序被置换，但每一份载荷都必须完整还原且只还原一次
+        let mut decoder = Decoder::new(99);
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        for f in frames {
+            got.extend(decoder.frame(f).unwrap());
+        }
+        got.sort();
+        let mut want = payloads.clone();
+        want.sort();
+        assert_eq!(
+            got, want,
+            "interleaved emission must survive the decoder byte-for-byte"
+        );
+    }
+
+    /// 深度 1 必须与改动前逐位一致：组一完成就立刻整组发出（不做任何置换）。
+    #[test]
+    fn interleave_depth_one_preserves_the_original_emission_order() {
+        let mut enc = Encoder::with_identity(5, VERSION_V3, 1);
+        enc.adaptive.parity = 0;
+        enc.interleave = 1;
+        let mut frames = Vec::new();
+        for i in 0..(DATA_SHARDS * 2) {
+            let mut p = vec![0u8; 32];
+            p[0] = i as u8;
+            frames.extend(enc.encode_datagram(&p).unwrap());
+        }
+        frames.extend(enc.flush_all().unwrap());
+        assert_eq!(frames.len(), DATA_SHARDS * 2);
+        // 前 DATA_SHARDS 帧同组且 index 递增；后 DATA_SHARDS 帧属于另一个组
+        let first_group = frames[0].group;
+        for (k, f) in frames.iter().take(DATA_SHARDS).enumerate() {
+            assert_eq!(f.group, first_group);
+            assert_eq!(f.index as usize, k);
+        }
+        assert_ne!(frames[DATA_SHARDS].group, first_group);
+        assert_eq!(frames[DATA_SHARDS].index, 0);
+    }
+
     #[test]
     fn duplicate_authenticated_frame_is_not_delivered_twice() {
         let mut enc = Encoder::with_identity(7, VERSION_V2, 3);

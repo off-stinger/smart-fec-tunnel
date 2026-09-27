@@ -28,6 +28,11 @@ start_service() {
     # （客户端）生成，所以这个变量在路由器上是有效的：实测本链路 parity=1 比
     # parity=5 快 40.9%（PRODUCT-MANUAL §10.13），需要按实测覆盖模型时设它。
     max_parity="${SMART_FEC_MAX_PARITY:-}"
+    # FEC 交织深度（1 = 关闭，默认）。上行冗余由本端生成，所以这里有效；两端应设成相同
+    # 值——编码器在两端各有一份（客户端编上行、服务端编下行）。
+    # 注意：本变量在源码里以常量名读取（`std::env::var(INTERLEAVE_ENV)`），
+    # `tests/deploy_env_coverage.rs` 只扫字面量，**扫不到它**，所以这里的转发是人工维护的。
+    interleave="${SMART_FEC_INTERLEAVE:-}"
     # 注意：procd 的 env 参数走 _procd_add_table -> json_add_object("env")，多次调用
     # procd_set_param env 会生成重复的 "env" 键，JSON 解析后只有最后一次生效，前面几组
     # 环境变量会被静默丢弃（表现为二进制报缺少 --key）。必须只调用一次、合并传入。
@@ -36,6 +41,7 @@ start_service() {
     [ -z "$max_rate_mbps" ] || envs="$envs SMART_QUIC_MAX_RATE_MBPS=$max_rate_mbps"
     [ -z "$traffic_log" ] || envs="$envs SMART_FEC_TRAFFIC_LOG=$traffic_log"
     [ -z "$max_parity" ] || envs="$envs SMART_FEC_MAX_PARITY=$max_parity"
+    [ -z "$interleave" ] || envs="$envs SMART_FEC_INTERLEAVE=$interleave"
     # 只有显式配置为 1 时才传这一项：不传即 datagram 模式（默认，配合 FEC 纠错）。
     # 不传 "0" 是为了兼容旧二进制对 "0" 的拒绝（见 parse_stream_lanes）。
     [ "${SMART_QUIC_STREAM_LANES:-}" != "1" ] || envs="$envs SMART_QUIC_STREAM_LANES=1"
