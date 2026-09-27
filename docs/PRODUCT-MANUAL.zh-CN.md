@@ -1890,6 +1890,94 @@ if g.start_sequence != group_start_sequence { bail!("group mismatch") }  // main
   用确定性实验比较 `interleave=1` 与 `=3` 的未恢复率——这样不依赖 WAN 运气。这与
   §10.24 的结论一致：凡是依赖真实链路的速率/丢包 A/B，在这条链路上都做不成。
 
+### 10.27 部署守卫给过假保证：FEC 层开关从未到达读它的进程
+
+§10.26 实现了交织并留下"生产 A/B 未做成"。本轮把它真正部署时，发现**这个开关在生产上
+根本不可能生效**——而部署守卫一路通过。
+
+#### 缺陷
+
+路由器上有**两个**独立的 init：
+
+| init | 启动的进程 | 读哪些变量 |
+| --- | --- | --- |
+| `deploy/openwrt-smart-fec-quic.init` | 载体 `quic-client` | 只有 `SMART_QUIC_*` |
+| `deploy/openwrt-install.sh` 里 heredoc 生成的 `/etc/init.d/smart-fec-client` | **FEC 层** `client`（上行编码器） | `SMART_FEC_*` |
+
+我此前把 `SMART_FEC_MAX_PARITY`、`SMART_FEC_INTERLEAVE`（以及更早的 `SMART_FEC_TRAFFIC_LOG`）
+转发进了**载体** init。载体**根本不读**它们，而真正读它们的 FEC client 一个都没拿到——
+它的 `procd_set_param env` 只传 `SMART_FEC_KEY` 与 `RUST_LOG`。进程级实测（修复前）：
+
+    /proc/<FEC client pid>/environ →  只有 SMART_FEC_KEY, RUST_LOG
+
+**后果**：在 `/etc/smart-fec.env` 里设置这三个开关会被**静默忽略**——正是本手册反复记录的
+"静默配置丢失"，而 §10.26 写下的"init 转发 `SMART_FEC_INTERLEAVE`"是**无效**的。
+
+#### 守卫为什么没拦住（比缺陷本身更值得记录）
+
+第二/三版守卫的判据是 **"变量名出现在 init 文本里"**，而且只看**那一个** init 文件。
+把名字放进错误的 init，守卫就满意了。它检查的是"有没有被提到"，而真正该检查的是
+**"有没有到达读它的那个进程"**。
+
+#### 修复
+
+1. `deploy/openwrt-install.sh` 的 heredoc：FEC client init 改为按需转发
+   `SMART_FEC_TRAFFIC_LOG` / `SMART_FEC_MAX_PARITY` / `SMART_FEC_INTERLEAVE`，仍然**只调用
+   一次** `procd_set_param env`（procd 重复键会静默丢弃前面的变量）。
+2. `deploy/openwrt-smart-fec-quic.init`：移除这三个 FEC 层变量，并注明载体只读 `SMART_QUIC_*`。
+3. **守卫按"读取该变量的源文件"决定目标 init**：`src/quic_relay.rs` → 载体 init；
+   `src/main.rs` → FEC client init。这条映射就是"配置有没有到达读它的进程"的答案。
+   另有 `interleave_is_forwarded_to_the_fec_client_process` 与
+   `fec_layer_vars_are_not_forwarded_to_the_carrier` 两条用例专门钉住这次的坑
+   （`SMART_FEC_INTERLEAVE` 按常量名读取，字面量扫描扫不到它）。
+
+**验证**：临时把修复退回旧状态后，守卫以逐条具名的错误失败：
+
+    配置无法到达读取它的进程（在 env 文件里设置会被静默忽略）：[
+        "SMART_FEC_MAX_PARITY (read by src/main.rs) 未在 deploy/openwrt-install.sh 中转发",
+        "SMART_FEC_TRAFFIC_LOG (read by src/main.rs) 未在 deploy/openwrt-install.sh 中转发",
+        "SMART_FEC_INTERLEAVE 未在 deploy/openwrt-install.sh 中转发",
+    ]
+
+恢复后通过。部署后进程级核实：`/proc/<FEC client pid>/environ` 里**确实出现了**
+`SMART_FEC_INTERLEAVE=3`——修复前不可能。
+
+#### 顺带得到的结论：交织在无损路径上**要付代价**
+
+开关终于能生效后，在生产上测了它（同一目标 OVH 100 MB，http 全 200，干净那条 WAN）：
+
+| 配置 | 平均批深度 | 100 MB 吞吐 |
+| --- | --- | --- |
+| `SMART_FEC_INTERLEAVE` 未设 | **1.00** | **1.54 / 1.45 MB/s** |
+| `SMART_FEC_INTERLEAVE=3` | **2.04** | **0.91 / 0.59 MB/s** |
+
+- **机制确实生效**：批深度 1.00 → 2.04，54% 的批次跨组交织（`interleave_single_group_batches`
+  占 46%，即定时器提前冲掉了单组）。
+- **但吞吐掉 40–60%**，而这窗口的载体丢包只有 0.05–0.5%、`groups_failed` 1–2 ——
+  **连交织要去救的突发丢包都没有**。最可能的机制正是本手册反复警告的那条：交织让**内层
+  TUIC 看到乱序**，从而产生伪丢包与重传（RFC 9265 §5.5；`MAX_STREAM_LANES` 的注释也记过
+  "乱序深到足以造成严重停顿"）。
+
+**决定：保持关闭（默认值）。** 交织的**收益**至今没有任何实测支持，而**代价**已经测到。
+要在联通那条高丢包 WAN 上翻案，它必须先克服这个代价——在那之前它不是可用的优化，
+本手册不把它当作解决方案。这也再次印证 §10.24：不固定 WAN 的 A/B 不足以支撑结论。
+
+### 10.28 用户修复版（`578a8da7`）的部署测试
+
+用户提交的三处修复（详见各自代码注释）已部署并实测：
+
+| 修复 | 内容 | 测试结果 |
+| --- | --- | --- |
+| `AdaptStep::TestAbort` | 速率测试期间的 app-limited / 空区间不再被当作"降速有效"的证据 | 部署正常；本窗口无足够排队，**未触发**（只有 `probe`/`test_drop`/`test_revert`/`test_confirm`），路径正确性由单测覆盖 |
+| `app_limited` 改为字节占比 | 不再因单个 app-limited ACK 压掉整个区间的决策 | 同上 |
+| session liveness 只在入队成功后刷新 | 原实现让**队列永久塞满的卡死 session 永生**（`last_seen` 一直被刷新，永不被 idle 清理回收） | `session_queue_drops=0`，无异常回收 |
+| 队列丢弃可见 + 关闭队列移除 | 原为静默 `let _ = try_send` | `session_queue_drops` 计数器与 WARN 均已生效 |
+| 集成测试动态端口 | 原来固定 15555/25555/35555/45555 可能与本机服务冲突 | 4/4 通过 |
+
+部署态核实：两端 `578a8da738276fddf0df25e9aa65caf7`，服务全部 active，隧道 `loc=SG`，
+下载 **1.45–1.54 MB/s**（与部署前同量级，**无回归**），`parity/data=0.122`、
+`groups_failed` 1–2 —— 即用户修复**未改变正常路径的行为**。
+
 ## 11. 内核感知优化阶段
 
 内核优化按能力和验证结果分级，不以固定 `sysctl` 大全作为产品功能。

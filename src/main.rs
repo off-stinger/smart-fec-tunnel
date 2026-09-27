@@ -783,6 +783,10 @@ traffic_counters! {
     inner_tx_bytes,
     inner_tx_datagrams,
     inner_tx_failures,
+    session_queue_drops,
+    interleave_batches,
+    interleave_groups,
+    interleave_single_group_batches,
     inner_peer_conflicts,
     wire_tx_bytes,
     wire_rx_bytes,
@@ -925,6 +929,11 @@ fn log_traffic(role: &str, previous: &mut CounterSnapshot) {
         inner_tx_bytes = delta.inner_tx_bytes,
         inner_tx_datagrams = delta.inner_tx_datagrams,
         inner_tx_failures = delta.inner_tx_failures,
+        session_queue_drops = delta.session_queue_drops,
+        fec_interleave_configured = configured_interleave(),
+        interleave_batches = delta.interleave_batches,
+        interleave_groups = delta.interleave_groups,
+        interleave_single_group_batches = delta.interleave_single_group_batches,
         wire_tx_bytes = delta.wire_tx_bytes,
         wire_rx_bytes = delta.wire_rx_bytes,
         wire_tx_data_frames = delta.wire_tx_data_frames,
@@ -1114,6 +1123,16 @@ impl Encoder {
         // 未攒够交织深度且不强制时，先留着——这正是交织生效的方式。
         if !force && self.pending.len() < self.interleave.max(1) {
             return Vec::new();
+        }
+        let batch_depth = self.pending.len() as u64;
+        COUNTERS.interleave_batches.fetch_add(1, Ordering::Relaxed);
+        COUNTERS
+            .interleave_groups
+            .fetch_add(batch_depth, Ordering::Relaxed);
+        if batch_depth == 1 {
+            COUNTERS
+                .interleave_single_group_batches
+                .fetch_add(1, Ordering::Relaxed);
         }
         let mut out = Vec::new();
         let mut column = 0usize;
@@ -2010,6 +2029,7 @@ async fn client(
     }
 }
 
+#[derive(Debug)]
 struct SessionPacket {
     frame: Frame,
     peer: SocketAddr,
@@ -2019,6 +2039,19 @@ struct SessionEntry {
     sender: mpsc::Sender<SessionPacket>,
     last_seen: Arc<std::sync::Mutex<Instant>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Enqueue an authenticated frame and refresh liveness only after it is accepted.
+fn try_enqueue_session_packet(
+    sender: &mpsc::Sender<SessionPacket>,
+    last_seen: &std::sync::Mutex<Instant>,
+    packet: SessionPacket,
+) -> Result<(), mpsc::error::TrySendError<SessionPacket>> {
+    sender.try_send(packet)?;
+    if let Ok(mut last_seen) = last_seen.lock() {
+        *last_seen = Instant::now();
+    }
+    Ok(())
 }
 
 struct SessionRuntime {
@@ -2225,6 +2258,7 @@ async fn server(
     let mut net_buf = vec![0u8; 2048];
     let mut cleanup = time::interval(Duration::from_secs(5));
     let idle = Duration::from_secs(session_idle_secs);
+    let mut queue_drop_log_at = 0u64;
     info!(%listen, %upstream, v2_keys=keyring.len(), legacy=legacy_key.is_some(), max_sessions, "multi-user server started");
     loop {
         tokio::select! {
@@ -2288,12 +2322,41 @@ async fn server(
                     sessions.insert(session_key, SessionEntry { sender, last_seen, task });
                     info!(key_id=frame.key_id, session=frame.session, "authenticated session started");
                 }
+                let mut closed_session = false;
                 if let Some(entry) = sessions.get_mut(&session_key) {
-                    if let Ok(mut last_seen) = entry.last_seen.lock() {
-                        *last_seen = Instant::now();
+                    // A bounded queue intentionally sheds excess authenticated traffic,
+                    // but overload must be visible and must not extend session life.
+                    match try_enqueue_session_packet(
+                        &entry.sender,
+                        &entry.last_seen,
+                        SessionPacket { frame, peer },
+                    ) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            let drops = COUNTERS
+                                .session_queue_drops
+                                .fetch_add(1, Ordering::Relaxed)
+                                + 1;
+                            if drops == 1 || drops.saturating_sub(queue_drop_log_at) >= 256 {
+                                queue_drop_log_at = drops;
+                                warn!(session_drops = drops, key_id=session_key.0, session=session_key.1,
+                                    "authenticated session queue is full; packets are being shed");
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            COUNTERS
+                                .session_queue_drops
+                                .fetch_add(1, Ordering::Relaxed);
+                            closed_session = true;
+                        }
                     }
-                    // A bounded queue intentionally sheds excess authenticated traffic.
-                    let _ = entry.sender.try_send(SessionPacket { frame, peer });
+                }
+                if closed_session {
+                    if let Some(entry) = sessions.remove(&session_key) {
+                        entry.task.abort();
+                        warn!(key_id=session_key.0, session=session_key.1,
+                            "removed session with a closed packet queue");
+                    }
                 }
             }
             _ = cleanup.tick() => {
@@ -2656,6 +2719,56 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn session_packet(sequence: u64) -> SessionPacket {
+        SessionPacket {
+            frame: Frame {
+                version: VERSION_V1,
+                key_id: 0,
+                kind: KIND_DATA,
+                session: 1,
+                sequence,
+                group: 1,
+                index: 0,
+                data: 1,
+                parity: 0,
+                payload: vec![1],
+            },
+            peer: SocketAddr::from(([127, 0, 0, 1], 12345)),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_or_closed_session_queue_does_not_refresh_liveness() {
+        let stale = Instant::now() - Duration::from_secs(10);
+        let last_seen = std::sync::Mutex::new(stale);
+        let (sender, receiver) = mpsc::channel(1);
+        sender.try_send(session_packet(1)).unwrap();
+
+        assert!(matches!(
+            try_enqueue_session_packet(&sender, &last_seen, session_packet(2)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        assert_eq!(*last_seen.lock().unwrap(), stale);
+
+        drop(receiver);
+        assert!(matches!(
+            try_enqueue_session_packet(&sender, &last_seen, session_packet(3)),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        assert_eq!(*last_seen.lock().unwrap(), stale);
+    }
+
+    #[tokio::test]
+    async fn successful_session_enqueue_refreshes_liveness() {
+        let stale = Instant::now() - Duration::from_secs(10);
+        let last_seen = std::sync::Mutex::new(stale);
+        let (sender, _receiver) = mpsc::channel(1);
+
+        try_enqueue_session_packet(&sender, &last_seen, session_packet(1)).unwrap();
+
+        assert!(*last_seen.lock().unwrap() > stale);
+    }
+
     fn test_balance_upstream(
         port: u16,
         healthy: bool,
@@ -3006,6 +3119,30 @@ mod tests {
             got, want,
             "interleaved emission must survive the decoder byte-for-byte"
         );
+    }
+
+    #[test]
+    fn timer_flush_records_the_interleave_depth_that_was_really_emitted() {
+        let mut enc = Encoder::with_identity(100, VERSION_V3, 1);
+        enc.adaptive.parity = 0;
+        enc.interleave = 4;
+
+        // The production 5 ms timer calls flush_all. A sparse flow that completes
+        // only one group per timer tick must emit that group immediately rather
+        // than hold it for three more ticks and add up to 15 ms of latency.
+        for group_index in 0..4 {
+            let mut frames = Vec::new();
+            for packet_index in 0..DATA_SHARDS {
+                let payload = [group_index as u8, packet_index as u8];
+                frames.extend(enc.encode_datagram(&payload).unwrap());
+            }
+            frames.extend(enc.flush_all().unwrap());
+
+            assert_eq!(frames.len(), DATA_SHARDS);
+            let groups: std::collections::BTreeSet<_> =
+                frames.iter().map(|frame| frame.group).collect();
+            assert_eq!(groups.len(), 1);
+        }
     }
 
     /// 深度 1 必须与改动前逐位一致：组一完成就立刻整组发出（不做任何置换）。

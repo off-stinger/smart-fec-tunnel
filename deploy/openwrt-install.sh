@@ -62,6 +62,13 @@ START=96
 STOP=10
 
 start_service() {
+    # 本进程是**上行方向的 FEC 编码器**，`SMART_FEC_*` 全部由它读取；载体
+    # （smart-fec-quic）不读其中任何一个。把 FEC 层变量放进 quic 环境文件是无效的。
+    #
+    # procd 的 env 参数走 _procd_add_table -> json_add_object("env")：**只能调用一次**，
+    # 多次调用会生成重复的 "env" 键，JSON 解析后只有最后一次生效，前面的变量被静默丢弃
+    # （曾因此丢掉 SMART_FEC_KEY，client 以缺少 --key 崩溃并 crash loop）。所以下面
+    # 合并成一个 $envs 字符串，只调用一次。
     . /etc/smart-fec.env
     procd_open_instance
     set -- /usr/bin/smart-fec-tunnel client \
@@ -70,7 +77,12 @@ start_service() {
         --rate-mbps "$SMART_FEC_RATE_MBPS"
     [ -z "${SMART_FEC_KEY_ID:-}" ] || set -- "$@" --key-id "$SMART_FEC_KEY_ID"
     procd_set_param command "$@"
-    procd_set_param env SMART_FEC_KEY="$SMART_FEC_KEY" RUST_LOG=info
+    envs="SMART_FEC_KEY=$SMART_FEC_KEY RUST_LOG=info"
+    # 以下三项都是 FEC 层的开关，只有本进程读。空值不传，以免覆盖二进制的默认值。
+    [ -z "${SMART_FEC_TRAFFIC_LOG:-}" ] || envs="$envs SMART_FEC_TRAFFIC_LOG=$SMART_FEC_TRAFFIC_LOG"
+    [ -z "${SMART_FEC_MAX_PARITY:-}" ] || envs="$envs SMART_FEC_MAX_PARITY=$SMART_FEC_MAX_PARITY"
+    [ -z "${SMART_FEC_INTERLEAVE:-}" ] || envs="$envs SMART_FEC_INTERLEAVE=$SMART_FEC_INTERLEAVE"
+    procd_set_param env $envs
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
     procd_set_param stderr 1

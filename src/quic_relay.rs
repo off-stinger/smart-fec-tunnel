@@ -682,6 +682,8 @@ enum AdaptStep {
     TestConfirm,
     /// Queueing did not fall, so it was not congestion: restore the rate.
     TestRevert,
+    /// The application stopped supplying enough traffic to evaluate the test.
+    TestAbort,
     /// The path is delivering almost nothing: drop immediately, no test.
     SaturationDrop,
     Probe,
@@ -694,6 +696,7 @@ impl AdaptStep {
             AdaptStep::TestDrop => "test_drop",
             AdaptStep::TestConfirm => "test_confirm",
             AdaptStep::TestRevert => "test_revert",
+            AdaptStep::TestAbort => "test_abort",
             AdaptStep::SaturationDrop => "saturation_drop",
             AdaptStep::Probe => "probe",
             AdaptStep::Hold => "hold",
@@ -733,12 +736,35 @@ fn adapt_step(
     let total = sample.delivered_bytes.saturating_add(sample.lost_bytes);
     let mut next = state;
     if total == 0 {
+        if state.phase == AdaptPhase::Testing {
+            next.phase = AdaptPhase::Steady;
+            next.steps = 0;
+            next.target = clamp(state.pre_test_rate);
+            next.test_queue_sum_ms = 0;
+            return (next, AdaptStep::TestAbort);
+        }
         // No evidence either way. An idle interval must not ratchet the target
         // up, and must not be read as 100 % loss either.
         return (next, AdaptStep::Hold);
     }
     let loss = loss_ppm(sample.delivered_bytes, total);
     let queueing = sample.smoothed_rtt.saturating_sub(sample.base_rtt);
+
+    if state.phase == AdaptPhase::Testing && (sample.app_limited || sample.delivered_bytes == 0) {
+        // A queue that drains because the application stopped sending, or an
+        // interval with losses but no successful delivery, cannot show that the
+        // lower rate fixed congestion. Restore the pre-test rate and wait for a
+        // traffic-sufficient interval.
+        next.phase = AdaptPhase::Steady;
+        next.steps = 0;
+        next.target = clamp(state.pre_test_rate);
+        next.test_queue_sum_ms = 0;
+        return (next, AdaptStep::TestAbort);
+    }
+
+    if sample.app_limited {
+        return (next, AdaptStep::Hold);
+    }
 
     if state.phase == AdaptPhase::Testing {
         next.test_queue_sum_ms = state
@@ -766,10 +792,6 @@ fn adapt_step(
         next.steps = 0;
         next.target = clamp(state.pre_test_rate);
         return (next, AdaptStep::TestRevert);
-    }
-
-    if sample.app_limited {
-        return (next, AdaptStep::Hold);
     }
 
     // Loss is recorded but never steers: on this path it is ~20 % wide, swings
@@ -894,7 +916,7 @@ struct AdaptiveRate {
     interval_started: Option<Instant>,
     interval_delivered: u64,
     interval_lost: u64,
-    interval_app_limited: bool,
+    interval_app_limited_delivered: u64,
     adapt: AdaptState,
     last_step: AdaptStep,
     steps: u64,
@@ -922,7 +944,7 @@ impl AdaptiveRate {
             interval_started: None,
             interval_delivered: 0,
             interval_lost: 0,
-            interval_app_limited: false,
+            interval_app_limited_delivered: 0,
             adapt: AdaptState::new(target),
             last_step: AdaptStep::Hold,
             steps: 0,
@@ -946,7 +968,12 @@ impl AdaptiveRate {
             lost_bytes: self.interval_lost,
             smoothed_rtt: self.rtt,
             base_rtt: self.base_rtt,
-            app_limited: self.interval_app_limited,
+            // Treat an interval as app-limited only when at least half of its
+            // acknowledged bytes came from app-limited sends. This avoids one
+            // small ACK suppressing decisions for an otherwise saturated period.
+            app_limited: self.interval_app_limited_delivered > 0
+                && self.interval_app_limited_delivered
+                    >= self.interval_delivered.saturating_add(1) / 2,
         };
         let (next, step) = adapt_step(self.adapt, self.ceiling, self.floor, sample);
         if step != AdaptStep::Hold || next.target != self.target {
@@ -978,7 +1005,7 @@ impl AdaptiveRate {
         self.steps = self.steps.saturating_add(1);
         self.interval_delivered = 0;
         self.interval_lost = 0;
-        self.interval_app_limited = false;
+        self.interval_app_limited_delivered = 0;
     }
 }
 
@@ -998,8 +1025,13 @@ impl Controller for AdaptiveRate {
         }
         // `bytes.max(1)`: a zero-byte ACK still proves the path is alive, and
         // dropping it would let an interval look idle when it was not.
-        self.interval_delivered = self.interval_delivered.saturating_add(bytes.max(1));
-        self.interval_app_limited |= app_limited;
+        let acknowledged = bytes.max(1);
+        self.interval_delivered = self.interval_delivered.saturating_add(acknowledged);
+        if app_limited {
+            self.interval_app_limited_delivered = self
+                .interval_app_limited_delivered
+                .saturating_add(acknowledged);
+        }
         self.ack_rate = refresh_ack_rate(&mut self.slots, &mut self.base, now, 1, 0);
         self.maybe_adapt(now);
     }
@@ -1031,6 +1063,14 @@ impl Controller for AdaptiveRate {
             self.adapt = AdaptState::new(self.floor);
             self.adapt.phase = AdaptPhase::Cooldown;
             self.adapt.steps = 0;
+            // Do not immediately feed the pre-reset interval (including this
+            // loss event) back into the fresh controller state.
+            self.interval_started = Some(now);
+            self.interval_delivered = 0;
+            self.interval_lost = 0;
+            self.interval_app_limited_delivered = 0;
+            self.last_step = AdaptStep::Hold;
+            return;
         }
         self.maybe_adapt(now);
     }
@@ -2698,6 +2738,70 @@ mod tests {
         let (next, step) = adapt_step(state, ceiling, floor, quiet);
         assert_eq!(step, AdaptStep::Hold);
         assert_eq!(next.target, state.target);
+    }
+
+    #[test]
+    fn adaptive_aborts_rate_test_when_traffic_is_app_limited_or_idle() {
+        let (ceiling, floor) = adaptive_bounds();
+        let base_rtt = Duration::from_millis(52);
+        let queued = IntervalSample {
+            smoothed_rtt: base_rtt + ADAPTIVE_QUEUE_TARGET,
+            ..clean_sample(1_000_000, 0, base_rtt)
+        };
+        let (testing, step) = adapt_step(AdaptState::new(ceiling), ceiling, floor, queued);
+        assert_eq!(step, AdaptStep::TestDrop);
+
+        let app_limited = IntervalSample {
+            app_limited: true,
+            smoothed_rtt: base_rtt,
+            ..clean_sample(20_000, 0, base_rtt)
+        };
+        let (aborted, step) = adapt_step(testing, ceiling, floor, app_limited);
+        assert_eq!(step, AdaptStep::TestAbort);
+        assert_eq!(aborted.phase, AdaptPhase::Steady);
+        assert_eq!(aborted.target, testing.pre_test_rate);
+
+        let loss_only = IntervalSample {
+            lost_bytes: 1_000_000,
+            smoothed_rtt: base_rtt,
+            base_rtt,
+            ..IntervalSample::default()
+        };
+        let (aborted, step) = adapt_step(testing, ceiling, floor, loss_only);
+        assert_eq!(step, AdaptStep::TestAbort);
+        assert_eq!(aborted.phase, AdaptPhase::Steady);
+        assert_eq!(aborted.target, testing.pre_test_rate);
+
+        let idle = IntervalSample {
+            smoothed_rtt: base_rtt,
+            base_rtt,
+            ..IntervalSample::default()
+        };
+        let (aborted, step) = adapt_step(testing, ceiling, floor, idle);
+        assert_eq!(step, AdaptStep::TestAbort);
+        assert_eq!(aborted.phase, AdaptPhase::Steady);
+        assert_eq!(aborted.target, testing.pre_test_rate);
+    }
+
+    #[test]
+    fn adaptive_persistent_congestion_discards_the_old_interval() {
+        let (ceiling, floor) = adaptive_bounds();
+        let now = Instant::now();
+        let mut controller = AdaptiveRate::new(ceiling, floor, 1200);
+        controller.interval_started = Some(now - ADAPTIVE_INTERVAL);
+        controller.interval_delivered = 50_000;
+        controller.interval_lost = 10_000;
+        controller.interval_app_limited_delivered = 20_000;
+
+        controller.on_congestion_event(now, now, true, 1200);
+
+        assert_eq!(controller.target, floor);
+        assert_eq!(controller.adapt.phase, AdaptPhase::Cooldown);
+        assert_eq!(controller.interval_started, Some(now));
+        assert_eq!(controller.interval_delivered, 0);
+        assert_eq!(controller.interval_lost, 0);
+        assert_eq!(controller.interval_app_limited_delivered, 0);
+        assert_eq!(controller.last_step, AdaptStep::Hold);
     }
 
     #[test]

@@ -33,9 +33,8 @@ impl Lcg {
     }
 }
 
-fn spawn_echo(stop: Arc<AtomicBool>, port: u16) {
+fn spawn_echo(stop: Arc<AtomicBool>, sock: UdpSocket) {
     thread::spawn(move || {
-        let sock = UdpSocket::bind(("127.0.0.1", port)).expect("bind echo");
         sock.set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
         let mut buf = [0u8; 65535];
@@ -47,9 +46,8 @@ fn spawn_echo(stop: Arc<AtomicBool>, port: u16) {
     });
 }
 
-fn spawn_relay(stop: Arc<AtomicBool>, port: u16, server: SocketAddr, loss: f64, seed: u64) {
+fn spawn_relay(stop: Arc<AtomicBool>, sock: UdpSocket, server: SocketAddr, loss: f64, seed: u64) {
     thread::spawn(move || {
-        let sock = UdpSocket::bind(("127.0.0.1", port)).expect("bind relay");
         sock.set_read_timeout(Some(Duration::from_millis(10)))
             .unwrap();
         let mut client = None;
@@ -83,7 +81,7 @@ struct Harness {
 
 /// 时序敏感用例的全局串行锁。
 ///
-/// 本文件的用例**端口**是独立的（动态/错开的 base port），但**CPU 与 UDP 收发
+/// 本文件的用例**端口**由系统动态分配，但**CPU 与 UDP 收发
 /// 时序不是**：每个 harness 要跑 2 个子进程 + relay 线程 + echo 线程 + 发送与
 /// 接收两个线程，并且用固定间隔灌包、按固定阈值判定到达率。四个用例在同一
 /// 测试二进制里并行时，观测到 `production_sized_datagrams_survive_ten_percent_loss`
@@ -104,21 +102,29 @@ fn serial_guard() -> MutexGuard<'static, ()> {
 }
 
 impl Harness {
-    fn new(loss: f64, force_parity: Option<usize>, base: u16) -> Self {
+    fn new(loss: f64, force_parity: Option<usize>) -> Self {
         // 先取锁再起任何线程/进程：否则锁只保护了后半段，前一个用例的残留
         // 线程仍在抢 CPU。
         let serial = serial_guard();
         let stop = Arc::new(AtomicBool::new(false));
-        let echo_port = base;
-        let server_port = base + 1;
-        let relay_port = base + 2;
-        let client_port = base + 3;
+        // Keep the echo and relay sockets bound while choosing child-process
+        // ports, then move them into their worker threads. This avoids fixed
+        // test ports colliding with other local services or parallel test runs.
+        let echo_socket = UdpSocket::bind("127.0.0.1:0").expect("bind echo");
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").expect("bind relay");
+        let echo_port = echo_socket.local_addr().unwrap().port();
+        let relay_port = relay_socket.local_addr().unwrap().port();
+        let server_reservation = UdpSocket::bind("127.0.0.1:0").expect("reserve server port");
+        let client_reservation = UdpSocket::bind("127.0.0.1:0").expect("reserve client port");
+        let server_port = server_reservation.local_addr().unwrap().port();
+        let client_port = client_reservation.local_addr().unwrap().port();
+        drop((server_reservation, client_reservation));
 
         let server_addr: SocketAddr = ([127, 0, 0, 1], server_port).into();
-        spawn_echo(stop.clone(), echo_port);
+        spawn_echo(stop.clone(), echo_socket);
         spawn_relay(
             stop.clone(),
-            relay_port,
+            relay_socket,
             server_addr,
             loss,
             0x9e37_79b9_7f4a_7c15,
@@ -137,8 +143,11 @@ impl Harness {
         }
 
         // V3 模式需要 keyring；权限 0600 以通过 keyring 权限检查。
-        let keyring_path =
-            std::env::temp_dir().join(format!("sft-test-keyring-{}-{}", std::process::id(), base));
+        let keyring_path = std::env::temp_dir().join(format!(
+            "sft-test-keyring-{}-{}",
+            std::process::id(),
+            server_port
+        ));
         std::fs::write(&keyring_path, format!("1 {KEY}\n")).expect("write keyring");
         #[cfg(unix)]
         {
@@ -313,8 +322,8 @@ impl Drop for Harness {
 fn force_parity_recovers_random_loss() {
     // 10% 双向随机丢包。parity=0 的到达率应接近 (1-0.1)^2=81%，
     // parity=2 应显著更高（>90%），证明 FEC 协议本身有效。
-    let no_fec = Harness::new(0.10, Some(0), 15555).measure(1000, 1.0, false);
-    let with_fec = Harness::new(0.10, Some(2), 15555).measure(1000, 1.0, false);
+    let no_fec = Harness::new(0.10, Some(0)).measure(1000, 1.0, false);
+    let with_fec = Harness::new(0.10, Some(2)).measure(1000, 1.0, false);
 
     eprintln!("no-fec(parity=0)={no_fec:.3}  fec(parity=2)={with_fec:.3}");
     assert!(
@@ -335,7 +344,7 @@ fn adaptive_parity_rises_without_force() {
     // 阈值 0.83 留了很大余量：实测三次分别为 0.976 / 0.985 / 0.986，基线 0.807。
     // 本文件内的并行竞争已由 `HARNESS_LOCK` 消除；**外部**负载（例如同时编译）仍
     // 会压低到达率，因此一次失败不要当成回归，先空载重跑；真正的回归会稳定失败。
-    let h = Harness::new(0.10, None, 25555);
+    let h = Harness::new(0.10, None);
     // 12 秒持续流量：debug 构建较慢，需更长预热让自适应 parity 充分升上去。
     let arrival = h.measure(2000, 12.0, true);
     eprintln!("adaptive arrival={arrival:.3}");
@@ -355,7 +364,7 @@ fn adaptive_parity_rises_without_force() {
 /// 报文尺寸下才显现；100 字节的用例把这些路径全绕开了。
 #[test]
 fn production_sized_datagrams_survive_zero_loss() {
-    let h = Harness::new(0.0, None, 35555);
+    let h = Harness::new(0.0, None);
     let arrival = h.measure_with(1000, 1200, Duration::from_millis(1), 1.0, false);
     eprintln!("1200B/zero-loss arrival={arrival:.4}");
     assert!(
@@ -374,7 +383,7 @@ fn production_sized_datagrams_survive_zero_loss() {
 /// 而空载单跑 3/3 通过（每次约 24.4s）。
 #[test]
 fn production_sized_datagrams_survive_ten_percent_loss() {
-    let h = Harness::new(0.10, None, 45555);
+    let h = Harness::new(0.10, None);
     let arrival = h.measure_with(1000, 1200, Duration::from_millis(1), 12.0, true);
     eprintln!("1200B/10%-loss adaptive arrival={arrival:.4}");
     assert!(

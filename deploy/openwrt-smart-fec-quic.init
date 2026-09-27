@@ -21,27 +21,18 @@ start_service() {
     # 上行）。与 FIXED_RATE 的区别：这里是钳住补偿后的有效速率，所以填 30 就是
     # 30，不会被 1.25 倍放大越界（PRODUCT-MANUAL §10.11）。
     max_rate_mbps="${SMART_QUIC_MAX_RATE_MBPS:-}"
-    # T1 的流量账目默认开启，每 5 秒一条。路由器 syslog 环形缓冲只有 128KB，
-    # 需要时可用 SMART_FEC_TRAFFIC_LOG=0 关掉。
-    traffic_log="${SMART_FEC_TRAFFIC_LOG:-}"
-    # FEC parity 的有效上限，夹在 [1, 8]。默认 8 = 不设限。**上行**冗余由本端
-    # （客户端）生成，所以这个变量在路由器上是有效的：实测本链路 parity=1 比
-    # parity=5 快 40.9%（PRODUCT-MANUAL §10.13），需要按实测覆盖模型时设它。
-    max_parity="${SMART_FEC_MAX_PARITY:-}"
-    # FEC 交织深度（1 = 关闭，默认）。上行冗余由本端生成，所以这里有效；两端应设成相同
-    # 值——编码器在两端各有一份（客户端编上行、服务端编下行）。
-    # 注意：本变量在源码里以常量名读取（`std::env::var(INTERLEAVE_ENV)`），
-    # `tests/deploy_env_coverage.rs` 只扫字面量，**扫不到它**，所以这里的转发是人工维护的。
-    interleave="${SMART_FEC_INTERLEAVE:-}"
     # 注意：procd 的 env 参数走 _procd_add_table -> json_add_object("env")，多次调用
     # procd_set_param env 会生成重复的 "env" 键，JSON 解析后只有最后一次生效，前面几组
     # 环境变量会被静默丢弃（表现为二进制报缺少 --key）。必须只调用一次、合并传入。
+    #
+    # **本进程只读 `SMART_QUIC_*`。** FEC 层的 `SMART_FEC_*`（TRAFFIC_LOG / MAX_PARITY /
+    # INTERLEAVE）由 `smart-fec-tunnel client` 读取，而它由 **/etc/init.d/smart-fec-client**
+    # 启动（模板见 `deploy/openwrt-install.sh` 的 heredoc）。曾经把这三个变量转发到这里，
+    # 结果是"配置看似生效、实际从未到达读它的进程"——`tests/deploy_env_coverage.rs` 现在
+    # 按"读取该变量的源文件"来校验目标 init，正是为了封住这个缺口。
     envs="SMART_FEC_KEY=$SMART_FEC_KEY SMART_QUIC_CONGESTION=$congestion RUST_LOG=info"
     [ -z "$fixed_rate_mbps" ] || envs="$envs SMART_QUIC_FIXED_RATE_MBPS=$fixed_rate_mbps"
     [ -z "$max_rate_mbps" ] || envs="$envs SMART_QUIC_MAX_RATE_MBPS=$max_rate_mbps"
-    [ -z "$traffic_log" ] || envs="$envs SMART_FEC_TRAFFIC_LOG=$traffic_log"
-    [ -z "$max_parity" ] || envs="$envs SMART_FEC_MAX_PARITY=$max_parity"
-    [ -z "$interleave" ] || envs="$envs SMART_FEC_INTERLEAVE=$interleave"
     # 只有显式配置为 1 时才传这一项：不传即 datagram 模式（默认，配合 FEC 纠错）。
     # 不传 "0" 是为了兼容旧二进制对 "0" 的拒绝（见 parse_stream_lanes）。
     [ "${SMART_QUIC_STREAM_LANES:-}" != "1" ] || envs="$envs SMART_QUIC_STREAM_LANES=1"
